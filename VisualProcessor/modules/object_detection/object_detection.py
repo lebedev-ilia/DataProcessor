@@ -19,8 +19,6 @@ from transformers import (
     Owlv2ForObjectDetection,
 )
 
-from core.base_module import BaseModule
-
 
 @dataclass
 class TrackedObject:
@@ -163,7 +161,7 @@ class SimpleTracker:
         return list(self.tracks.values())
 
 
-class ObjectDetectionModule(BaseModule):
+class ObjectDetectionModule():
     """
     Object detection module using OWL-ViT.
     
@@ -192,7 +190,6 @@ class ObjectDetectionModule(BaseModule):
         :param box_threshold: Confidence threshold for bounding boxes
         :param logger: Optional logger function
         """
-        super().__init__(logger=logger)
         
         self.model_name = model_name
         self.model_family = model_family
@@ -564,133 +561,28 @@ class ObjectDetectionModule(BaseModule):
         
         return inter_area / union_area
 
-    def should_run(self, state: Dict[str, Any]) -> bool:
-        """Check if module should run based on state."""
-        # Check if sampler_result exists and has frames
-        sampler_result = state.get("sampler_result", {})
-        if not sampler_result:
-            self.log("No sampler_result in state, skipping")
-            return False
-        
-        # Check if we have any frame indices to process
-        # Look for "global" or any other strategy
-        has_frames = False
-        for strategy, frames in sampler_result.items():
-            if frames and len(frames) > 0:
-                has_frames = True
-                break
-        
-        if not has_frames:
-            self.log("No frames to process, skipping")
-            return False
-        
-        return True
-
-    def run(self, state: Dict[str, Any]) -> Optional[Dict[str, Any]]:
+    def run(self, frame_manager, frame_indices):
         """
         Main execution method.
 
         :param state: State dictionary containing:
-            - video_context: VideoContext with video metadata
-            - sampler_result: Dict with frame indices per strategy
-            - frame_reader: FrameReader instance (optional, will create if not present)
-            - model_registry: ModelRegistry instance (optional)
-            - result_store: ResultStore instance (optional)
+            - frame_manager
+            
         :return: Dictionary with results or None
         """
-        self.log("Starting object detection")
-
-        # Get components from state
-        video_context = state.get("video_context")
-        sampler_result = state.get("sampler_result", {})
-        frame_reader = state.get("frame_reader")
-        model_registry = state.get("model_registry")
-        result_store = state.get("result_store")
-
-        if video_context is None:
-            self.log("ERROR: video_context not found in state")
-            return None
-
-        # Get video path from context
-        video_path = getattr(video_context, "video_path", None)
-        if not video_path:
-            self.log("ERROR: video_path not found in video_context")
-            return None
-
-        # Create or use FrameReader
-        if frame_reader is None:
-            from core.frame_reader import FrameReader
-            frame_reader = FrameReader(video_path)
-            state["frame_reader"] = frame_reader
-
-        # Load model (via ModelRegistry if available, otherwise directly)
-        if model_registry:
-            model_key = f"owlvit-{self.model_name}"
-            try:
-                if not model_registry.registry.get(model_key):
-                    def load_model():
-                        self._load_model()
-                        return {
-                            "model": self._model,
-                            "processor": self._processor,
-                        }
-                    model_registry.register_model(model_key, load_model)
-                
-                model_data = model_registry.get_model(model_key, device=self.device)
-                self._model = model_data["model"]
-                self._processor = model_data["processor"]
-            except Exception as e:
-                self.log(f"ERROR loading model from registry: {e}, loading directly")
-                self._load_model()
-        else:
-            self._load_model()
-
-        # Get frame indices from sampler_result
-        # Use "global" strategy by default, or first available
-        frame_indices = []
-        for strategy in ["global", "GLOBAL"]:
-            if strategy in sampler_result:
-                frames_data = sampler_result[strategy]
-                # Extract indices from frame descriptors
-                for frame_desc in frames_data:
-                    if isinstance(frame_desc, dict):
-                        if "idx" in frame_desc:
-                            frame_indices.append(int(frame_desc["idx"]))
-                        elif "frame_index" in frame_desc:
-                            frame_indices.append(int(frame_desc["frame_index"]))
-                    elif isinstance(frame_desc, int):
-                        frame_indices.append(frame_desc)
-                break
+        if frame_manager is None:
+            raise "frame_manager is None"
         
-        # If no indices found, try to get from any strategy
-        if not frame_indices:
-            for strategy, frames_data in sampler_result.items():
-                for frame_desc in frames_data:
-                    if isinstance(frame_desc, dict):
-                        if "idx" in frame_desc:
-                            frame_indices.append(int(frame_desc["idx"]))
-                        elif "frame_index" in frame_desc:
-                            frame_indices.append(int(frame_desc["frame_index"]))
-                    elif isinstance(frame_desc, int):
-                        frame_indices.append(frame_desc)
-                if frame_indices:
-                    break
-
-        if not frame_indices:
-            self.log("WARNING: No frame indices found in sampler_result")
-            return None
-
-        self.log(f"Processing {len(frame_indices)} frames")
-
-        # Get video FPS for duration calculations
-        fps = getattr(video_context, "fps", 30)
+        fps = frame_manager.fps
         frame_time = 1.0 / fps if fps > 0 else 1.0 / 30.0
+
+        self._load_model()
 
         # Read frames
         frames = []
         for idx in frame_indices:
             try:
-                frame = frame_reader.read_frame(idx)
+                frame = frame_manager.get(idx)
                 frames.append(frame)
             except Exception as e:
                 self.log(f"ERROR reading frame {idx}: {e}")
@@ -857,62 +749,34 @@ class ObjectDetectionModule(BaseModule):
 
         # Prepare result
         result = {
-            "object_detections": {
-                "frames": all_detections,  # Per-frame detections
-                "frame_metadata": frame_metadata,  # Density, overlapping per frame
-                "summary": {
-                    "total_detections": total_detections,
-                    "unique_categories": len(object_counts),
-                    "category_counts": object_counts,
-                    "semantic_tag_counts": dict(semantic_tag_counts),
-                    "brand_detections": brand_detections,
-                    "avg_density": float(avg_density),
-                    "avg_overlap_ratio": float(avg_overlap_ratio),
-                },
-                "tracking": tracking_metrics if tracking_metrics else None,
-                "tracks": [
-                    {
-                        "track_id": track.track_id,
-                        "label": track.label,
-                        "first_frame": track.first_frame,
-                        "last_frame": track.last_frame,
-                        "duration_frames": track.last_frame - track.first_frame + 1,
-                        "duration_seconds": (track.last_frame - track.first_frame + 1) * frame_time,
-                        "num_detections": len(track.frames),
-                        "semantic_tags": track.semantic_tags or [],
-                        "colors": [{"B": int(c[0]), "G": int(c[1]), "R": int(c[2])} for c in (track.colors or [])]
-                    }
-                    for track in tracks
-                ] if tracks else [],
-                "frame_count": len(frame_indices),
-            }
+            "frames": all_detections,  # Per-frame detections
+            "frame_metadata": frame_metadata,  # Density, overlapping per frame
+            "summary": {
+                "total_detections": total_detections,
+                "unique_categories": len(object_counts),
+                "category_counts": object_counts,
+                "semantic_tag_counts": dict(semantic_tag_counts),
+                "brand_detections": brand_detections,
+                "avg_density": float(avg_density),
+                "avg_overlap_ratio": float(avg_overlap_ratio),
+            },
+            "tracking": tracking_metrics if tracking_metrics else None,
+            "tracks": [
+                {
+                    "track_id": track.track_id,
+                    "label": track.label,
+                    "first_frame": track.first_frame,
+                    "last_frame": track.last_frame,
+                    "duration_frames": track.last_frame - track.first_frame + 1,
+                    "duration_seconds": (track.last_frame - track.first_frame + 1) * frame_time,
+                    "num_detections": len(track.frames),
+                    "semantic_tags": track.semantic_tags or [],
+                    "colors": [{"B": int(c[0]), "G": int(c[1]), "R": int(c[2])} for c in (track.colors or [])]
+                }
+                for track in tracks
+            ] if tracks else [],
+            "frame_count": len(frame_indices),
         }
-
-        # Store results in ResultStore if available
-        if result_store:
-            result_store.store(
-                self.name,
-                result["object_detections"],
-                level="video"
-            )
-            
-            # Also store per-frame results
-            for frame_idx, detections in all_detections.items():
-                result_store.store(
-                    self.name,
-                    detections,
-                    level="frame",
-                    key=frame_idx
-                )
-
-        self.log(f"Object detection completed: {total_detections} detections across {len(frame_indices)} frames")
-        
-        # Release model from registry if used
-        if model_registry:
-            try:
-                model_registry.release_model(f"owlvit-{self.model_name}")
-            except:
-                pass
 
         return result
 

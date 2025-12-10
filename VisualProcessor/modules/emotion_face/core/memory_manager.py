@@ -54,37 +54,3 @@ def memory_cleanup(func: Callable) -> Callable:
     
     return wrapper
 
-
-def calculate_optimal_batch_size(
-    frame_shape: tuple,
-    available_memory_mb: float,
-    model_memory_estimate_mb: float = 500
-) -> int:
-    """
-    Динамический расчет размера батча на основе доступной памяти.
-    
-    Args:
-        frame_shape: (H, W, C) - размер одного кадра
-        available_memory_mb: доступная память в MB
-        model_memory_estimate_mb: оценка памяти, занимаемой моделью в MB
-    
-    Returns:
-        Оптимальный размер батча (от 1 до 64)
-    """
-    if frame_shape is None or len(frame_shape) < 3:
-        return 16  # значение по умолчанию
-    
-    H, W, C = frame_shape[:3]
-    # float32 = 4 байта на пиксель
-    frame_memory_mb = (H * W * C * 4) / (1024 ** 2)
-    
-    # Вычисляем максимальное количество кадров
-    available_for_frames = available_memory_mb - model_memory_estimate_mb
-    if available_for_frames <= 0:
-        return 1
-    
-    max_frames = int((available_for_frames * 0.7) / frame_memory_mb)  # 70% от доступной памяти
-    
-    # Ограничиваем размер батча
-    return min(64, max(1, max_frames))
-

@@ -56,12 +56,6 @@ class MemoryError(VideoProcessingError):
     """Ошибка нехватки памяти."""
     pass
 
-
-class VideoFileError(VideoProcessingError):
-    """Ошибка работы с видео файлом."""
-    pass
-
-
 class ModelError(VideoProcessingError):
     """Ошибка работы с моделью."""
     pass

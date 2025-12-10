@@ -1,31 +1,26 @@
 """
 Основной класс для обработки видео и анализа эмоций.
 """
-import os
 import sys
-import time
-import shutil
 import torch
-import gc
-from pathlib import Path
 from typing import Dict, Any, List, Optional, Tuple
-from collections import defaultdict, OrderedDict
+from collections import OrderedDict
 
 from core.processing_config import (
-    ConfigLoader, ProcessingParams, ProcessingMetrics
+    ProcessingParams, ProcessingMetrics
 )
-from core.memory_manager import memory_context, cleanup_memory, calculate_optimal_batch_size
+from core.memory_manager import memory_context, cleanup_memory
 from core.retry_strategy import RetryStrategy, QualityMetrics
 from core.validation import ValidationLogic, ValidationCriteria
 from core.logger import StructuredLogger
 from core.exceptions import (
-    VideoProcessingError, VideoFileError, FrameSelectionError,
+    VideoProcessingError, FrameSelectionError,
     EmotionAnalysisError, ValidationError
 )
 from core.validators import (
-    validate_video_file, validate_target_length, validate_chunk_size
+    validate_target_length
 )
-from core.edge_cases import validate_edge_cases, handle_very_short_video, handle_very_long_video
+from core.edge_cases import validate_edge_cases
 from core.cache_with_ttl import FaceScanCacheWithTTL
 
 from utils import (
@@ -35,9 +30,8 @@ from utils import (
     save_for_user, save_for_model, get_video_type,
     analyze_emotion_profile, sample_for_static_face,
     analyze_emotion_changes, print_memory_usage,
-    get_available_memory_mb, calculate_max_frames_by_memory,
-    compute_steps, FrameManager, frame_writer, scan_for_faces, 
-    process_frames_in_batches, create_tmp
+    get_available_memory_mb,
+    compute_steps, scan_for_faces, process_frames_in_batches
 )
 from core.advanced_emotion_features import (
     detect_micro_expressions,
@@ -139,51 +133,135 @@ class VideoEmotionProcessor:
     Реализует все этапы обработки с четким разделением ответственности.
     """
     
-    def __init__(self, config_path: Optional[str] = None):
+    def __init__(
+        self,
+        # cache
+        ttl_enabled: bool = True,
+        ttl_seconds: int = 1800,
+        cache_size_limit: int = 10,
+        # validate
+        min_frames_ratio: float = 0.8,
+        min_keyframes: int = 3,
+        min_transitions: int = 2,
+        min_diversity_threshold: float = 0.2,
+        quality_threshold: float = 0.4,
+        # perfomance
+        memory_threshold_low: int = 2000,
+        batch_load_low: int = 20,
+        batch_process_low: int = 8,
+        memory_threshold_medium: int = 4000,
+        batch_load_medium: int = 30,
+        batch_process_medium: int = 12,
+        memory_threshold_high: int = 8000,
+        batch_load_high: int = 50,
+        batch_process_high: int = 15,
+        batch_load_very_high: int = 80,
+        batch_process_very_high: int = 24,
+        # logging
+        enable_structured_metrics: bool = True,
+        log_memory_usage: bool = True,
+        # processing
+        min_faces_threshold: int = 20,
+        target_length: int = 256,
+        max_retries: int = 2,
+        # face detection
+        default_threshold: float = 0.5,
+        # keyframes
+        transition_threshold: float = 0.3,
+        # segmentation
+        max_gap_seconds: float = 0.5,
+        max_samples_per_segment: int = 10,
+        # face app
+        det_size: Tuple[int] = (640, 640),
+        # emonet
+        emo_path: str = None,
+        # other
+        device: str = "cuda",
+    ):
         """
         Инициализация процессора.
         
         Args:
             config_path: Путь к файлу конфигурации. Если None, используется config.yaml.
         """
-        self.config = ConfigLoader.load(config_path)
+        self.device = device
+        
         self.metrics = ProcessingMetrics()
         
-        # Используем кэш с TTL, если включен в конфиге
-        cache_config = self.config.get("caching", {})
-        use_ttl = cache_config.get("ttl_enabled", False)
-        cache_ttl = cache_config.get("ttl_seconds", 1800.0)  # 30 минут по умолчанию
+        self.target_length = validate_target_length(target_length)
+        self.max_retries = max_retries
+        self.default_threshold = default_threshold
+        self.transition_threshold = transition_threshold
+        self.quality_threshold = quality_threshold
+        self.min_diversity_threshold = min_diversity_threshold
+        self.max_gap_seconds = max_gap_seconds
+        self.max_samples_per_segment = max_samples_per_segment
+        self.min_faces_threshold = min_faces_threshold
         
-        if use_ttl:
+        self.memory_threshold_low = memory_threshold_low
+        self.batch_load_low = batch_load_low
+        self.batch_process_low = batch_process_low
+        self.memory_threshold_medium = memory_threshold_medium
+        self.batch_load_medium = batch_load_medium
+        self.batch_process_medium = batch_process_medium
+        self.memory_threshold_high = memory_threshold_high
+        self.batch_load_high = batch_load_high
+        self.batch_process_high = batch_process_high
+        self.batch_load_very_high = batch_load_very_high
+        self.batch_process_very_high = batch_process_very_high
+        
+        self.face_app = self.init_face_app(det_size)
+        self.model = self.load_emonet(path=emo_path)
+        
+        if ttl_enabled:
             self.face_cache = FaceScanCacheWithTTL(
-                max_size=cache_config.get("cache_size_limit", 10),
-                ttl_seconds=cache_ttl
+                max_size=cache_size_limit,
+                ttl_seconds=ttl_seconds
             )
         else:
             self.face_cache = FaceScanCache(
-                max_size=cache_config.get("cache_size_limit", 10)
+                max_size=cache_size_limit
             )
         self.validation_logic = ValidationLogic(
             ValidationCriteria(
-                min_frames_ratio=self.config.get("validation", {}).get("min_frames_ratio", 0.8),
-                min_keyframes=self.config.get("validation", {}).get("min_keyframes", 3),
-                min_transitions=self.config.get("validation", {}).get("min_transitions", 2),
-                min_diversity=self.config.get("validation", {}).get("min_diversity_threshold", 0.2)
+                min_frames_ratio=min_frames_ratio,
+                min_keyframes=min_keyframes,
+                min_transitions=min_transitions,
+                min_diversity=self.min_diversity_threshold
             )
         )
-        # Структурированный логгер
-        logging_config = self.config.get("logging", {})
+
         self.logger = StructuredLogger(
-            enable_metrics=logging_config.get("enable_structured_metrics", True)
+            enable_metrics=enable_structured_metrics
         )
+        
+    def load_emonet(self, path: str, n_expression: int = 8):
+        from models.emonet.emonet.models.emonet import EmoNet
+        state = torch.load(path, map_location="cpu")
+        if isinstance(state, dict):
+            state = {k.replace("module.", ""): v for k, v in state.items()}
+        model = EmoNet(n_expression=n_expression).to(self.device)
+        model.load_state_dict(state, strict=False)
+        model.eval()
+        return model
+        
+    def init_face_app(self, det_size=(640,640)):
+        try:
+            from insightface.app import FaceAnalysis
+        except Exception as e:
+            raise RuntimeError("insightface not installed or failed to import") from e
+        # try GPU, fallback CPU
+        try:
+            app = FaceAnalysis(providers=["CUDAExecutionProvider"])
+            app.prepare(ctx_id=0, det_size=det_size)
+        except Exception:
+            app = FaceAnalysis(providers=["CPUExecutionProvider"])
+            app.prepare(ctx_id=-1, det_size=det_size)
+        return app
     
     def process(
         self,
-        video_path: str,
-        model,
-        face_app,
-        target_length: Optional[int] = None,
-        chunk_size: Optional[int] = None
+        frame_manager,
     ) -> Dict[str, Any]:
         """
         Основной метод обработки видео.
@@ -191,7 +269,7 @@ class VideoEmotionProcessor:
         Args:
             video_path: Путь к видео файлу.
             model: Загруженная модель EmoNet.
-            face_app: Инициализированное приложение для детекции лиц.
+            self.face_app: Инициализированное приложение для детекции лиц.
             target_length: Целевая длина последовательности. Если None, берется из конфига.
             chunk_size: Размер чанка для обработки. Если None, берется из конфига.
         
@@ -203,52 +281,31 @@ class VideoEmotionProcessor:
             ConfigurationValidationError: Если параметры некорректны.
             VideoProcessingError: При ошибках обработки.
         """
-        # Валидация входных данных
-        validate_video_file(video_path)
-        
-        # Получаем и валидируем параметры
-        default_target_length = self.config.get("processing", {}).get("target_length", 256)
-        default_chunk_size = self.config.get("processing", {}).get("chunk_size", 32)
-        
-        target_length = validate_target_length(target_length, default_target_length)
-        chunk_size = validate_chunk_size(chunk_size, default_chunk_size)
-        
-        max_retries = self.config.get("processing", {}).get("max_retries", 2)
-        retry_strategy = RetryStrategy(max_retries=max_retries)
+        retry_strategy = RetryStrategy(max_retries=self.max_retries)
         
         # Инициализация параметров
         base_params = ProcessingParams(
-            face_detection_threshold=self.config.get("face_detection", {}).get("default_threshold", 0.5),
+            face_detection_threshold=self.default_threshold,
             scan_stride_multiplier=1.0,
-            keyframe_threshold=self.config.get("keyframes", {}).get("transition_threshold", 0.3),
-            quality_threshold=self.config.get("validation", {}).get("quality_threshold", 0.4),
-            min_diversity=self.config.get("validation", {}).get("min_diversity_threshold", 0.2),
-            segment_max_gap=self.config.get("segmentation", {}).get("max_gap_seconds", 0.5),
-            samples_per_segment=self.config.get("segmentation", {}).get("max_samples_per_segment", 10)
+            keyframe_threshold=self.transition_threshold,
+            quality_threshold=self.quality_threshold,
+            min_diversity=self.min_diversity_threshold,
+            segment_max_gap=self.max_gap_seconds,
+            samples_per_segment=self.max_samples_per_segment
         )
         
         current_params = base_params.copy()
         
-        # Подготовка ресурсов
-        tmp_dir = None
-        fm = None
-        
         try:
             with memory_context():
-                # Подготовка временных файлов
-                tmp_dir = create_tmp(video_path)
                 
-                # Запись кадров
-                self.logger.start_stage("frame_writing")
-                meta = frame_writer(video_path, tmp_dir, batch_size=chunk_size, logger=self.logger)
-                total_frames = meta["total_frames"]
-                fps = meta.get("fps", 30)
-                self.logger.end_stage("frame_writing")
-                
-                if self.config.get("logging", {}).get("log_memory_usage", True):
+                if self.log_memory_usage:
                     print_memory_usage(label="After frame_writer", log=log)
-                
-                fm = FrameManager(tmp_dir, chunk_size=chunk_size)
+                    
+                total_frames = frame_manager.total_frames
+                fps = frame_manager.fps
+                meta = frame_manager.meta
+                video_path = meta["video_path"]
                 
                 # Валидация граничных случаев
                 try:
@@ -256,7 +313,7 @@ class VideoEmotionProcessor:
                         total_frames,
                         fps,
                         [],  # timeline будет заполнен позже
-                        min_faces_ratio=self.config.get("processing", {}).get("min_faces_threshold", 20) / total_frames if total_frames > 0 else 0.01
+                        min_faces_ratio=self.min_faces_threshold / total_frames if total_frames > 0 else 0.01
                     )
                     self.logger.log(f"Edge cases validation: {edge_cases_info.get('warnings', [])}")
                 except VideoProcessingError as e:
@@ -264,17 +321,17 @@ class VideoEmotionProcessor:
                     # Продолжаем обработку, но с предупреждением
                 
                 # Основной цикл обработки с повторными попытками
-                while retry_strategy.attempts <= max_retries:
+                while retry_strategy.attempts <= self.max_retries:
                     try:
                         cleanup_memory()
                         
-                        self.logger.log(f"Попытка {retry_strategy.attempts + 1}/{max_retries + 1}")
+                        self.logger.log(f"Попытка {retry_strategy.attempts + 1}/{self.max_retries + 1}")
                         self.logger.log_metrics(current_params.to_dict(), "Параметры обработки")
                         
                         # Этап 1: Адаптивный сбор кадров
                         self.logger.start_stage("adaptive_frame_selection")
                         result = self._adaptive_frame_selection(
-                            fm, face_app, total_frames, fps, current_params
+                            frame_manager, self.face_app, total_frames, fps, current_params
                         )
                         self.logger.end_stage("adaptive_frame_selection")
                         
@@ -300,7 +357,7 @@ class VideoEmotionProcessor:
                         # Этап 2: Анализ эмоций
                         self.logger.start_stage("emotion_analysis")
                         emotion_result = self._emotion_analysis_pipeline(
-                            fm, selected_indices, model, total_frames, fps, current_params, face_app
+                            frame_manager, selected_indices, self.model, total_frames, fps, current_params, self.face_app
                         )
                         self.logger.end_stage("emotion_analysis")
                         
@@ -323,7 +380,7 @@ class VideoEmotionProcessor:
                         validation_result = self._validation_and_retry_logic(
                             emotion_result,
                             selected_indices,
-                            target_length,
+                            self.target_length,
                             video_type,
                             current_params,
                             retry_strategy
@@ -384,17 +441,12 @@ class VideoEmotionProcessor:
                 return self._build_failure_result(current_params, retry_strategy.attempts)
         
         finally:
-            # Очистка ресурсов
-            if fm:
-                fm.close()
-            # if tmp_dir and os.path.exists(tmp_dir):
-            #     shutil.rmtree(tmp_dir)
             torch.cuda.empty_cache()
             self.face_cache.clear()
     
     def _adaptive_frame_selection(
         self,
-        fm: FrameManager,
+        fm,
         face_app,
         total_frames: int,
         fps: float,
@@ -453,7 +505,7 @@ class VideoEmotionProcessor:
                     total_frames,
                     fps,
                     timeline,
-                    min_faces_ratio=self.config.get("processing", {}).get("min_faces_threshold", 20) / total_frames if total_frames > 0 else 0.01
+                    min_faces_ratio=self.min_faces_threshold / total_frames if total_frames > 0 else 0.01
                 )
                 if edge_cases_info.get("warnings"):
                     for warning in edge_cases_info["warnings"]:
@@ -495,16 +547,13 @@ class VideoEmotionProcessor:
             n_frames = len(selected_indices)
             self.logger.log(f"Выбрано индексов: {n_frames}")
             
-            # Проверка достаточности данных
-            min_faces_threshold = self.config.get("processing", {}).get("min_faces_threshold", 20)
-            
             if n_frames < 10:
                 self.logger.log(f"Слишком мало кадров ({n_frames}), переключаюсь на равномерное покрытие", level="WARNING")
                 selected_indices = uniform_time_coverage(
                     total_frames,
                     min(256 * 3, total_frames)
                 )
-            elif n_frames < min_faces_threshold:
+            elif n_frames < self.min_faces_threshold:
                 self.logger.log("Комбинирую лица и равномерное покрытие")
                 uniform_indices = uniform_time_coverage(
                     total_frames,
@@ -536,7 +585,7 @@ class VideoEmotionProcessor:
     
     def _emotion_analysis_pipeline(
         self,
-        fm: FrameManager,
+        fm,
         selected_indices: List[int],
         model,
         total_frames: int,
@@ -553,22 +602,19 @@ class VideoEmotionProcessor:
         try:
             # Определение размера батча
             available_memory = get_available_memory_mb()
-            batch_config = self.config.get("batch_processing", {})
-            thresholds = batch_config.get("memory_thresholds", {})
-            batch_sizes = batch_config.get("batch_sizes", {})
             
-            if available_memory < thresholds.get("low", 2000):
-                batch_load = batch_sizes.get("low", {}).get("load", 20)
-                batch_process = batch_sizes.get("low", {}).get("process", 8)
-            elif available_memory < thresholds.get("medium", 4000):
-                batch_load = batch_sizes.get("medium", {}).get("load", 30)
-                batch_process = batch_sizes.get("medium", {}).get("process", 12)
-            elif available_memory < thresholds.get("high", 8000):
-                batch_load = batch_sizes.get("high", {}).get("load", 50)
-                batch_process = batch_sizes.get("high", {}).get("process", 16)
+            if available_memory < self.memory_threshold_low:
+                batch_load = self.batch_load_low
+                batch_process = self.batch_process_low
+            elif available_memory < self.memory_threshold_medium:
+                batch_load = self.batch_load_medium
+                batch_process = self.batch_process_medium
+            elif available_memory < self.memory_threshold_high:
+                batch_load = self.batch_load_high
+                batch_process = self.batch_process_high
             else:
-                batch_load = batch_sizes.get("very_high", {}).get("load", 80)
-                batch_process = batch_sizes.get("very_high", {}).get("process", 24)
+                batch_load = self.batch_load_very_high
+                batch_process = self.batch_process_very_high
             
             self.logger.log(f"Размеры батчей: загрузка={batch_load}, обработка={batch_process}")
             

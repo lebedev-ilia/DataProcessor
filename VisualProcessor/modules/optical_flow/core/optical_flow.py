@@ -164,7 +164,7 @@ class OpticalFlowProcessor:
         
         return cv2.cvtColor(hsv, cv2.COLOR_HSV2RGB)
     
-    def process_video(self, video_path: str) -> Dict[str, Any]:
+    def process_video(self, frame_manager, frame_indices) -> Dict[str, Any]:
         """
         Основной метод обработки видео.
         
@@ -174,41 +174,22 @@ class OpticalFlowProcessor:
         Returns:
             Словарь с результатами обработки
         """
-        logger.info(f"Начало обработки: {video_path}")
-        
-        # Валидация
-        video_path = Path(video_path)
-        if not video_path.exists():
-            raise FileNotFoundError(f"Видеофайл не найден: {video_path}")
-        
         # Инициализация модели
         if self.model is None:
             self._initialize_model()
-        
-        # Создание структуры директорий
-        video_name = video_path.stem
-        video_hash = hashlib.md5(str(video_path).encode()).hexdigest()[:8]
-        
-        output_base = Path(self.config.output_dir) / f"{video_name}_{video_hash}"
-        flow_dir = output_base / "flow"
-        overlay_dir = output_base / "overlay" if self.config.save_overlay else None
+
+        flow_dir = self.config.output_dir / "flow"
+        overlay_dir = self.config.output_dir / "overlay" if self.config.save_overlay else None
         
         flow_dir.mkdir(parents=True, exist_ok=True)
         if overlay_dir:
             overlay_dir.mkdir(exist_ok=True)
         
-        # Открытие видео
-        cap = cv2.VideoCapture(str(video_path))
-        if not cap.isOpened():
-            raise ValueError(f"Не удалось открыть видео: {video_path}")
-        
         # Получение свойств видео
-        fps = cap.get(cv2.CAP_PROP_FPS)
-        total_frames = int(cap.get(cv2.CAP_PROP_FRAME_COUNT))
-        width = int(cap.get(cv2.CAP_PROP_FRAME_WIDTH))
-        height = int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT))
-        
-        logger.info(f"Видео: {video_name}, FPS: {fps}, Разрешение: {width}x{height}")
+        fps = frame_manager.fps
+        total_frames = frame_manager.total_frames
+        width = frame_manager.width
+        height = frame_manager.height
         
         # Основной цикл обработки
         frame_buffer = []
@@ -217,14 +198,10 @@ class OpticalFlowProcessor:
         
         from tqdm import tqdm
         
-        with tqdm(total=total_frames//self.config.frame_skip, 
-                 desc="Обработка потока", unit="пар") as pbar:
+        with tqdm(total=total_frames//self.config.frame_skip, desc="Обработка потока", unit="пар") as pbar:
             
-            frame_idx = 0
-            while True:
-                ret, frame = cap.read()
-                if not ret:
-                    break
+            for frame_idx in frame_indices:
+                frame = frame_manager.get(frame_idx)
                 
                 # Конвертация BGR -> RGB
                 frame_rgb = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)

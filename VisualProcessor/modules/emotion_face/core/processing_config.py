@@ -1,10 +1,8 @@
 """
 Модуль для работы с конфигурацией обработки видео.
 """
-import yaml
 from dataclasses import dataclass, field
-from pathlib import Path
-from typing import Dict, Any, Optional
+from typing import Dict, Any
 from core.exceptions import ConfigurationValidationError
 
 
@@ -103,99 +101,3 @@ class ProcessingMetrics:
             'quality_scores': self.quality_scores,
             'processing_stats': self.processing_stats
         }
-
-
-class ConfigLoader:
-    """Загрузчик конфигурации из YAML файла."""
-    
-    @staticmethod
-    def load(config_path: Optional[str] = None) -> Dict[str, Any]:
-        """
-        Загружает конфигурацию из YAML файла.
-        
-        Args:
-            config_path: Путь к файлу конфигурации. Если None, используется config.yaml в корне проекта.
-        
-        Returns:
-            Словарь с конфигурацией.
-        
-        Raises:
-            ConfigurationError: Если файл не найден или некорректен.
-        """
-        from core.exceptions import ConfigurationError
-        
-        if config_path is None:
-            config_path = Path(__file__).parent.parent / "config.yaml"
-        else:
-            config_path = Path(config_path)
-        
-        if not config_path.exists():
-            raise ConfigurationError(
-                f"Config file not found: {config_path}",
-                details={"config_path": str(config_path)}
-            )
-        
-        try:
-            with open(config_path, 'r', encoding='utf-8') as f:
-                config = yaml.safe_load(f)
-        except yaml.YAMLError as e:
-            raise ConfigurationError(
-                f"Failed to parse YAML config file: {e}",
-                details={"config_path": str(config_path), "error": str(e)}
-            ) from e
-        
-        if config is None:
-            raise ConfigurationError(
-                "Config file is empty or invalid",
-                details={"config_path": str(config_path)}
-            )
-        
-        # Базовая валидация структуры
-        ConfigLoader._validate_config(config)
-        
-        return config
-    
-    @staticmethod
-    def _validate_config(config: Dict[str, Any]) -> None:
-        """
-        Валидирует базовую структуру конфигурации.
-        
-        Args:
-            config: Словарь с конфигурацией.
-        
-        Raises:
-            ConfigurationValidationError: Если структура некорректна.
-        """
-        from core.exceptions import ConfigurationValidationError
-        
-        required_sections = ["processing", "validation"]
-        for section in required_sections:
-            if section not in config:
-                raise ConfigurationValidationError(
-                    f"Missing required config section: {section}",
-                    details={"section": section}
-                )
-        
-        # Валидация processing секции
-        processing = config.get("processing", {})
-        if "target_length" in processing:
-            target_length = processing["target_length"]
-            if not isinstance(target_length, int) or target_length <= 0:
-                raise ConfigurationValidationError(
-                    f"processing.target_length must be positive integer, got {target_length}",
-                    details={"section": "processing", "key": "target_length", "value": target_length}
-                )
-        
-        if "max_retries" in processing:
-            max_retries = processing["max_retries"]
-            if not isinstance(max_retries, int) or max_retries < 0:
-                raise ConfigurationValidationError(
-                    f"processing.max_retries must be non-negative integer, got {max_retries}",
-                    details={"section": "processing", "key": "max_retries", "value": max_retries}
-                )
-    
-    @staticmethod
-    def get_default_params() -> ProcessingParams:
-        """Возвращает параметры по умолчанию."""
-        return ProcessingParams()
-

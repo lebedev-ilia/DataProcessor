@@ -25,11 +25,9 @@ try:
     CLIP_AVAILABLE = True
 except ImportError:
     CLIP_AVAILABLE = False
+    
 
-from src.core.base_extractor import BaseExtractor
-
-
-class Places365SceneClassifier(BaseExtractor):
+class Places365SceneClassifier:
     """
     Scene classifier built on top of Places365 checkpoints.
 
@@ -182,21 +180,17 @@ class Places365SceneClassifier(BaseExtractor):
             self._load_clip_model()
 
     def classify(
-        self, frames: Sequence[np.ndarray], top_k: Optional[int] = None
+        self, frame_manager, frame_indices, top_k: Optional[int] = None
     ) -> List[List[Dict[str, Any]]]:
         """
         Runs scene classification over the provided frames.
 
-        :param frames: iterable of OpenCV frames (BGR numpy arrays)
         :param top_k: override default number of predictions
         :return: list where each element contains predictions dicts for a frame:
                  { "label": str, "score": float }
         """
-        if not frames:
-            return []
-
         k = max(1, top_k or self.top_k)
-        raw_predictions: List[List[Dict[str, Any]]] = [[] for _ in range(len(frames))]
+        raw_predictions: List[List[Dict[str, Any]]] = [[] for _ in range(len(frame_indices))]
 
         # Process frames with batching
         batch_tensors: List[torch.Tensor] = []
@@ -225,7 +219,10 @@ class Places365SceneClassifier(BaseExtractor):
             batch_tensors.clear()
             batch_indices.clear()
 
-        for frame_idx, frame in enumerate(frames):
+        for frame_idx in frame_indices:
+            
+            frame = frame_manager.get(frame_idx)
+            
             self.check_system_state(frame_idx)
             if frame is None:
                 continue
@@ -898,7 +895,7 @@ class Places365SceneClassifier(BaseExtractor):
         }
     
     def classify_with_advanced_features(
-        self, frames: Sequence[np.ndarray], top_k: Optional[int] = None
+        self, frame_manager, frame_indices, top_k: Optional[int] = None
     ) -> List[Dict[str, Any]]:
         """
         Classify scenes with advanced features.
@@ -908,7 +905,7 @@ class Places365SceneClassifier(BaseExtractor):
         :return: list of dictionaries with scene predictions and advanced features
         """
         # Get base predictions
-        base_predictions = self.classify(frames, top_k)
+        base_predictions = self.classify(frame_manager, frame_indices, top_k)
         
         if not self.enable_advanced_features:
             return [
@@ -916,13 +913,16 @@ class Places365SceneClassifier(BaseExtractor):
                 for preds in base_predictions
             ]
         
-        results = []
-        for frame_idx, (frame, preds) in enumerate(zip(frames, base_predictions)):
+        results = {}
+        for frame_idx, preds in (zip(frame_indices, base_predictions)):
+            
+            frame = frame_manager.get(frame_idx)
+            
             if frame is None or not preds:
-                results.append({
+                results[frame_idx] = {
                     "predictions": preds,
                     "advanced_features": None
-                })
+                }
                 continue
             
             # Get top prediction
@@ -959,10 +959,10 @@ class Places365SceneClassifier(BaseExtractor):
             geometric = self._calculate_geometric_features(frame)
             advanced["geometric_features"] = geometric
             
-            results.append({
+            results[frame_idx] = {
                 "predictions": preds,
                 "advanced_features": advanced
-            })
+            }
         
         return results
 

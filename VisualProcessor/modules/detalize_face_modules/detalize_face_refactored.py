@@ -5,9 +5,6 @@
 """
 from __future__ import annotations
 
-
-
-import argparse
 import logging
 from typing import Any, Dict, List, Optional, Sequence
 from pathlib import Path
@@ -40,7 +37,7 @@ class DetalizeFaceExtractorRefactored():
         *,
         modules: Optional[List[str]] = None,
         module_configs: Optional[Dict[str, Dict[str, Any]]] = None,
-        max_faces: int = 4,
+        max_faces: int = 10,
         refine_landmarks: bool = True,
         visualize: bool = False,
         visualize_dir: Optional[str] = None,
@@ -133,23 +130,19 @@ class DetalizeFaceExtractorRefactored():
             except Exception as e:
                 self.logger.error(f"DetalizeFaceExtractorRefactored | init | Ошибка при инициализации модуля '{module.module_name}': {e}")
 
-    def extract(self, frames: Sequence[np.ndarray]) -> List[List[Dict[str, Any]]]:
+    def extract(self, frame_manager, frame_indices) -> List[List[Dict[str, Any]]]:
         """
         Processes a sequence of OpenCV BGR frames and returns a list where each
         element corresponds to the facial feature set per frame.
         """
-        if not frames:
-            return []
+        outputs = {}
 
-        outputs: List[List[Dict[str, Any]]] = []
+        for frame_idx in frame_indices:
 
-        for frame_idx, frame in enumerate(frames):
-            if frame is None:
-                outputs.append([])
-                continue
+            frame = frame_manager.get(frame_idx)
 
             frame_results = self._process_frame(frame, frame_idx)
-            outputs.append(frame_results)
+            outputs[frame_idx] = frame_results
 
             # Visualize frame if enabled and faces detected
             if self.visualize and frame_results:
@@ -301,261 +294,3 @@ class DetalizeFaceExtractorRefactored():
         
         if frame_idx == 0 or (frame_idx + 1) % 10 == 0:
             print(f"Saved visualization: {output_path}")
-
-if __name__ == "__main__":
-    parser = argparse.ArgumentParser(
-        description="DetalizeFaceExtractorRefactored - модульная система извлечения фич лица",
-        formatter_class=argparse.ArgumentDefaultsHelpFormatter
-    )
-    
-    # Input/Output arguments
-    parser.add_argument(
-        "--input", "-i",
-        type=str,
-        required=True,
-        help="Путь к входному видео файлу или директории с изображениями"
-    )
-    parser.add_argument(
-        "--output", "-o",
-        type=str,
-        default="face_features.json",
-        help="Путь к выходному JSON файлу с результатами"
-    )
-    
-    # Module configuration
-    parser.add_argument(
-        "--modules",
-        type=str,
-        nargs="+",
-        default=None,
-        help="Список модулей для загрузки (по умолчанию - все доступные)"
-    )
-    parser.add_argument(
-        "--module-config",
-        type=str,
-        default=None,
-        help="Путь к JSON файлу с конфигурацией модулей"
-    )
-    
-    # Face detection parameters
-    parser.add_argument(
-        "--max-faces",
-        type=int,
-        default=4,
-        help="Максимальное количество лиц для детекции на кадр"
-    )
-    parser.add_argument(
-        "--refine-landmarks",
-        action="store_true",
-        default=True,
-        help="Использовать уточненные landmarks (468 точек)"
-    )
-    parser.add_argument(
-        "--no-refine-landmarks",
-        action="store_false",
-        dest="refine_landmarks",
-        help="Не использовать уточненные landmarks"
-    )
-    
-    # Quality filtering parameters
-    parser.add_argument(
-        "--min-detection-confidence",
-        type=float,
-        default=0.7,
-        help="Минимальная уверенность детекции лица"
-    )
-    parser.add_argument(
-        "--min-tracking-confidence",
-        type=float,
-        default=0.7,
-        help="Минимальная уверенность трекинга лица"
-    )
-    parser.add_argument(
-        "--min-face-size",
-        type=int,
-        default=30,
-        help="Минимальный размер лица в пикселях"
-    )
-    parser.add_argument(
-        "--max-face-size-ratio",
-        type=float,
-        default=0.8,
-        help="Максимальное отношение размера лица к размеру кадра"
-    )
-    parser.add_argument(
-        "--min-aspect-ratio",
-        type=float,
-        default=0.6,
-        help="Минимальное соотношение сторон лица"
-    )
-    parser.add_argument(
-        "--max-aspect-ratio",
-        type=float,
-        default=1.4,
-        help="Максимальное соотношение сторон лица"
-    )
-    parser.add_argument(
-        "--no-validate-landmarks",
-        action="store_false",
-        dest="validate_landmarks",
-        default=True,
-        help="Отключить валидацию landmarks"
-    )
-    
-    # Visualization parameters
-    parser.add_argument(
-        "--visualize",
-        action="store_true",
-        help="Включить визуализацию результатов"
-    )
-    parser.add_argument(
-        "--visualize-dir",
-        type=str,
-        default="./face_visualizations",
-        help="Директория для сохранения визуализаций"
-    )
-    parser.add_argument(
-        "--show-landmarks",
-        action="store_true",
-        help="Показывать landmarks на визуализации"
-    )
-    
-    # Processing parameters
-    parser.add_argument(
-        "--frame-skip",
-        type=int,
-        default=1,
-        help="Обрабатывать каждый N-й кадр (для ускорения)"
-    )
-    parser.add_argument(
-        "--max-frames",
-        type=int,
-        default=None,
-        help="Максимальное количество кадров для обработки"
-    )
-    
-    args = parser.parse_args()
-    
-    # Load module configuration if provided
-    module_configs = None
-    if args.module_config:
-        import json
-        try:
-            with open(args.module_config, 'r', encoding='utf-8') as f:
-                module_configs = json.load(f)
-            print(f"Загружена конфигурация модулей из: {args.module_config}")
-        except Exception as e:
-            print(f"Ошибка при загрузке конфигурации модулей: {e}")
-            exit(1)
-    
-    # Initialize extractor
-    try:
-        extractor = DetalizeFaceExtractorRefactored(
-            modules=args.modules,
-            module_configs=module_configs,
-            max_faces=args.max_faces,
-            refine_landmarks=args.refine_landmarks,
-            visualize=args.visualize,
-            visualize_dir=args.visualize_dir,
-            show_landmarks=args.show_landmarks,
-            min_detection_confidence=args.min_detection_confidence,
-            min_tracking_confidence=args.min_tracking_confidence,
-            min_face_size=args.min_face_size,
-            max_face_size_ratio=args.max_face_size_ratio,
-            min_aspect_ratio=args.min_aspect_ratio,
-            max_aspect_ratio=args.max_aspect_ratio,
-            validate_landmarks=args.validate_landmarks,
-        )
-    except Exception as e:
-        print(f"Ошибка при инициализации экстрактора: {e}")
-        exit(1)
-    
-    # Load and process input
-    input_path = Path(args.input)
-    frames = []
-    
-    if input_path.is_file():
-        # Process video file
-        print(f"Загрузка видео: {input_path}")
-        cap = cv2.VideoCapture(str(input_path))
-        
-        if not cap.isOpened():
-            print(f"Ошибка: не удалось открыть видео файл {input_path}")
-            exit(1)
-        
-        frame_count = 0
-        while True:
-            ret, frame = cap.read()
-            if not ret:
-                break
-            
-            if frame_count % args.frame_skip == 0:
-                frames.append(frame)
-                
-                if args.max_frames and len(frames) >= args.max_frames:
-                    break
-            
-            frame_count += 1
-        
-        cap.release()
-        print(f"Загружено {len(frames)} кадров из {frame_count} (skip={args.frame_skip})")
-        
-    elif input_path.is_dir():
-        # Process image directory
-        print(f"Загрузка изображений из директории: {input_path}")
-        image_extensions = {'.jpg', '.jpeg', '.png', '.bmp', '.tiff', '.tif'}
-        image_files = []
-        
-        for ext in image_extensions:
-            image_files.extend(input_path.glob(f"*{ext}"))
-            image_files.extend(input_path.glob(f"*{ext.upper()}"))
-        
-        image_files.sort()
-        
-        for i, img_path in enumerate(image_files):
-            if i % args.frame_skip == 0:
-                frame = cv2.imread(str(img_path))
-                if frame is not None:
-                    frames.append(frame)
-                    
-                    if args.max_frames and len(frames) >= args.max_frames:
-                        break
-        
-        print(f"Загружено {len(frames)} изображений")
-    else:
-        print(f"Ошибка: {input_path} не является файлом или директорией")
-        exit(1)
-    
-    if not frames:
-        print("Ошибка: не удалось загрузить ни одного кадра")
-        exit(1)
-    
-    # Process frames
-    print("Начинаем обработку...")
-    try:
-        results = extractor.extract(frames)
-        print(f"Обработка завершена. Обработано {len(results)} кадров")
-        
-        # Count total faces
-        total_faces = sum(len(frame_result) for frame_result in results)
-        print(f"Всего обнаружено лиц: {total_faces}")
-        
-    except Exception as e:
-        print(f"Ошибка при обработке: {e}")
-        exit(1)
-    
-    # Save results
-    output_path = Path(args.output)
-    output_path.parent.mkdir(parents=True, exist_ok=True)
-    
-    try:
-        import json
-        with open(output_path, 'w', encoding='utf-8') as f:
-            json.dump(results, f, ensure_ascii=False, indent=2)
-        print(f"Результаты сохранены в: {output_path}")
-        
-    except Exception as e:
-        print(f"Ошибка при сохранении результатов: {e}")
-        exit(1)
-    
-    print("Готово!")

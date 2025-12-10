@@ -131,26 +131,6 @@ def handle_very_long_video(total_frames: int, fps: float, max_duration_hours: fl
     }
 
 
-def handle_corrupted_frames(frame_indices: list, total_frames: int) -> Dict[str, Any]:
-    """
-    Обрабатывает случай поврежденных кадров.
-    
-    Args:
-        frame_indices: Список индексов кадров, которые нужно проверить.
-        total_frames: Общее количество кадров.
-    
-    Returns:
-        Словарь с информацией о поврежденных кадрах.
-    """
-    # В реальной реализации здесь была бы проверка каждого кадра
-    # Пока возвращаем структуру для будущей реализации
-    return {
-        "corrupted_frames": [],
-        "corrupted_count": 0,
-        "corruption_ratio": 0.0
-    }
-
-
 def validate_edge_cases(
     total_frames: int,
     fps: float,

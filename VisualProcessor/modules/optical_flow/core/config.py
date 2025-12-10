@@ -11,7 +11,6 @@ class FlowPipelineConfig:
     output_dir: str = "raft_output"
     model_type: str = "small"  # "small" или "large"
     max_dimension: int = 512
-    frame_skip: int = 5
     save_overlay: bool = True
     save_flow_tensors: bool = True
     create_summary_video: bool = False

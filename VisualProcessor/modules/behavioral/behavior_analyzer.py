@@ -671,33 +671,53 @@ class StressAnalyzer:
 class BehaviorAnalyzer:
     """Главный класс для анализа поведения"""
     
-    def __init__(self):
+    def __init__(
+        self,
+        # pose
+        pose_static_image_mode: bool = False,
+        pose_model_complexity: int = 2,
+        pose_smooth_landmarks: bool = True,
+        pose_min_detection_confidence: float = 0.5,
+        pose_min_tracking_confidence: float = 0.5,
+        # hands
+        hands_static_image_mode: bool = False,
+        hands_max_num_hands: int = 2,
+        hands_model_complexity: int = 1,
+        hands_min_detection_confidence: float = 0.5,
+        hands_min_tracking_confidence: float = 0.5,
+        # face
+        face_static_image_mode: bool = False,
+        face_max_num_faces: int = 1,
+        face_refine_landmarks: bool = True,
+        face_min_detection_confidence: float = 0.5,
+        face_min_tracking_confidence: float = 0.5,
+    ):
         self.mp_pose = mp.solutions.pose
         self.mp_hands = mp.solutions.hands
         self.mp_face_mesh = mp.solutions.face_mesh
         
         self.pose = self.mp_pose.Pose(
-            static_image_mode=False,
-            model_complexity=2,
-            smooth_landmarks=True,
-            min_detection_confidence=0.5,
-            min_tracking_confidence=0.5
+            static_image_mode=pose_static_image_mode,
+            model_complexity=pose_model_complexity,
+            smooth_landmarks=pose_smooth_landmarks,
+            min_detection_confidence=pose_min_detection_confidence,
+            min_tracking_confidence=pose_min_tracking_confidence
         )
         
         self.hands = self.mp_hands.Hands(
-            static_image_mode=False,
-            max_num_hands=2,
-            model_complexity=1,
-            min_detection_confidence=0.5,
-            min_tracking_confidence=0.5
+            static_image_mode=hands_static_image_mode,
+            max_num_hands=hands_max_num_hands,
+            model_complexity=hands_model_complexity,
+            min_detection_confidence=hands_min_detection_confidence,
+            min_tracking_confidence=hands_min_tracking_confidence
         )
         
         self.face_mesh = self.mp_face_mesh.FaceMesh(
-            static_image_mode=False,
-            max_num_faces=1,
-            refine_landmarks=True,
-            min_detection_confidence=0.5,
-            min_tracking_confidence=0.5
+            static_image_mode=face_static_image_mode,
+            max_num_faces=face_max_num_faces,
+            refine_landmarks=face_refine_landmarks,
+            min_detection_confidence=face_min_detection_confidence,
+            min_tracking_confidence=face_min_tracking_confidence
         )
         
         self.gesture_classifier = HandGestureClassifier()
@@ -784,55 +804,27 @@ class BehaviorAnalyzer:
         
         return results
     
-    def process_video(self, video_path: str, output_path: Optional[str] = None, 
-                     frame_skip: int = 1) -> Dict[str, Any]:
+    def process_video(self, frame_manager, frame_indices) -> Dict[str, Any]:
         """Обрабатывает видео"""
-        cap = cv2.VideoCapture(video_path)
-        if not cap.isOpened():
-            return {'error': f'Cannot open video: {video_path}'}
         
-        fps = int(cap.get(cv2.CAP_PROP_FPS))
-        total_frames = int(cap.get(cv2.CAP_PROP_FRAME_COUNT))
+        fps = frame_manager.fps
         
         all_results = []
-        frame_idx = 0
         
-        while cap.isOpened():
-            ret, frame = cap.read()
-            if not ret:
-                break
+        for frame_idx in frame_indices:
+            frame = frame_manager.get(frame_idx)
             
-            if frame_idx % frame_skip == 0:
-                result = self.process_frame(frame)
-                result['frame_idx'] = frame_idx
-                result['timestamp'] = frame_idx / fps
-                all_results.append(result)
+            result = self.process_frame(frame)
+            result['frame_idx'] = frame_idx
+            result['timestamp'] = frame_idx / fps
+            all_results.append(result)
             
             frame_idx += 1
         
-        cap.release()
-        
-        # Агрегирование результатов
         aggregated = self._aggregate_results(all_results)
         
-        # Сохранение результатов
-        if output_path:
-            with open(output_path, 'w', encoding='utf-8') as f:
-                json.dump({
-                    'video_path': video_path,
-                    'fps': fps,
-                    'total_frames': total_frames,
-                    'processed_frames': len(all_results),
-                    'frame_results': all_results,
-                    'aggregated': aggregated
-                }, f, indent=2, ensure_ascii=False)
-        
         return {
-            'success': True,
-            'video_path': video_path,
-            'fps': fps,
-            'total_frames': total_frames,
-            'processed_frames': len(all_results),
+            'frame_results': all_results,
             'aggregated': aggregated
         }
     
