@@ -1,0 +1,117 @@
+modules:
+    object_detection: true
+    scene_classification: true
+    detalize_face_modules: true
+    emotion_face: true
+
+global:
+    root_path: "/Users/user/Desktop/DataProcessor"
+    frames_dir: "/Users/user/Desktop/DataProcessor/Segmentor/data/video"
+    rs_path: "/Users/user/Desktop/DataProcessor/VisualProcessor/result_store"
+
+object_detection:
+    model_name: "google/owlvit-base-patch16"
+    model_family: "owlvit"
+    device: "cuda"
+    box_threshold: 0.3
+
+scene_classification:
+    model_arch: "resnet50" # DEFAULT: resnet18 resnet50 | TIMM: efficientnet_b0 efficientnet_b1 efficientnet_b2 efficientnet_b3 convnext_tiny convnext_small convnext_base vit_base_patch16_224 vit_large_patch16_224 regnetx_002 regnetx_004 regnetx_006 resnet50 resnet101
+    use_timm: false
+    top_k: 5
+    batch_size: 1
+    device: "cuda"
+    categories_path: None
+    cache_dir: None
+    gpu_memory_threshold: 0.95
+    log_metrics_every_n_frames: 10
+    input_size: 224 # 256, 320 ...
+    use_tta: True
+    use_multi_crop: True
+    temporal_smoothing: True
+    smoothing_window: 5
+    enable_advanced_features: True
+    use_clip_for_semantics: True
+
+detalize_face_modules:
+    modules: "geometry,pose,quality,lighting,skin,accessories,eyes,motion,structure,professional,lip_reading,face_3d"
+    max_faces: 10
+    refine_landmarks: True
+    visualize: False
+    visualize_dir: None
+    show_landmarks: False
+    min_detection_confidence: 0.7
+    min_tracking_confidence: 0.7
+    min_face_size: 30
+    max_face_size_ratio: 0.8
+    min_aspect_ratio: 0.6
+    max_aspect_ratio: 1.4
+    validate_landmarks: True
+
+emotion_face:
+    target_length: 256
+    max_retries: 2
+    min_faces_threshold: 20
+    default_threshold: 0.5
+    transition_threshold: 0.3
+    min_frames_ratio: 0.8
+    min_keyframes: 3
+    min_transitions: 2
+    min_diversity_threshold: 0.2
+    quality_threshold: 0.4
+    max_gap_seconds: 0.5
+    max_samples_per_segment: 10
+    ttl_enabled: false
+    ttl_seconds: 1800
+    cache_size_limit: 10
+    log_memory_usage: true
+    enable_structured_metrics: true
+    det_size: (640, 640)
+    emo_path: None
+    device: "cuda"
+
+behavioral:
+    pose_static_image_mode: False
+    pose_model_complexity: 2
+    pose_smooth_landmarks: True
+    pose_min_detection_confidence: 0.5
+    pose_min_tracking_confidence: 0.5
+    hands_static_image_mode: False
+    hands_max_num_hands: 2
+    hands_model_complexity: 1
+    hands_min_detection_confidence: 0.5
+    hands_min_tracking_confidence: 0.5
+    face_static_image_mode: False
+    face_max_num_faces: 1
+    face_refine_landmarks: True
+    face_min_detection_confidence: 0.5
+    face_min_tracking_confidence: 0.5
+    visualize: false
+    visualize_dir: ""
+
+optical_flow:
+    model: "small" # large
+    max_dim: 256
+    no_overlay: true
+    run_stats: true
+    run_camera_motion: true
+    no_advanced_features: false
+
+    grid_size: (4, 4)
+    motion_thresholds: [0.5, 1.0, 2.0]
+    direction_bins: 36
+    spatial_sample_rate: 10
+    top_regions_count: 3
+    savgol_window: 11
+    min_frames_for_temporal: 10
+    peak_detection_height: 0.1
+    enable_camera_motion: true
+
+    enable_advanced_features: true
+    enable_mei: true
+    enable_fg_bg: true
+    enable_clusters: true
+    enable_smoothness: true
+    fg_bg_method: 'magnitude_threshold'  # 'magnitude_threshold', 'spatial_clustering', 'segmentation'
+    fg_bg_threshold: 0.5
+    motion_clusters_n: 5
