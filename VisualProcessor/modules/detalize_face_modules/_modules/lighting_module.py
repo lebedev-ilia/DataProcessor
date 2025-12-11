@@ -6,8 +6,8 @@ from typing import Dict, List, Any, Optional
 import cv2
 import numpy as np
 
-from modules.base_module import FaceModule
-from utils.landmarks_utils import LANDMARKS
+from _modules.base_module import FaceModule
+from _utils.landmarks_utils import LANDMARKS
 
 
 class LightingModule(FaceModule):

@@ -1,8 +1,18 @@
 import os
+import sys
+
+_path = os.path.dirname(__file__)
+
+if _path not in sys.path:
+    sys.path.append(_path)
+
 import yaml
 import argparse
+import logging
 import subprocess
 
+from utils.logger import get_logger
+logger = get_logger("VisualProcessor")
 
 def run_module(global_cfg, module_name, module_cfg):
     """
@@ -13,8 +23,10 @@ def run_module(global_cfg, module_name, module_cfg):
     root_path = global_cfg["root_path"]
     frames_dir = global_cfg["frames_dir"]
     rs_path = global_cfg["rs_path"]
+
+    os.makedirs(rs_path, exist_ok=True)
     
-    module_path = os.path.join(root_path, "modules", module_name)
+    module_path = os.path.join(root_path, "VisualProcessor", "modules", module_name)
     venv_name = f".{module_name}_venv"
     module_venv_path = os.path.join(module_path, venv_name)
 
@@ -29,20 +41,26 @@ def run_module(global_cfg, module_name, module_cfg):
 
     kwargs = []
     for k, v in module_cfg.items():
+        if v is None or v == "False" or v is False:
+            continue
         key = f"--{k.replace('_', '-')}"
-        kwargs.extend([key, str(v)])
+        if v is True or v == "True":
+            kwargs.extend([key])
+        else:
+            kwargs.extend([key, str(v)])
         
     cmd = [python_exec, module_entry] + \
         kwargs + \
         ["--frames-dir", frames_dir] + \
         ["--rs-path", rs_path]
 
-    print("▶ Running:", " ".join(cmd))
+    logger.info(f"VisualProcessor | main | run_module | ▶ Running: {module_name}")
 
     try:
         subprocess.run(cmd)
         return True
-    except:
+    except Exception as e:
+        logger.error(f"VisualProcessor | main | run_module | Error: {e}")
         return False
 
 
@@ -56,6 +74,7 @@ def get_current_modules(config):
     return [name for name, enabled in config["modules"].items() if enabled]
 
 
+
 if __name__ == "__main__":
     parser = argparse.ArgumentParser(
         description="DataProcessor Controller",
@@ -66,16 +85,30 @@ if __name__ == "__main__":
 
     args = parser.parse_args()
 
+    logger.info(f"VisualProcessor | main | Начало обработки")
+
     config = load_config(args.cfg_path)
 
-    root_path = config["global"]["root_path"]
+    g_config = config["global"]
 
     current_modules = get_current_modules(config)
 
+    logger.info(f"VisualProcessor | main | Текущие модули:")
+
     for module in current_modules:
+        logger.info(f"            {module}")
+
+    for module in current_modules:
+        logger.info(f"VisualProcessor | main | {module} start")
+
         module_cfg = config.get(module)
+
+        logger.info(f"VisualProcessor | main | {module} config:")
+
+        for k, v in module_cfg.items():
+            logger.info(f"            {k}: {v}")
 
         if module_cfg is None:
             raise ValueError(f"❌ Config entry for module '{module}' not found in YAML")
 
-        status = run_module(root_path, module, module_cfg)
+        status = run_module(g_config, module, module_cfg)

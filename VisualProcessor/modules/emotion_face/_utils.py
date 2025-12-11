@@ -1,26 +1,20 @@
 import os
+import gc
+import cv2
 import math
 import psutil
 import torch
-import sys
+import numpy as np
 import torch.nn.functional as F
 from torchvision import transforms
-import cv2
-import json
-import shutil
 from pathlib import Path
-from typing import List, Tuple, Optional
-from numpy.lib.format import open_memmap
-import gc
-import numpy as np
+from typing import List, Optional
 
 DEVICE = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 FRAME_TMP_PREFIX = "tmp_frames"
 CHUNK_SIZE = 64
 SCAN_STRIDE = 20
 
-def log(*a, **kw):
-    print(*a, file=sys.stderr, **kw)
 
 def segmentation(timeline, fps=30, max_gap_seconds=0.5, max_segment_length_sec=3.0):
     """
@@ -633,7 +627,7 @@ def validate_sequence_quality(emotions, min_length=20, min_diversity_threshold=0
     
     is_valid = overall_score >= quality_threshold and diversity_score >= diversity_threshold
 
-    logger.log(f"[VALIDATION QUALITY] overall_score: {overall_score} |>=| quality_threshold: {quality_threshold} | diversity_score: {diversity_score} |>=| diversity_threshold: {diversity_threshold}")
+    logger.info(f"[VALIDATION QUALITY] overall_score: {overall_score} |>=| quality_threshold: {quality_threshold} | diversity_score: {diversity_score} |>=| diversity_threshold: {diversity_threshold}")
     
     return {
         'is_valid': bool(is_valid),
@@ -653,7 +647,7 @@ def validate_sequence_quality(emotions, min_length=20, min_diversity_threshold=0
         }
     }
 
-def save_for_user(data, video_path, output_dir='user_results'):
+def save_for_user(data, output, output_dir='user_results'):
     """
     Сохраняет детализированные результаты для пользователя.
     """
@@ -661,11 +655,10 @@ def save_for_user(data, video_path, output_dir='user_results'):
     import os
     from datetime import datetime
     
-    os.makedirs(output_dir, exist_ok=True)
+    os.makedirs(f"{output}/{output_dir}", exist_ok=True)
     
-    video_name = os.path.splitext(os.path.basename(video_path))[0]
     timestamp = datetime.now().strftime('%Y%m%d_%H%M%S')
-    output_file = os.path.join(output_dir, f"{video_name}_{timestamp}_analysis.json")
+    output_file = os.path.join(output, output_dir, f"{timestamp}_analysis.json")
     
     # Функция для преобразования несериализуемых типов
     def make_serializable(obj):
@@ -687,8 +680,7 @@ def save_for_user(data, video_path, output_dir='user_results'):
     # Подготавливаем данные для сериализации
     serializable_data = make_serializable({
         'metadata': {
-            'video_path': str(video_path),  # Преобразуем Path в строку
-            'video_name': str(video_name),
+            'output': str(output),  # Преобразуем Path в строку
             'analysis_timestamp': str(timestamp),
             'processing_version': '1.0'
         },
@@ -718,7 +710,7 @@ def save_for_user(data, video_path, output_dir='user_results'):
     print(f"[INFO] User analysis saved to: {output_file}")
     return output_file
 
-def save_for_model(data, video_path, output_dir='model_data'):
+def save_for_model(data, output, output_dir='model_data'):
     """
     Сохраняет нормализованные данные для обучения модели.
     """
@@ -727,9 +719,8 @@ def save_for_model(data, video_path, output_dir='model_data'):
     import os
     from datetime import datetime
     
-    os.makedirs(output_dir, exist_ok=True)
+    os.makedirs(f"{output}/{output_dir}", exist_ok=True)
     
-    video_name = os.path.splitext(os.path.basename(video_path))[0]
     timestamp = datetime.now().strftime('%Y%m%d_%H%M%S')
     
     # Функция для преобразования данных
@@ -761,13 +752,11 @@ def save_for_model(data, video_path, output_dir='model_data'):
     
     # Сохраняем как numpy файл
     np_array = np.array(emotions_array, dtype=np.float32)
-    npy_file = os.path.join(output_dir, f"{video_name}_{timestamp}_emotions.npy")
+    npy_file = os.path.join(output, output_dir, f"{timestamp}_emotions.npy")
     np.save(npy_file, np_array)
     
     # Сохраняем метаданные
     metadata = prepare_for_json({
-        'video_name': str(video_name),
-        'original_path': str(video_path),
         'processing_timestamp': str(timestamp),
         'sequence_length': int(len(np_array)),
         'feature_dim': int(np_array.shape[1]),
@@ -785,7 +774,7 @@ def save_for_model(data, video_path, output_dir='model_data'):
         }
     })
     
-    meta_file = os.path.join(output_dir, f"{video_name}_{timestamp}_meta.json")
+    meta_file = os.path.join(output, output_dir, f"{timestamp}_meta.json")
     with open(meta_file, 'w', encoding='utf-8') as f:
         json.dump(metadata, f, indent=2, ensure_ascii=False)
     
@@ -1015,7 +1004,7 @@ def compute_steps(total_frames, MAX_SCANS=2000, MIN_SCANS=50, BASE=500, SCALE_FA
         target_scans = int(min(MAX_SCANS, max(MIN_SCANS, target_scans)))
         target_scans = min(target_scans, total_frames)  # Не больше общего числа кадров
     except Exception as e:
-        log(f"Ошибка расчета target_scans: {e}")
+        print(f"_utils | compute_steps | Ошибка расчета target_scans: {e}")
         target_scans = min(MAX_SCANS, total_frames // 10)
     
     try:
@@ -1023,153 +1012,11 @@ def compute_steps(total_frames, MAX_SCANS=2000, MIN_SCANS=50, BASE=500, SCALE_FA
         scan_stride = max(1, total_frames // target_scans)
         scan_stride = int(scan_stride)
     except Exception as e:
-        log(f"Ошибка расчета scan_stride: {e}")
+        print(f"_utils | compute_steps | Ошибка расчета scan_stride: {e}")
         scan_stride = max(1, total_frames // 100)
     
     return scan_stride, target_scans 
 
-def frame_writer(video_path: str, out_dir: str, batch_size: int = 512, logger=None):
-    os.makedirs(out_dir, exist_ok=True)
-    cap = cv2.VideoCapture(video_path)
-    
-    # Получаем FPS из видео
-    fps = cap.get(cv2.CAP_PROP_FPS)
-    if fps <= 0:
-        fps = 30  # значение по умолчанию
-
-    p_meta = os.path.join(out_dir, "metadata.json")
-
-    if os.path.exists(p_meta):
-        with open(p_meta, "r") as f:
-            meta = json.load(f)
-        cap.release()
-        return meta
-    else:
-        meta = {
-            "total_frames": 0,
-            "batch_size": batch_size,
-            "fps": fps,
-            "batches": []
-        }
-
-    H = W = C = None
-    batch_id = 0
-    buf_count = 0
-    arr = None
-    current_path = None  # Добавлено: храним path для частичного батча
-
-    while True:
-        ret, frame = cap.read()
-        if not ret:
-            break
-
-        if H is None:
-            H, W, C = frame.shape
-            # Добавлено: сохраняем размеры в meta
-            meta["height"] = H
-            meta["width"] = W
-            meta["channels"] = C
-
-        # фиксируем возможные битые размеры
-        if frame.shape != (H, W, C):
-            frame = cv2.resize(frame, (W, H), interpolation=cv2.INTER_AREA)
-
-        # создаём mmap под батч
-        if buf_count == 0:
-            fname = f"batch_{batch_id:05d}.npy"
-            current_path = os.path.join(out_dir, fname)
-
-            arr = open_memmap(
-                filename=current_path,
-                mode="w+",
-                dtype=np.uint8,
-                shape=(batch_size, H, W, C)
-            )
-
-        arr[buf_count] = frame
-        buf_count += 1
-        meta["total_frames"] += 1
-
-        # батч заполнен → записываем мету, закрываем
-        if buf_count == batch_size:
-            arr.flush()
-            del arr  
-            arr = None  # Очистка
-
-            logger.log(f"Записан Батч №{batch_id+1} | start: {batch_id * batch_size} | end: {batch_id * batch_size + buf_count - 1}")
-
-            meta["batches"].append({
-                "batch_index": batch_id,
-                "path": fname,
-                "start_frame": batch_id * batch_size,
-                "end_frame": batch_id * batch_size + buf_count - 1
-            })
-
-            buf_count = 0
-            batch_id += 1
-
-    # последний неполный батч
-    if buf_count > 0:
-        arr.flush()
-        # Добавлено: обрезаем файл до реального размера (для экономии диска и точности)
-        frame_bytes = H * W * C
-        actual_bytes = buf_count * frame_bytes
-        os.truncate(current_path, actual_bytes)
-        del arr  
-        arr = None  # Очистка
-
-        fname = f"batch_{batch_id:05d}.npy"  # Уже определён
-        meta["batches"].append({
-            "batch_index": batch_id,
-            "path": fname,
-            "start_frame": batch_id * batch_size,
-            "end_frame": batch_id * batch_size + buf_count - 1
-        })
-
-    with open(os.path.join(out_dir, "metadata.json"), "w") as f:
-        json.dump(meta, f, indent=2)
-
-    cap.release()
-
-    return meta
-
-def safe_det_score(face) -> float:
-    return float(getattr(face, "det_score", getattr(face, "score", 0.0) or 0.0))
-
-def detect_face(frame_bgr: np.ndarray, face_app, thr: float = 0.5) -> bool:
-    """
-    frame_bgr: OpenCV BGR ndarray
-    Returns True if any face >= thr
-    """
-    try:
-        faces = face_app.get(frame_bgr)
-        if not faces:
-            return False
-        best = max(safe_det_score(f) for f in faces)
-        return best >= thr
-    except Exception:
-        return False
-
-def scan_for_faces(fm: FrameManager, face_app, scan_stride: int = SCAN_STRIDE, detect_thr: float = 0.5) -> List[int]:
-    """
-    Scan video for face presence. Returns sorted list of frame indices where face detected.
-    scan_stride can be >1 to speed up scanning.
-    """
-    total = fm.total_frames
-    timeline = []
-    cn = 0
-    # iterate with stride, but we will later use windows around hits
-    for i in range(0, total, scan_stride):
-        try:
-            frame = fm.get(i)
-            cn += 1
-        except IndexError:
-            continue
-        # detect expects BGR
-        if detect_face(frame, face_app, thr=detect_thr):
-            timeline.append(i)
-    # Optionally refine: try to fill small gaps by checking neighbors? we'll keep it simple
-    return timeline, cn
 
 EMOTION_CLASSES = {
     0: "Neutral", 1: "Happy", 2: "Sad", 3: "Surprise",

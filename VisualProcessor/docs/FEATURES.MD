@@ -1,6 +1,6 @@
 # 🎬 1. Объекты, сцена, окружение
 
-## 1.1. Детектирование объектов         🟩🟩🟥
+## 1.1. Детектирование объектов         🟩🟩🟩🟥 🟪🟪
 
 ### Модели для детектирования
 
@@ -32,7 +32,7 @@
 - семантика объектов ("luxury", "danger", "cute")
 - атрибуты объектов (цвет, стиль, размер)
 
-## 1.2. Сценарное распознавание         🟩🟩🟥
+## 1.2. Сценарное распознавание         🟩🟩🟩🟥 🟪🟪
 
 ### Модели для распознавания сцен
 
@@ -294,7 +294,7 @@ similarity(video, trending_category_X)
 
 # 🧑‍🦰 2. Люди, лица, эмоции и поведение
 
-## 🎯 2.1. Детализация лиц              🟩🟩🟥
+## 🎯 2.1. Детализация лиц              🟩🟩🟥🟥 🟪🟪
 
 ---
 
@@ -513,7 +513,7 @@ FaceParsing (BiSeNet) для сегментации:
      - улыбка
      - активная мимика
 
-## 2.2. Эмоции из лица                  🟩🟩🟥
+## 2.2. Эмоции из лица                  🟩🟩🟥🟥 🟪🟪
 
 ### ✅ КАТЕГОРИИ ФИЧЕЙ ИЗ ЭМОЦИЙ
 
@@ -761,7 +761,7 @@ FaceParsing (BiSeNet) для сегментации:
   - эмоции публики
   - согласованность эмоций всех лиц
 
-## 2.3. Поведение людей (behavioral)    🟩🟩🟥
+## 2.3. Поведение людей (behavioral)    🟩🟩🟥🟥 🟪🟪
 
 ### 🧠 2.3. Поведение людей — Полный разбор
 
@@ -997,7 +997,7 @@ FaceParsing (BiSeNet) для сегментации:
 
 # 3. Движение, активность, экшн-зоны
 
-## 3.1. Optical Flow Statistics         🟩🟩🟥
+## 3.1. Optical Flow Statistics         🟩🟩🟥🟥 🟪🟪
 
 🔹 3.1.1. Базовые статистики скорости и направления
 
@@ -1410,7 +1410,7 @@ shakiness = np.var(flow_background)
 - `style_screencap`
 - `style_gaming`
 
-## 3.2. Action Recognition              🟩🟥🟥
+## 3.2. Action Recognition              🟩🟥🟥🟥 🟪🟪
 
 🔹 3.2.1. High-level Actions (высокоуровневые действия)
 
@@ -1647,7 +1647,7 @@ ActionRecognitionModule:
 
 # 🌈 4. Стиль и кинематографические признаки
 
-## 4.1. Цвет и свет                     🟩🟥🟥
+## 4.1. Цвет и свет                     🟩🟥🟥🟥 🟪🟪
 
 🌈 A) Цветовые статистики (базовые, но расширенные)
 
@@ -1817,7 +1817,7 @@ ActionRecognitionModule:
 
 > 💡 Всего можно получить 100–200 цветовых/осветительных фичей.
 
-## 4.2. Композиция кадра                🟩🟥🟥
+## 4.2. Композиция кадра                🟩🟥🟥🟥 🟪🟪
 
 ### 🧱 A) Правило третей (Rule of Thirds)
 
@@ -2036,7 +2036,7 @@ attention_to_product_ratio
 
 Разбора стиля создания контента
 
-## 4.3. Shot Quality Metrics            🟩🟥🟥
+## 4.3. Shot Quality Metrics            🟩🟥🟥🟥 🟪🟪
 
 🧼 A) Sharpness & Clarity (резкость)
 
@@ -2199,7 +2199,7 @@ attention_to_product_ratio
 
 # ✂️ 5. Монтаж, ритм, структура
 
-## 5.1. Cut detection                   🟩🟥🟥
+## 5.1. Cut detection                   🟩🟥🟥🟥 🟪🟪
 
 🔧 A) Типы склеек (детектируемые)
 ✔ Hard Cuts (моментальное переключение)
@@ -2413,7 +2413,7 @@ edit_style_slow_prob
 | Аудио-связь | audio-cut sync score |
 | Стиль монтажа | fast/cinematic/meme |
 
-## 5.2. Video pacing                    🟩🟥🟥
+## 5.2. Video pacing                    🟩🟥🟥🟥 🟪🟪
 
 🔥 A. Метрические фичи темпа монтажа (чистый pace)
 1. Cut rate per second
@@ -2634,7 +2634,7 @@ scene_duration_variance
 - `climax_speed`
 - `pacing_symmetry`
 
-## 5.3. Story Structure                 🟩🟥🟥
+## 5.3. Story Structure                 🟩🟥🟥🟥 🟪🟪
 
 🧩 A. Сегментация истории (Story Segmentation)
 
@@ -2867,7 +2867,7 @@ story_coherence_score
 
 abrupt_semantic_changes
 
-# 🔤 6. Текст в кадре text scoring      🟩🟥🟥
+# 🔤 6. Текст в кадре text scoring      🟩🟥🟥🟥 🟪🟪
 
 📚 A. Основные извлекаемые данные
 1. Raw OCR text dataset
@@ -3122,7 +3122,7 @@ cta_strength (эмоционально + визуально)
 - `emphasis_score`
 - CTA timestamps
 
-# 🧠 7. Высокоуровневая семантика видео 🟩🟥🟥
+# 🧠 7. Высокоуровневая семантика видео 🟩🟥🟥🟥 🟪🟪
 
 🔹 A. Scene-level semantic embeddings
 
@@ -3276,7 +3276,7 @@ cta_strength (эмоционально + визуально)
 | Multimodal | multimodal_attention, event_alignment, cross_modal_novelty |
 | High-level labels | genre_probabilities, style_probability, content_type_probabilities |
 
-# 📊 8. Метрики сравнений               🟩🟥🟥
+# 📊 8. Метрики сравнений               🟩🟥🟥🟥 🟪🟪
 
 🔹 A. Semantic similarity
 
@@ -3403,7 +3403,7 @@ Cut rate, shot duration, scene length. Плавность повествован
 | Temporal / Pacing | pacing_curve_similarity, shot_duration_distribution_similarity |
 | High-level | overall_similarity_score, uniqueness_score, trend_alignment_score |
 
-# ⭐ 9. Степень уникальности видео      🟥🟥🟥
+# ⭐ 9. Степень уникальности видео      🟥🟥🟥🟥 🟪🟪
 
 🔹 A. Semantic / Content Novelty
 

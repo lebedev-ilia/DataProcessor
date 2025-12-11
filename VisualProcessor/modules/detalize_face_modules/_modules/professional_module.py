@@ -6,7 +6,7 @@ from typing import Dict, List, Any, Optional
 from collections import defaultdict, deque
 import numpy as np
 
-from modules.base_module import FaceModule
+from _modules.base_module import FaceModule
 
 
 class ProfessionalModule(FaceModule):

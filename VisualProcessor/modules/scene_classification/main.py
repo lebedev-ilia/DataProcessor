@@ -1,3 +1,10 @@
+import os
+import sys
+_path = os.path.dirname(os.path.dirname(os.path.dirname(__file__)))
+
+if _path not in sys.path:
+    sys.path.append(_path)
+
 import json
 import argparse
 
@@ -6,6 +13,9 @@ from utils.frame_manager import FrameManager
 from utils.results_store import ResultsStore
 
 name = "scene_classification"
+
+from utils.logger import get_logger
+logger = get_logger(name)
 
 def load_metadata(meta_path):
     try:
@@ -20,24 +30,24 @@ if __name__ == "__main__":
         formatter_class=argparse.ArgumentDefaultsHelpFormatter
     )
     
-    parser.add_argument('--model_arch',                 type=str,   default=None, help='')
-    parser.add_argument('--use_timm',                   type=str,   default=None, help='')
-    parser.add_argument('--top_k',                      type=str,   default=None, help='')
-    parser.add_argument('--batch_size',                 type=float, default=None, help='')
-    parser.add_argument('--device',                     type=str,   default=None, help='')
-    parser.add_argument('--categories_path',            type=str,   default=None, help='')
-    parser.add_argument('--cache_dir',                  type=str,   default=None, help='')
-    parser.add_argument('--gpu_memory_threshold',       type=str,   default=None, help='')
-    parser.add_argument('--log_metrics_every_n_frames', type=str,   default=None, help='')
-    parser.add_argument('--input_size',                 type=str,   default=None, help='')
-    parser.add_argument('--use_tta',                    type=str,   default=None, help='')
-    parser.add_argument('--use_multi_crop',             type=str,   default=None, help='')
-    parser.add_argument('--temporal_smoothing',         type=str,   default=None, help='')
-    parser.add_argument('--smoothing_window',           type=str,   default=None, help='')
-    parser.add_argument('--enable_advanced_features',   type=str,   default=None, help='')
-    parser.add_argument('--use_clip_for_semantics',     type=str,   default=None, help='')
-    parser.add_argument('--frames-dir',    type=str,   default=None, help='')
-    parser.add_argument('--rs-path',       type=str,   default=None, help='')
+    parser.add_argument('--model-arch',                 type=str,              default=None, help='')
+    parser.add_argument('--use-timm',                   action="store_true",   default=None, help='')
+    parser.add_argument('--min-scene-length',           type=int,   default=None, help='')
+    parser.add_argument('--batch-size',                 type=int,              default=None, help='')
+    parser.add_argument('--device',                     type=str,              default=None, help='')
+    parser.add_argument('--categories-path',            type=str,              default=None, help='')
+    parser.add_argument('--cache-dir',                  type=str,              default=None, help='')
+    parser.add_argument('--gpu-memory-threshold',       type=float,            default=None, help='')
+    parser.add_argument('--log-metrics-every-n-frames', type=int,              default=None, help='')
+    parser.add_argument('--input-size',                 type=int,              default=None, help='')
+    parser.add_argument('--use-tta',                    action="store_true",   default=None, help='')
+    parser.add_argument('--use-multi-crop',             action="store_true",   default=None, help='')
+    parser.add_argument('--temporal-smoothing',         action="store_true",   default=None, help='')
+    parser.add_argument('--smoothing-window',           type=int,              default=None, help='')
+    parser.add_argument('--enable-advanced-features',   action="store_true",   default=None, help='')
+    parser.add_argument('--use-clip-for-semantics',     action="store_true",   default=None, help='')
+    parser.add_argument('--frames-dir',                 type=str,              default=None, help='')
+    parser.add_argument('--rs-path',                    type=str,              default=None, help='')
     
     args = parser.parse_args()
     
@@ -48,7 +58,7 @@ if __name__ == "__main__":
     
     model_arch                 = args.model_arch
     use_timm                   = args.use_timm
-    top_k                      = args.top_k
+    min_scene_length           = args.min_scene_length
     batch_size                 = args.batch_size
     device                     = args.device
     categories_path            = args.categories_path
@@ -66,7 +76,7 @@ if __name__ == "__main__":
     classifier = Places365SceneClassifier(
         model_arch=model_arch,
         use_timm=use_timm,
-        top_k=top_k,
+        min_scene_length=min_scene_length,
         batch_size=batch_size,
         device=device,
         categories_path=categories_path,

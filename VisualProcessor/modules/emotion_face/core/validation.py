@@ -99,7 +99,7 @@ class ValidationLogic:
             (has_enough_diversity or is_monotonic_video)
         )
 
-        logger.log(
+        logger.info(
             f"[VALIDATION] is_valid: {is_valid} | has_enough_frames: {has_enough_frames} | has_enough_keyframes: {has_enough_keyframes} | has_enough_diversity: {has_enough_diversity} | is_monotonic_video: {is_monotonic_video} | has_enough_transitions: {has_enough_transitions} ({transition_count}>={min_transitions})"
             )
         

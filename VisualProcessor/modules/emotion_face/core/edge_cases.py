@@ -2,7 +2,7 @@
 Обработка граничных случаев (edge cases) для обработки видео.
 """
 from typing import Dict, Any, Tuple
-from core.exceptions import VideoFileError, FrameSelectionError
+from core.exceptions import FrameSelectionError
 
 
 def check_video_duration(total_frames: int, fps: float) -> Dict[str, Any]:
@@ -42,11 +42,7 @@ def handle_empty_video(total_frames: int) -> None:
         VideoFileError: Если видео пустое.
     """
     if total_frames == 0:
-        raise VideoFileError(
-            "Video file is empty (no frames)",
-            details={"total_frames": total_frames}
-        )
-
+        raise
 
 def handle_no_faces(timeline: list, total_frames: int, min_faces_ratio: float = 0.01) -> Tuple[bool, str]:
     """
@@ -130,66 +126,6 @@ def handle_very_long_video(total_frames: int, fps: float, max_duration_hours: fl
         "recommendation": "normal_processing"
     }
 
-
-def validate_edge_cases(
-    total_frames: int,
-    fps: float,
-    timeline: list,
-    min_faces_ratio: float = 0.01
-) -> Dict[str, Any]:
-    """
-    Комплексная валидация граничных случаев.
-    
-    Args:
-        total_frames: Общее количество кадров.
-        fps: FPS видео.
-        timeline: Список индексов кадров с лицами.
-        min_faces_ratio: Минимальная доля кадров с лицами.
-    
-    Returns:
-        Словарь с информацией о всех граничных случаях.
-    
-    Raises:
-        VideoFileError: Если видео пустое.
-        FrameSelectionError: Если нет лиц и это критично.
-    """
-    # Проверка пустого видео
-    handle_empty_video(total_frames)
-    
-    # Проверка длительности
-    duration_info = check_video_duration(total_frames, fps)
-    
-    # Проверка наличия лиц
-    is_critical_no_faces, faces_message = handle_no_faces(timeline, total_frames, min_faces_ratio)
-    
-    if is_critical_no_faces:
-        raise FrameSelectionError(
-            "No faces detected in video",
-            details={
-                "total_frames": total_frames,
-                "faces_detected": len(timeline),
-                "fps": fps
-            }
-        )
-    
-    # Обработка очень коротких видео
-    short_video_info = handle_very_short_video(total_frames, fps)
-    
-    # Обработка очень длинных видео
-    long_video_info = handle_very_long_video(total_frames, fps)
-    
-    return {
-        "duration": duration_info,
-        "faces": {
-            "count": len(timeline),
-            "ratio": len(timeline) / total_frames if total_frames > 0 else 0,
-            "message": faces_message,
-            "is_critical": is_critical_no_faces
-        },
-        "short_video": short_video_info,
-        "long_video": long_video_info,
-        "warnings": _collect_warnings(duration_info, short_video_info, long_video_info, len(timeline), total_frames)
-    }
 
 
 def _collect_warnings(

@@ -26,6 +26,8 @@ try:
 except ImportError:
     CLIP_AVAILABLE = False
     
+from utils.logger import get_logger
+logger = get_logger("Places365SceneClassifier")
 
 class Places365SceneClassifier:
     """
@@ -71,7 +73,7 @@ class Places365SceneClassifier:
         *,
         model_arch: str = "resnet50",
         use_timm: bool = False,
-        top_k: int = 5,
+        min_scene_length: int = 30,
         batch_size: int = 1,
         device: Optional[str] = None,
         categories_path: Optional[str] = None,
@@ -109,13 +111,8 @@ class Places365SceneClassifier:
         :param enable_advanced_features: enable advanced features (indoor/outdoor, time of day, etc.)
         :param use_clip_for_semantics: use CLIP for semantic features (aesthetic, atmosphere)
         """
-        super().__init__(
-            gpu_memory_threshold=gpu_memory_threshold,
-            log_metrics_every_n_frames=log_metrics_every_n_frames,
-        )
-
+        self.min_scene_length = min_scene_length
         self.device = device or ("cuda" if torch.cuda.is_available() else "cpu")
-        self.top_k = max(1, top_k)
         self.batch_size = max(1, batch_size)
         self.input_size = input_size
         self.use_tta = use_tta
@@ -180,84 +177,88 @@ class Places365SceneClassifier:
             self._load_clip_model()
 
     def classify(
-        self, frame_manager, frame_indices, top_k: Optional[int] = None
-    ) -> List[List[Dict[str, Any]]]:
+        self, frame_manager, frame_indices
+    ) -> List[Dict[str, Any]]:
         """
         Runs scene classification over the provided frames.
 
-        :param top_k: override default number of predictions
-        :return: list where each element contains predictions dicts for a frame:
-                 { "label": str, "score": float }
+        Returns a list of dicts, one per frame:
+            { "label": str, "score": float }
         """
-        k = max(1, top_k or self.top_k)
-        raw_predictions: List[List[Dict[str, Any]]] = [[] for _ in range(len(frame_indices))]
 
-        # Process frames with batching
+        # Output results indexed by position (not frame index)
+        raw_predictions: List[Dict[str, Any]] = [None] * len(frame_indices)
+
+        # Map frame_index → output array position
+        index_map = {frame_idx: i for i, frame_idx in enumerate(frame_indices)}
+
+        # Batch accumulators
         batch_tensors: List[torch.Tensor] = []
-        batch_indices: List[int] = []
+        batch_frame_indices: List[int] = []
+
+        def select_best(preds: List[Dict[str, Any]]) -> Dict[str, Any]:
+            """Return the highest-score prediction."""
+            return max(preds, key=lambda x: x["score"])
 
         def flush_batch() -> None:
+            """Run inference for accumulated tensors and distribute results."""
             if not batch_tensors:
                 return
-            batch_tensor = torch.cat(batch_tensors, dim=0)
-            batch_results = self._infer_batch(batch_tensor, k)
-            
-            # Group results by frame index (for TTA/multi-crop averaging)
-            frame_results: Dict[int, List[List[Dict[str, Any]]]] = {}
-            for idx, preds in zip(batch_indices, batch_results):
-                if idx not in frame_results:
-                    frame_results[idx] = []
-                frame_results[idx].append(preds)
-            
-            # Average predictions for frames with multiple inferences (TTA/multi-crop)
-            for idx, pred_list in frame_results.items():
-                if len(pred_list) > 1:
-                    raw_predictions[idx] = self._average_predictions(pred_list, k)
-                else:
-                    raw_predictions[idx] = pred_list[0]
-            
-            batch_tensors.clear()
-            batch_indices.clear()
 
+            batch_tensor = torch.cat(batch_tensors, dim=0)
+            batch_results = self._infer_batch(batch_tensor)  # returns list[list[preds]]
+
+            # Group predictions by frame index (in case of TTA/multi-crop)
+            frame_groups: Dict[int, List[List[Dict[str, Any]]]] = {}
+
+            for frame_idx, preds in zip(batch_frame_indices, batch_results):
+                frame_groups.setdefault(frame_idx, []).append(preds)
+
+            # Merge predictions (if multi-crop/TTA) → pick best overall
+            for frame_idx, pred_list in frame_groups.items():
+                all_preds = [p for group in pred_list for p in group]
+                best = select_best(all_preds)
+
+                pos = index_map[frame_idx]
+                raw_predictions[pos] = best
+
+            batch_tensors.clear()
+            batch_frame_indices.clear()
+
+        # Main loop
         for frame_idx in frame_indices:
-            
+
             frame = frame_manager.get(frame_idx)
-            
-            self.check_system_state(frame_idx)
             if frame is None:
                 continue
 
-            # Prepare frame(s) - may return multiple tensors for TTA/multi-crop
             tensors = self._prepare_frame(frame)
             if tensors is None:
                 continue
 
+            # Multi-crop/TTA returns list
             if isinstance(tensors, list):
-                # Multiple tensors (TTA or multi-crop)
                 for tensor in tensors:
                     batch_tensors.append(tensor)
-                    batch_indices.append(frame_idx)
+                    batch_frame_indices.append(frame_idx)
             else:
-                # Single tensor
                 batch_tensors.append(tensors)
-                batch_indices.append(frame_idx)
+                batch_frame_indices.append(frame_idx)
 
             if len(batch_tensors) >= self.batch_size:
                 flush_batch()
 
+        # Last batch
         flush_batch()
 
-        # Apply temporal smoothing if enabled
-        if self.temporal_smoothing and len(raw_predictions) > 1:
-            return self._apply_temporal_smoothing(raw_predictions, k)
-        
         return raw_predictions
 
     __call__ = classify
 
+
     def _prepare_frame(self, frame: np.ndarray) -> Optional[torch.Tensor | List[torch.Tensor]]:
         if frame is None or not isinstance(frame, np.ndarray):
-            self.logger.warning("Frame is not a numpy array – skipping")
+            logger.warning("Frame is not a numpy array – skipping")
             return None
 
         if frame.ndim == 2:
@@ -289,26 +290,30 @@ class Places365SceneClassifier:
         tensor = self.preprocess(image).unsqueeze(0).to(self.device)
         return tensor
 
-    def _infer_batch(self, tensor: torch.Tensor, top_k: int) -> List[List[Dict[str, Any]]]:
+    def _infer_batch(self, tensor: torch.Tensor) -> List[List[Dict[str, Any]]]:
         with torch.no_grad():
             logits = self.model(tensor)
             probs = F.softmax(logits, dim=1)
-            top_probs, top_indices = probs.topk(top_k, dim=1)
 
         batch_predictions: List[List[Dict[str, Any]]] = []
-        for sample_probs, sample_indices in zip(top_probs, top_indices):
-            frame_predictions: List[Dict[str, Any]] = []
-            for prob, idx in zip(sample_probs, sample_indices):
-                class_idx = int(idx)
+
+        for sample_probs in probs:  # sample_probs: [num_classes]
+            frame_predictions = []
+            for class_idx, prob in enumerate(sample_probs):
                 label = (
                     self.categories[class_idx]
                     if 0 <= class_idx < len(self.categories)
                     else f"class_{class_idx}"
                 )
-                frame_predictions.append({"label": label, "score": float(prob.item())})
+                frame_predictions.append({
+                    "label": label,
+                    "score": float(prob)
+                })
+
             batch_predictions.append(frame_predictions)
 
         return batch_predictions
+
 
     def _load_model(self, model_arch: str) -> torch.nn.Module:
         model_arch = model_arch.lower()
@@ -323,7 +328,7 @@ class Places365SceneClassifier:
                 )
             
             timm_name = self.TIMM_MODELS[model_arch]
-            self.logger.info(f"Loading timm model: {timm_name} (pretrained on ImageNet)")
+            logger.info(f"Loading timm model: {timm_name} (pretrained on ImageNet)")
             
             # Create model with ImageNet pretrained weights and Places365 classifier
             model = timm.create_model(
@@ -332,7 +337,7 @@ class Places365SceneClassifier:
                 num_classes=len(self.categories),  # Directly set to Places365 classes
             )
             
-            self.logger.info(
+            logger.info(
                 f"Model loaded from timm. Note: Using ImageNet pretrained weights. "
                 f"For best results, fine-tune on Places365 dataset."
             )
@@ -371,9 +376,9 @@ class Places365SceneClassifier:
 
         missing, unexpected = model.load_state_dict(cleaned_state, strict=False)
         if missing:
-            self.logger.warning("Missing keys while loading Places365 weights: %s", missing)
+            logger.warning("Missing keys while loading Places365 weights: %s", missing)
         if unexpected:
-            self.logger.warning("Unexpected keys while loading Places365 weights: %s", unexpected)
+            logger.warning("Unexpected keys while loading Places365 weights: %s", unexpected)
 
         return model.to(self.device)
 
@@ -394,7 +399,7 @@ class Places365SceneClassifier:
             cache_file.write_text(response.text, encoding="utf-8")
             return self._parse_categories(response.text)
         except Exception as exc:
-            self.logger.warning(
+            logger.warning(
                 "Failed to load Places365 categories (%s). Falling back to generic labels.",
                 exc,
             )
@@ -536,19 +541,21 @@ class Places365SceneClassifier:
     
     def _load_clip_model(self) -> None:
         """Load CLIP model for semantic features."""
+        import os
+        p = os.path.dirname(__file__)
+
         if not CLIP_AVAILABLE:
-            self.logger.warning("CLIP not available. Install transformers for semantic features.")
+            logger.warning("CLIP not available. Install transformers for semantic features.")
             return
-        
         try:
-            self.logger.info("Loading CLIP model for semantic features...")
-            self._clip_model = CLIPModel.from_pretrained("openai/clip-vit-base-patch32")
+            logger.info("Loading CLIP model for semantic features...")
+            self._clip_model = CLIPModel.from_pretrained(f"{p}/models/clip_vit_base_patch32")
             self._clip_processor = CLIPProcessor.from_pretrained("openai/clip-vit-base-patch32")
             self._clip_model = self._clip_model.to(self.device)
             self._clip_model.eval()
-            self.logger.info("CLIP model loaded successfully")
+            logger.info("CLIP model loaded successfully")
         except Exception as e:
-            self.logger.warning(f"Failed to load CLIP model: {e}. Semantic features will be limited.")
+            logger.warning(f"Failed to load CLIP model: {e}. Semantic features will be limited.")
             self.use_clip_for_semantics = False
     
     def _classify_indoor_outdoor(self, scene_label: str) -> Dict[str, float]:
@@ -686,7 +693,7 @@ class Places365SceneClassifier:
             aesthetic_score = (probs[0][0] + probs[0][1]).item()
             return float(aesthetic_score)
         except Exception as e:
-            self.logger.warning(f"CLIP aesthetic score failed: {e}, using heuristic")
+            logger.warning(f"CLIP aesthetic score failed: {e}, using heuristic")
             return self._calculate_aesthetic_score_heuristic(frame, "")
     
     def _calculate_aesthetic_score_heuristic(self, frame: np.ndarray, scene_label: str) -> float:
@@ -758,7 +765,7 @@ class Places365SceneClassifier:
             luxury_score = (probs[0][0] + probs[0][1]).item()
             return float(luxury_score)
         except Exception as e:
-            self.logger.warning(f"CLIP luxury score failed: {e}, using heuristic")
+            logger.warning(f"CLIP luxury score failed: {e}, using heuristic")
             return self._calculate_luxury_score_heuristic(frame, "")
     
     def _calculate_luxury_score_heuristic(self, frame: np.ndarray, scene_label: str) -> float:
@@ -825,7 +832,7 @@ class Places365SceneClassifier:
                 "neutral": float(probs[0][3].item())
             }
         except Exception as e:
-            self.logger.warning(f"CLIP atmosphere detection failed: {e}, using heuristic")
+            logger.warning(f"CLIP atmosphere detection failed: {e}, using heuristic")
             return self._detect_atmosphere_heuristic(frame)
     
     def _detect_atmosphere_heuristic(self, frame: np.ndarray) -> Dict[str, float]:
@@ -894,75 +901,184 @@ class Places365SceneClassifier:
             "depth_cues": float(np.clip(depth_cues, 0.0, 1.0))
         }
     
+    def aggregate_scenes(self, res, min_scene_length: int = 30):
+        """
+        Aggregate consecutive frames with the same scene label.
+
+        Args:
+            res: dict[frame_idx] = {
+                "predictions": {"label": str, "score": float},
+                "advanced_features": {
+                    "indoor_outdoor": {"indoor": float, "outdoor": float},
+                    "nature_urban": {"nature": float, "urban": float},
+                    "time_of_day": {"morning": float, "day": float, "evening": float, "night": float},
+                    "aesthetic_score": float,
+                    "luxury_score": float,
+                    "atmosphere_sentiment": {"cozy": float, "scary": float, "epic": float, "neutral": float},
+                    "geometric_features": {"openness": float, "clutter": float, "depth_cues": float}
+                }
+            }
+            min_scene_length: minimal number of consecutive frames for a segment to be included
+
+        Returns:
+            dict: aggregated segments with means and indices
+        """
+        import numpy as np
+
+        if not res:
+            return {}
+
+        aggregated = {}
+        current_label = None
+        current_indices = []
+        current_values = None
+
+        def reset_values():
+            return {
+                "score": [],
+                "indoor": [], "outdoor": [],
+                "nature": [], "urban": [],
+                "morning": [], "day": [], "evening": [], "night": [],
+                "aesthetic_score": [], "luxury_score": [],
+                "cozy": [], "scary": [], "epic": [], "neutral": [],
+                "openness": [], "clutter": [], "depth_cues": []
+            }
+
+        def finalize_segment(label, indices, values):
+            """Return mean-aggregated segment dict."""
+            if (indices[-1] - indices[0]) < min_scene_length:  # исправлено
+                return None
+            return {
+                "indices": indices,
+                "mean_score": float(np.mean(values["score"])),
+                "mean_indoor": float(np.mean(values["indoor"])),
+                "mean_outdoor": float(np.mean(values["outdoor"])),
+                "mean_nature": float(np.mean(values["nature"])),
+                "mean_urban": float(np.mean(values["urban"])),
+                "mean_morning": float(np.mean(values["morning"])),
+                "mean_day": float(np.mean(values["day"])),
+                "mean_evening": float(np.mean(values["evening"])),
+                "mean_night": float(np.mean(values["night"])),
+                "mean_aesthetic_score": float(np.mean(values["aesthetic_score"])),
+                "mean_luxury_score": float(np.mean(values["luxury_score"])),
+                "mean_cozy": float(np.mean(values["cozy"])),
+                "mean_scary": float(np.mean(values["scary"])),
+                "mean_epic": float(np.mean(values["epic"])),
+                "mean_neutral": float(np.mean(values["neutral"])),
+                "mean_openness": float(np.mean(values["openness"])),
+                "mean_clutter": float(np.mean(values["clutter"])),
+                "mean_depth_cues": float(np.mean(values["depth_cues"]))
+            }
+
+        for idx in sorted(res.keys()):
+            d = res[idx]
+            label = d["predictions"]["label"]
+
+            if current_label != label:
+                if current_label is not None:
+                    segment = finalize_segment(current_label, current_indices, current_values)
+                    if segment:
+                        aggregated[f"{current_label}_{current_indices[0]}"] = segment
+                # Start new segment
+                current_label = label
+                current_indices = [idx]
+                current_values = reset_values()
+            else:
+                current_indices.append(idx)
+
+            # Fill values
+            adv = d["advanced_features"]
+            current_values["score"].append(d["predictions"]["score"])
+            current_values["indoor"].append(adv["indoor_outdoor"]["indoor"])
+            current_values["outdoor"].append(adv["indoor_outdoor"]["outdoor"])
+            current_values["nature"].append(adv["nature_urban"]["nature"])
+            current_values["urban"].append(adv["nature_urban"]["urban"])
+            tod = adv["time_of_day"]
+            current_values["morning"].append(tod["morning"])
+            current_values["day"].append(tod["day"])
+            current_values["evening"].append(tod["evening"])
+            current_values["night"].append(tod["night"])
+            current_values["aesthetic_score"].append(adv["aesthetic_score"])
+            current_values["luxury_score"].append(adv["luxury_score"])
+            atm = adv["atmosphere_sentiment"]
+            current_values["cozy"].append(atm["cozy"])
+            current_values["scary"].append(atm["scary"])
+            current_values["epic"].append(atm["epic"])
+            current_values["neutral"].append(atm["neutral"])
+            geo = adv["geometric_features"]
+            current_values["openness"].append(geo["openness"])
+            current_values["clutter"].append(geo["clutter"])
+            current_values["depth_cues"].append(geo["depth_cues"])
+
+        # Final segment
+        if current_label is not None:
+            segment = finalize_segment(current_label, current_indices, current_values)
+            if segment:
+                aggregated[f"{current_label}_{current_indices[0]}"] = segment
+
+        return aggregated
+
     def classify_with_advanced_features(
-        self, frame_manager, frame_indices, top_k: Optional[int] = None
+        self, frame_manager, frame_indices
     ) -> List[Dict[str, Any]]:
         """
-        Classify scenes with advanced features.
-        
-        :param frames: iterable of OpenCV frames (BGR numpy arrays)
-        :param top_k: override default number of predictions
-        :return: list of dictionaries with scene predictions and advanced features
+        Classify scenes and compute advanced features (if enabled).
+
+        Returns list aligned with frame_indices:
+            {
+                "predictions": { "label": str, "score": float } or None,
+                "advanced_features": dict or None
+            }
         """
-        # Get base predictions
-        base_predictions = self.classify(frame_manager, frame_indices, top_k)
         
+        # Base predictions (already best-only)
+        base_predictions = self.classify(frame_manager, frame_indices)
+
+        # If advanced features disabled — simple wrapper
         if not self.enable_advanced_features:
             return [
-                {"predictions": preds, "advanced_features": None}
-                for preds in base_predictions
+                {
+                    "predictions": pred,
+                    "advanced_features": None
+                }
+                for pred in base_predictions
             ]
-        
+
+        # Allocate output list (positional, not indexed by frame ID)
         results = {}
-        for frame_idx, preds in (zip(frame_indices, base_predictions)):
+
+        for frame_idx, pred in zip(frame_indices, base_predictions):
             
             frame = frame_manager.get(frame_idx)
-            
-            if frame is None or not preds:
+
+            # No frame OR no prediction → no features
+            if frame is None or pred is None:
                 results[frame_idx] = {
-                    "predictions": preds,
+                    "predictions": pred,
                     "advanced_features": None
                 }
                 continue
-            
-            # Get top prediction
-            top_scene = preds[0]["label"] if preds else ""
-            
-            # Calculate advanced features
+
+            # Best scene prediction
+            top_scene = pred["label"]
+
+            # Compute advanced features
             advanced = {}
-            
-            # Indoor/outdoor
-            indoor_outdoor = self._classify_indoor_outdoor(top_scene)
-            advanced["indoor_outdoor"] = indoor_outdoor
-            
-            # Nature/urban
-            nature_urban = self._classify_nature_urban(top_scene)
-            advanced["nature_urban"] = nature_urban
-            
-            # Time of day
-            time_of_day = self._detect_time_of_day(frame)
-            advanced["time_of_day"] = time_of_day
-            
-            # Aesthetic score
-            aesthetic_score = self._calculate_aesthetic_score(frame, top_scene)
-            advanced["aesthetic_score"] = aesthetic_score
-            
-            # Luxury score
-            luxury_score = self._calculate_luxury_score(frame, top_scene)
-            advanced["luxury_score"] = luxury_score
-            
-            # Atmosphere sentiment
-            atmosphere = self._detect_atmosphere_sentiment(frame)
-            advanced["atmosphere_sentiment"] = atmosphere
-            
-            # Geometric features
-            geometric = self._calculate_geometric_features(frame)
-            advanced["geometric_features"] = geometric
-            
+
+            advanced["indoor_outdoor"] = self._classify_indoor_outdoor(top_scene)
+            advanced["nature_urban"] = self._classify_nature_urban(top_scene)
+            advanced["time_of_day"] = self._detect_time_of_day(frame)
+            advanced["aesthetic_score"] = self._calculate_aesthetic_score(frame, top_scene)
+            advanced["luxury_score"] = self._calculate_luxury_score(frame, top_scene)
+            advanced["atmosphere_sentiment"] = self._detect_atmosphere_sentiment(frame)
+            advanced["geometric_features"] = self._calculate_geometric_features(frame)
+
             results[frame_idx] = {
-                "predictions": preds,
+                "predictions": pred,
                 "advanced_features": advanced
             }
-        
-        return results
+
+        agg_result = self.aggregate_scenes(results, self.min_scene_length)
+
+        return agg_result
 

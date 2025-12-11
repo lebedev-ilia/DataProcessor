@@ -1,10 +1,8 @@
 """
 Основной класс для обработки видео и анализа эмоций.
 """
-import sys
 import torch
-from typing import Dict, Any, List, Optional, Tuple
-from collections import OrderedDict
+from typing import Dict, Any, List, Optional
 
 from core.processing_config import (
     ProcessingParams, ProcessingMetrics
@@ -12,7 +10,6 @@ from core.processing_config import (
 from core.memory_manager import memory_context, cleanup_memory
 from core.retry_strategy import RetryStrategy, QualityMetrics
 from core.validation import ValidationLogic, ValidationCriteria
-from core.logger import StructuredLogger
 from core.exceptions import (
     VideoProcessingError, FrameSelectionError,
     EmotionAnalysisError, ValidationError
@@ -20,18 +17,16 @@ from core.exceptions import (
 from core.validators import (
     validate_target_length
 )
-from core.edge_cases import validate_edge_cases
-from core.cache_with_ttl import FaceScanCacheWithTTL
 
-from utils import (
+from _utils import (
     segmentation, select_from_segments, uniform_time_coverage,
     build_emotion_curve, detect_keyframes, compress_sequence,
     expand_sequence, temporal_smoothing, validate_sequence_quality,
     save_for_user, save_for_model, get_video_type,
     analyze_emotion_profile, sample_for_static_face,
-    analyze_emotion_changes, print_memory_usage,
+    analyze_emotion_changes,
     get_available_memory_mb,
-    compute_steps, scan_for_faces, process_frames_in_batches
+    compute_steps, process_frames_in_batches
 )
 from core.advanced_emotion_features import (
     detect_micro_expressions,
@@ -45,87 +40,8 @@ EMOTION_CLASSES = {
     4: "Fear", 5: "Disgust", 6: "Anger", 7: "Contempt"
 }
 
-
-def log(*a, **kw):
-    """Функция логирования."""
-    print(*a, file=sys.stderr, **kw)
-
-
-class FaceScanCache:
-    """
-    Кэш для результатов сканирования лиц с LRU стратегией.
-    
-    Использует OrderedDict для эффективной реализации LRU с O(1) операциями.
-    """
-    
-    def __init__(self, max_size: int = 10):
-        """
-        Инициализация кэша.
-        
-        Args:
-            max_size: Максимальное количество кэшированных результатов.
-        
-        Raises:
-            ValueError: Если max_size <= 0.
-        """
-        if max_size <= 0:
-            raise ValueError(f"max_size must be positive, got {max_size}")
-        
-        self.cache: OrderedDict[Tuple[int, float], Tuple[List[int], int]] = OrderedDict()
-        self.max_size = max_size
-    
-    def get(self, scan_stride: int, detect_thr: float) -> Optional[Tuple[List[int], int]]:
-        """
-        Получает результат из кэша.
-        
-        Args:
-            scan_stride: Шаг сканирования.
-            detect_thr: Порог детекции.
-        
-        Returns:
-            Кортеж (timeline, scanned_count) или None, если не найдено.
-        """
-        key = (scan_stride, detect_thr)
-        if key in self.cache:
-            # Перемещаем в конец (MRU) - O(1) операция
-            self.cache.move_to_end(key)
-            return self.cache[key]
-        return None
-    
-    def put(self, scan_stride: int, detect_thr: float, timeline: List[int], scanned_count: int):
-        """
-        Сохраняет результат в кэш.
-        
-        Args:
-            scan_stride: Шаг сканирования.
-            detect_thr: Порог детекции.
-            timeline: Список индексов кадров с лицами.
-            scanned_count: Количество просканированных кадров.
-        """
-        key = (scan_stride, detect_thr)
-        
-        # Если ключ уже существует, обновляем и перемещаем в конец
-        if key in self.cache:
-            self.cache.move_to_end(key)
-        else:
-            # Если кэш переполнен, удаляем самый старый элемент (первый)
-            if len(self.cache) >= self.max_size:
-                self.cache.popitem(last=False)  # O(1) операция
-        
-        self.cache[key] = (timeline, scanned_count)
-    
-    def clear(self):
-        """Очищает кэш."""
-        self.cache.clear()
-    
-    def __len__(self) -> int:
-        """Возвращает количество элементов в кэше."""
-        return len(self.cache)
-    
-    def __contains__(self, key: Tuple[int, float]) -> bool:
-        """Проверяет наличие ключа в кэше."""
-        return key in self.cache
-
+from utils.logger import get_logger
+logger = get_logger("VideoEmotionProcessor")
 
 class VideoEmotionProcessor:
     """
@@ -135,10 +51,6 @@ class VideoEmotionProcessor:
     
     def __init__(
         self,
-        # cache
-        ttl_enabled: bool = True,
-        ttl_seconds: int = 1800,
-        cache_size_limit: int = 10,
         # validate
         min_frames_ratio: float = 0.8,
         min_keyframes: int = 3,
@@ -159,20 +71,15 @@ class VideoEmotionProcessor:
         batch_process_very_high: int = 24,
         # logging
         enable_structured_metrics: bool = True,
-        log_memory_usage: bool = True,
         # processing
         min_faces_threshold: int = 20,
         target_length: int = 256,
         max_retries: int = 2,
-        # face detection
-        default_threshold: float = 0.5,
         # keyframes
         transition_threshold: float = 0.3,
         # segmentation
         max_gap_seconds: float = 0.5,
         max_samples_per_segment: int = 10,
-        # face app
-        det_size: Tuple[int] = (640, 640),
         # emonet
         emo_path: str = None,
         # other
@@ -190,7 +97,6 @@ class VideoEmotionProcessor:
         
         self.target_length = validate_target_length(target_length)
         self.max_retries = max_retries
-        self.default_threshold = default_threshold
         self.transition_threshold = transition_threshold
         self.quality_threshold = quality_threshold
         self.min_diversity_threshold = min_diversity_threshold
@@ -209,19 +115,16 @@ class VideoEmotionProcessor:
         self.batch_process_high = batch_process_high
         self.batch_load_very_high = batch_load_very_high
         self.batch_process_very_high = batch_process_very_high
+
+        self.frames_with_face = self.frames_with_face_load("2025-12-11_17-19-00-354053_ff96ec7c")
+
+        if emo_path == "None" or emo_path is None:
+            import os
+            p = os.path.dirname(os.path.dirname(__file__))
+            emo_path = f"{p}/models/emonet/pretrained/emonet_8.pth"
         
-        self.face_app = self.init_face_app(det_size)
         self.model = self.load_emonet(path=emo_path)
         
-        if ttl_enabled:
-            self.face_cache = FaceScanCacheWithTTL(
-                max_size=cache_size_limit,
-                ttl_seconds=ttl_seconds
-            )
-        else:
-            self.face_cache = FaceScanCache(
-                max_size=cache_size_limit
-            )
         self.validation_logic = ValidationLogic(
             ValidationCriteria(
                 min_frames_ratio=min_frames_ratio,
@@ -230,11 +133,17 @@ class VideoEmotionProcessor:
                 min_diversity=self.min_diversity_threshold
             )
         )
-
-        self.logger = StructuredLogger(
-            enable_metrics=enable_structured_metrics
-        )
         
+    def frames_with_face_load(self, filename):
+        import os, json
+        p = os.path.dirname(os.path.dirname(os.path.dirname(os.path.dirname(__file__))))
+        try:
+            with open(f"{p}/result_store/face_detection/{filename}.json", "r") as f:
+                return json.load(f) # ["frames_with_face"]
+        except Exception as e:
+            logger.error(f"VideoEmotionProcessor | frames_with_face_load | Error: {e}")
+            raise
+
     def load_emonet(self, path: str, n_expression: int = 8):
         from models.emonet.emonet.models.emonet import EmoNet
         state = torch.load(path, map_location="cpu")
@@ -244,34 +153,14 @@ class VideoEmotionProcessor:
         model.load_state_dict(state, strict=False)
         model.eval()
         return model
-        
-    def init_face_app(self, det_size=(640,640)):
-        try:
-            from insightface.app import FaceAnalysis
-        except Exception as e:
-            raise RuntimeError("insightface not installed or failed to import") from e
-        # try GPU, fallback CPU
-        try:
-            app = FaceAnalysis(providers=["CUDAExecutionProvider"])
-            app.prepare(ctx_id=0, det_size=det_size)
-        except Exception:
-            app = FaceAnalysis(providers=["CPUExecutionProvider"])
-            app.prepare(ctx_id=-1, det_size=det_size)
-        return app
     
     def process(
         self,
         frame_manager,
+        save_path
     ) -> Dict[str, Any]:
         """
         Основной метод обработки видео.
-        
-        Args:
-            video_path: Путь к видео файлу.
-            model: Загруженная модель EmoNet.
-            self.face_app: Инициализированное приложение для детекции лиц.
-            target_length: Целевая длина последовательности. Если None, берется из конфига.
-            chunk_size: Размер чанка для обработки. Если None, берется из конфига.
         
         Returns:
             Словарь с результатами обработки.
@@ -285,7 +174,6 @@ class VideoEmotionProcessor:
         
         # Инициализация параметров
         base_params = ProcessingParams(
-            face_detection_threshold=self.default_threshold,
             scan_stride_multiplier=1.0,
             keyframe_threshold=self.transition_threshold,
             quality_threshold=self.quality_threshold,
@@ -298,42 +186,21 @@ class VideoEmotionProcessor:
         
         try:
             with memory_context():
-                
-                if self.log_memory_usage:
-                    print_memory_usage(label="After frame_writer", log=log)
                     
                 total_frames = frame_manager.total_frames
                 fps = frame_manager.fps
                 meta = frame_manager.meta
-                video_path = meta["video_path"]
-                
-                # Валидация граничных случаев
-                try:
-                    edge_cases_info = validate_edge_cases(
-                        total_frames,
-                        fps,
-                        [],  # timeline будет заполнен позже
-                        min_faces_ratio=self.min_faces_threshold / total_frames if total_frames > 0 else 0.01
-                    )
-                    self.logger.log(f"Edge cases validation: {edge_cases_info.get('warnings', [])}")
-                except VideoProcessingError as e:
-                    self.logger.log(f"Edge case validation failed: {e}", level="WARNING")
-                    # Продолжаем обработку, но с предупреждением
                 
                 # Основной цикл обработки с повторными попытками
                 while retry_strategy.attempts <= self.max_retries:
                     try:
                         cleanup_memory()
                         
-                        self.logger.log(f"Попытка {retry_strategy.attempts + 1}/{self.max_retries + 1}")
-                        self.logger.log_metrics(current_params.to_dict(), "Параметры обработки")
+                        logger.info(f"Попытка {retry_strategy.attempts + 1}/{self.max_retries + 1}")
                         
-                        # Этап 1: Адаптивный сбор кадров
-                        self.logger.start_stage("adaptive_frame_selection")
                         result = self._adaptive_frame_selection(
-                            frame_manager, self.face_app, total_frames, fps, current_params
+                            frame_manager, self.frames_with_face, total_frames, fps, current_params
                         )
-                        self.logger.end_stage("adaptive_frame_selection")
                         
                         if not result["success"]:
                             if retry_strategy.next_attempt():
@@ -343,7 +210,7 @@ class VideoEmotionProcessor:
                                     result.get("video_type", "UNKNOWN"),
                                     result.get("segments_count", 0),
                                     result.get("faces_found", 0),
-                                    log
+                                    log_func=logger.info
                                 )
                                 continue
                             else:
@@ -354,12 +221,9 @@ class VideoEmotionProcessor:
                         segments = result["segments"]
                         video_type = result["video_type"]
                         
-                        # Этап 2: Анализ эмоций
-                        self.logger.start_stage("emotion_analysis")
                         emotion_result = self._emotion_analysis_pipeline(
-                            frame_manager, selected_indices, self.model, total_frames, fps, current_params, self.face_app
+                            frame_manager, selected_indices, self.model, fps
                         )
-                        self.logger.end_stage("emotion_analysis")
                         
                         if not emotion_result["success"]:
                             if retry_strategy.next_attempt():
@@ -369,14 +233,13 @@ class VideoEmotionProcessor:
                                     video_type,
                                     len(segments),
                                     len(timeline),
-                                    log
+                                    logger.info
                                 )
                                 continue
                             else:
                                 return self._build_failure_result(current_params, retry_strategy.attempts)
                         
                         # Этап 3: Валидация и нормализация
-                        self.logger.start_stage("validation_and_normalization")
                         validation_result = self._validation_and_retry_logic(
                             emotion_result,
                             selected_indices,
@@ -385,12 +248,10 @@ class VideoEmotionProcessor:
                             current_params,
                             retry_strategy
                         )
-                        self.logger.end_stage("validation_and_normalization")
                         
                         # Логируем метрики качества
                         if validation_result.get("quality_metrics"):
                             quality_dict = validation_result["quality_metrics"].to_dict()
-                            self.logger.log_quality_metrics(quality_dict)
                         
                         if validation_result["should_retry"]:
                             if retry_strategy.should_retry(validation_result["quality_metrics"]):
@@ -400,18 +261,17 @@ class VideoEmotionProcessor:
                                     video_type,
                                     len(segments),
                                     len(timeline),
-                                    log
+                                    logger.info
                                 )
                                 retry_strategy.next_attempt()
                                 continue
                         
                         # Успешная обработка
-                        self.logger.start_stage("save_results")
                         result = self._save_results(
                             validation_result,
                             emotion_result,
                             selected_indices,
-                            video_path,
+                            save_path,
                             meta,
                             current_params,
                             retry_strategy.attempts + 1,
@@ -419,20 +279,17 @@ class VideoEmotionProcessor:
                             len(segments),
                             len(timeline)
                         )
-                        self.logger.end_stage("save_results")
                         
-                        # Добавляем метрики логирования в результат
-                        result["logging_metrics"] = self.logger.get_summary()
                         return result
                         
                     except Exception as e:
-                        self.logger.log(f"Ошибка в попытке {retry_strategy.attempts}: {e}", level="ERROR")
+                        logger.error(f"Ошибка в попытке {retry_strategy.attempts}: {e}")
                         import traceback
                         traceback.print_exc()
                         
                         if retry_strategy.next_attempt():
                             current_params = retry_strategy.get_safe_params()
-                            self.logger.log("Переход к безопасным параметрам", level="WARNING")
+                            logger.info("Переход к безопасным параметрам")
                             continue
                         else:
                             return self._build_failure_result(current_params, retry_strategy.attempts, str(e))
@@ -442,12 +299,11 @@ class VideoEmotionProcessor:
         
         finally:
             torch.cuda.empty_cache()
-            self.face_cache.clear()
     
     def _adaptive_frame_selection(
         self,
         fm,
-        face_app,
+        timeline,
         total_frames: int,
         fps: float,
         params: ProcessingParams
@@ -464,57 +320,9 @@ class VideoEmotionProcessor:
             adjusted_scan_stride = int(scan_stride * params.scan_stride_multiplier)
             adjusted_scan_stride = max(1, adjusted_scan_stride)
             
-            self.logger.log(f"Scan stride: {scan_stride} -> {adjusted_scan_stride}")
+            logger.info(f"Scan stride: {scan_stride} -> {adjusted_scan_stride}")
             
-            # Проверяем кэш (с поддержкой TTL, если используется FaceScanCacheWithTTL)
-            if isinstance(self.face_cache, FaceScanCacheWithTTL):
-                cached_result = self.face_cache.get_scan_result(adjusted_scan_stride, params.face_detection_threshold)
-                if cached_result:
-                    self.logger.log("Используется кэшированный результат сканирования (с TTL)")
-                    timeline, scanned_count = cached_result
-                else:
-                    # Сканирование лиц
-                    timeline, scanned_count = scan_for_faces(
-                        fm,
-                        face_app,
-                        scan_stride=adjusted_scan_stride,
-                        detect_thr=params.face_detection_threshold
-                    )
-                    self.face_cache.put_scan_result(adjusted_scan_stride, params.face_detection_threshold, timeline, scanned_count)
-            else:
-                # Старый кэш без TTL
-                cache_key = (adjusted_scan_stride, params.face_detection_threshold)
-                cached_result = self.face_cache.get(*cache_key)
-                
-                if cached_result:
-                    self.logger.log("Используется кэшированный результат сканирования")
-                    timeline, scanned_count = cached_result
-                else:
-                    # Сканирование лиц
-                    timeline, scanned_count = scan_for_faces(
-                        fm,
-                        face_app,
-                        scan_stride=adjusted_scan_stride,
-                        detect_thr=params.face_detection_threshold
-                    )
-                    self.face_cache.put(adjusted_scan_stride, params.face_detection_threshold, timeline, scanned_count)
-            
-            # Проверка граничных случаев после сканирования
-            try:
-                edge_cases_info = validate_edge_cases(
-                    total_frames,
-                    fps,
-                    timeline,
-                    min_faces_ratio=self.min_faces_threshold / total_frames if total_frames > 0 else 0.01
-                )
-                if edge_cases_info.get("warnings"):
-                    for warning in edge_cases_info["warnings"]:
-                        self.logger.log(f"Warning: {warning}", level="WARNING")
-            except FrameSelectionError as e:
-                # Если нет лиц - это критическая ошибка
-                raise
-            
-            self.logger.log(f"Найдено лиц: {len(timeline)} (порог: {params.face_detection_threshold})")
+            logger.info(f"Найдено лиц: {len(timeline)} (порог: {params.face_detection_threshold})")
             
             # Сегментация
             segments = segmentation(
@@ -522,11 +330,11 @@ class VideoEmotionProcessor:
                 fps=fps,
                 max_gap_seconds=params.segment_max_gap
             )
-            self.logger.log(f"Создано {len(segments)} сегментов")
+            logger.info(f"Создано {len(segments)} сегментов")
             
             # Определение типа видео
             video_type = get_video_type(timeline, total_frames, segments)
-            self.logger.log(f"Тип видео: {video_type}")
+            logger.info(f"Тип видео: {video_type}")
             
             # Выборка кадров
             if video_type == "STATIC_FACE":
@@ -545,16 +353,16 @@ class VideoEmotionProcessor:
                 )
             
             n_frames = len(selected_indices)
-            self.logger.log(f"Выбрано индексов: {n_frames}")
+            logger.info(f"Выбрано индексов: {n_frames}")
             
             if n_frames < 10:
-                self.logger.log(f"Слишком мало кадров ({n_frames}), переключаюсь на равномерное покрытие", level="WARNING")
+                logger.info(f"Слишком мало кадров ({n_frames}), переключаюсь на равномерное покрытие")
                 selected_indices = uniform_time_coverage(
                     total_frames,
                     min(256 * 3, total_frames)
                 )
             elif n_frames < self.min_faces_threshold:
-                self.logger.log("Комбинирую лица и равномерное покрытие")
+                logger.info("Комбинирую лица и равномерное покрытие")
                 uniform_indices = uniform_time_coverage(
                     total_frames,
                     min(256 * 2, total_frames - len(selected_indices))
@@ -562,7 +370,7 @@ class VideoEmotionProcessor:
                 selected_indices = sorted(list(set(selected_indices + uniform_indices)))
             
 
-            self.logger.log(f"Кол-во кадров на выходе 1 Этапа: {len(selected_indices)}")
+            logger.info(f"Кол-во кадров на выходе 1 Этапа: {len(selected_indices)}")
 
             return {
                 "success": len(selected_indices) > 0,
@@ -575,7 +383,7 @@ class VideoEmotionProcessor:
             }
         
         except Exception as e:
-            self.logger.log(f"Ошибка в _adaptive_frame_selection: {e}", level="ERROR")
+            logger.error(f"Ошибка в _adaptive_frame_selection: {e}")
             if isinstance(e, VideoProcessingError):
                 raise
             raise FrameSelectionError(
@@ -588,10 +396,7 @@ class VideoEmotionProcessor:
         fm,
         selected_indices: List[int],
         model,
-        total_frames: int,
         fps: float,
-        params: ProcessingParams,
-        face_app=None
     ) -> Dict[str, Any]:
         """
         Этап 2: Анализ эмоций в выбранных кадрах.
@@ -616,50 +421,50 @@ class VideoEmotionProcessor:
                 batch_load = self.batch_load_very_high
                 batch_process = self.batch_process_very_high
             
-            self.logger.log(f"Размеры батчей: загрузка={batch_load}, обработка={batch_process}")
+            logger.info(f"Размеры батчей: загрузка={batch_load}, обработка={batch_process}")
             
             # Обработка кадров батчами
             emo_results = process_frames_in_batches(
                 fm,
                 selected_indices,
                 model,
-                log,
+                logger.info,
                 batch_size_load=batch_load,
                 batch_size_process=batch_process
             )
             
             # Анализ эмоционального профиля
             emotion_profile = analyze_emotion_profile(emo_results)
-            self.logger.log(f"Доминирующая эмоция: {emotion_profile['dominant_emotion']}")
+            logger.info(f"Доминирующая эмоция: {emotion_profile['dominant_emotion']}")
             
             # Анализ изменений эмоций
             change_analysis = analyze_emotion_changes(emo_results)
-            self.logger.log(f"Тип изменений: {change_analysis['change_type']}")
+            logger.info(f"Тип изменений: {change_analysis['change_type']}")
             
             # Расширенные фичи: микроэмоции
-            self.logger.log("Вычисление микроэмоций...")
+            logger.info("Вычисление микроэмоций...")
             microexpressions = detect_micro_expressions(emo_results, fps=fps)
-            self.logger.log(f"Найдено микроэмоций: {microexpressions['microexpressions_count']}")
+            logger.info(f"Найдено микроэмоций: {microexpressions['microexpressions_count']}")
             
             # Расширенные фичи: физиологические сигналы
-            self.logger.log("Вычисление физиологических сигналов...")
+            logger.info("Вычисление физиологических сигналов...")
             physiological_signals = compute_physiological_signals(
                 emo_results, 
                 microexpressions=microexpressions,
                 fps=fps
             )
-            self.logger.log(f"Стресс: {physiological_signals['stress_level_score']:.2f}, "
+            logger.info(f"Стресс: {physiological_signals['stress_level_score']:.2f}, "
                           f"Уверенность: {physiological_signals['confidence_face_score']:.2f}")
             
             # Расширенные фичи: индивидуальность выражения эмоций
-            self.logger.log("Анализ индивидуальности выражения эмоций...")
+            logger.info("Анализ индивидуальности выражения эмоций...")
             emotional_individuality = compute_emotional_individuality(emo_results, fps=fps)
-            self.logger.log(f"Индекс выразительности: {emotional_individuality['expressivity_index']:.2f}")
+            logger.info(f"Индекс выразительности: {emotional_individuality['expressivity_index']:.2f}")
             
             # Расширенные фичи: асимметрия лица (упрощенная версия без landmarks)
             # Для полной версии нужны landmarks из face_app, что требует дополнительной обработки
             # Здесь используем упрощенную версию на основе эмоциональных паттернов
-            self.logger.log("Анализ асимметрии лица (упрощенная версия)...")
+            logger.info("Анализ асимметрии лица (упрощенная версия)...")
             face_asymmetry = compute_face_asymmetry(landmarks=None, face_data=None)
             # Примечание: полная версия требует landmarks, которые можно получить из face_app
             
@@ -675,7 +480,7 @@ class VideoEmotionProcessor:
             }
         
         except Exception as e:
-            self.logger.log(f"Ошибка в _emotion_analysis_pipeline: {e}", level="ERROR")
+            logger.error(f"Ошибка в _emotion_analysis_pipeline: {e}")
             if isinstance(e, VideoProcessingError):
                 raise
             raise EmotionAnalysisError(
@@ -742,7 +547,7 @@ class VideoEmotionProcessor:
                 min_diversity_threshold=params.min_diversity,
                 is_static_face=(video_type == "STATIC_FACE"),
                 neutral_percentage=neutral_percentage,
-                logger=self.logger
+                logger=logger
             )
             
             # Единая логика валидации
@@ -753,10 +558,10 @@ class VideoEmotionProcessor:
                 len(keyframes_indices),
                 is_monotonic=quality_metrics_raw.get("is_monotonic", False),
                 neutral_percentage=neutral_percentage,
-                logger=self.logger
+                logger=logger
             )
             
-            self.logger.log(f"Валидация: acceptable={quality_metrics.is_acceptable}")
+            logger.info(f"Валидация: acceptable={quality_metrics.is_acceptable}")
             
             return {
                 "should_retry": not quality_metrics.is_acceptable,
@@ -769,7 +574,7 @@ class VideoEmotionProcessor:
             }
         
         except Exception as e:
-            self.logger.log(f"Ошибка в _validation_and_retry_logic: {e}", level="ERROR")
+            logger.error(f"Ошибка в _validation_and_retry_logic: {e}")
             if isinstance(e, VideoProcessingError):
                 raise
             raise ValidationError(
@@ -782,7 +587,7 @@ class VideoEmotionProcessor:
         validation_result: Dict[str, Any],
         emotion_result: Dict[str, Any],
         selected_indices: List[int],
-        video_path: str,
+        save_path: str,
         meta: Dict[str, Any],
         params: ProcessingParams,
         attempt_number: int,
@@ -814,6 +619,7 @@ class VideoEmotionProcessor:
         # Подготовка данных для пользователя
         user_data = {
             "original_emotions": emo_results,
+            "emotion_profile": emotion_profile,
             "keyframes": [],
             "emotion_curve": emotion_curve,
             "quality_metrics": quality_metrics_raw,
@@ -849,7 +655,7 @@ class VideoEmotionProcessor:
                 })
         
         # Сохранение для пользователя
-        user_file = save_for_user(user_data, video_path)
+        user_file = save_for_user(user_data, save_path)
         
         # Подготовка данных для модели
         model_data = {
@@ -877,18 +683,12 @@ class VideoEmotionProcessor:
         }
         
         # Сохранение для модели
-        model_files = save_for_model(model_data, video_path)
+        model_files = save_for_model(model_data, save_path)
         
         return {
             "success": True,
             "user_data": user_data,
             "model_data": model_data,
-            "phase1_stats": user_data["processing_stats"],
-            "phase2_stats": {
-                "final_length": len(smoothed_emotions),
-                "keyframes_count": len(keyframes_indices),
-                "quality": quality_metrics_raw
-            },
             "files": {
                 "user": user_file,
                 "model": model_files

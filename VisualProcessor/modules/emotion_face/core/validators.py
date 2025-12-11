@@ -3,10 +3,10 @@
 """
 from pathlib import Path
 from typing import Optional
-from core.exceptions import VideoFileError, ConfigurationValidationError
+from core.exceptions import ConfigurationValidationError
 
 
-def validate_processing_params(params: 'ProcessingParams') -> None:
+def validate_processing_params(params) -> None:
     """
     Валидирует параметры обработки.
     

@@ -1,44 +1,52 @@
 modules:
-    object_detection: true
-    scene_classification: true
-    detalize_face_modules: true
+    object_detection: false
+    scene_classification: false
+    face_detection: false
+    detalize_face_modules: false
     emotion_face: true
 
 global:
-    root_path: "/Users/user/Desktop/DataProcessor"
-    frames_dir: "/Users/user/Desktop/DataProcessor/Segmentor/data/video"
-    rs_path: "/Users/user/Desktop/DataProcessor/VisualProcessor/result_store"
+    root_path: "/home/ilya/Рабочий стол/TrendFlowML/DataProcessor"
+    frames_dir: "/home/ilya/Рабочий стол/TrendFlowML/DataProcessor/Segmenter/data/video"
+    rs_path: "/home/ilya/Рабочий стол/TrendFlowML/DataProcessor/VisualProcessor/result_store"
 
 object_detection:
-    model_name: "google/owlvit-base-patch16"
-    model_family: "owlvit"
+    model: "yolo11x.pt" # google/owlvit-base-patch32, google/owlvit-base-patch16, google/owlvit-large-patch14, google/owlv2-base-patch16, yolo11x.pt
+    model_family: None # owlv2, owlvit, None
+    batch_size: 16
+    use_queries: false
+    default_categories: None # "person,bus"
     device: "cuda"
-    box_threshold: 0.3
+    box_threshold: 0.6 # 0.3 для owl
 
 scene_classification:
     model_arch: "resnet50" # DEFAULT: resnet18 resnet50 | TIMM: efficientnet_b0 efficientnet_b1 efficientnet_b2 efficientnet_b3 convnext_tiny convnext_small convnext_base vit_base_patch16_224 vit_large_patch16_224 regnetx_002 regnetx_004 regnetx_006 resnet50 resnet101
     use_timm: false
-    top_k: 5
     batch_size: 1
+    min_scene_length: 20
     device: "cuda"
-    categories_path: None
+    categories_path: null
     cache_dir: None
     gpu_memory_threshold: 0.95
     log_metrics_every_n_frames: 10
     input_size: 224 # 256, 320 ...
-    use_tta: True
-    use_multi_crop: True
-    temporal_smoothing: True
+    use_tta: true
+    use_multi_crop: true
+    temporal_smoothing: true
     smoothing_window: 5
-    enable_advanced_features: True
-    use_clip_for_semantics: True
+    enable_advanced_features: true
+    use_clip_for_semantics: true
+
+face_detection:
+    threshold: 0.5
+    det_size: "640,640"
 
 detalize_face_modules:
     modules: "geometry,pose,quality,lighting,skin,accessories,eyes,motion,structure,professional,lip_reading,face_3d"
     max_faces: 10
-    refine_landmarks: True
+    refine_landmarks: true
     visualize: False
-    visualize_dir: None
+    visualize_dir: null
     show_landmarks: False
     min_detection_confidence: 0.7
     min_tracking_confidence: 0.7
@@ -46,28 +54,33 @@ detalize_face_modules:
     max_face_size_ratio: 0.8
     min_aspect_ratio: 0.6
     max_aspect_ratio: 1.4
-    validate_landmarks: True
+    no_validate_landmarks: false
 
 emotion_face:
     target_length: 256
     max_retries: 2
     min_faces_threshold: 20
-    default_threshold: 0.5
     transition_threshold: 0.3
     min_frames_ratio: 0.8
     min_keyframes: 3
     min_transitions: 2
     min_diversity_threshold: 0.2
     quality_threshold: 0.4
+    memory_threshold_low: 2000
+    batch_load_low: 20
+    batch_process_low: 8 
+    memory_threshold_medium: 4000 
+    batch_load_medium: 30
+    batch_process_medium: 12 
+    memory_threshold_high: 8000
+    batch_load_high: 50
+    batch_process_high: 16 
+    batch_load_very_high: 80
+    batch_process_very_high: 24 
     max_gap_seconds: 0.5
     max_samples_per_segment: 10
-    ttl_enabled: false
-    ttl_seconds: 1800
-    cache_size_limit: 10
-    log_memory_usage: true
     enable_structured_metrics: true
-    det_size: (640, 640)
-    emo_path: None
+    emo_path: null
     device: "cuda"
 
 behavioral:

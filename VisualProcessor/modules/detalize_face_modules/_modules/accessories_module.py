@@ -6,9 +6,9 @@ from typing import Dict, List, Any, Optional
 import cv2
 import numpy as np
 
-from modules.base_module import FaceModule
-from utils.landmarks_utils import LANDMARKS
-from utils.face_helpers import eye_box, lower_face_box
+from _modules.base_module import FaceModule
+from _utils.landmarks_utils import LANDMARKS
+from _utils.face_helpers import eye_box, lower_face_box
 
 
 class AccessoriesModule(FaceModule):

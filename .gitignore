@@ -14,6 +14,12 @@ build/
 
 # Virtual environments
 .venv/
+.data_venv/
+.object_detection_venv/
+.scene_classification_venv/
+.detalize_face_modules_venv/
+.emotion_face_venv/
+.face_detection_venv/
 venv/
 env/
 ENV/
@@ -142,8 +148,6 @@ private_data/
 
 # Automatically generated metadata
 *.meta
-*.yaml
-*.yml
 
 # -----------------------------
 # CONFIGS / SECRETS
@@ -214,5 +218,8 @@ exports/
 *.tmp
 *.temp
 *.json
+*.png
+*.jpg
+*.pt
 
-OpenFace
+OpenFace/

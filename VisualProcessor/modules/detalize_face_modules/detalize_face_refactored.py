@@ -13,15 +13,18 @@ import cv2
 import mediapipe as mp
 import numpy as np
 
-from modules import MODULE_REGISTRY
-from modules.base_module import FaceModule
-from utils import (
+from _modules import MODULE_REGISTRY
+from _modules.base_module import FaceModule
+from _utils import (
     landmarks_to_ndarray,
     validate_face_landmarks,
     compute_bbox,
     extract_roi,
 )
-from utils.landmarks_utils import LANDMARKS
+from _utils.landmarks_utils import LANDMARKS
+
+from utils.logger import get_logger
+logger = get_logger("DetalizeFaceExtractorRefactored")
 
 _FACE_MESH = mp.solutions.face_mesh
 
@@ -61,21 +64,11 @@ class DetalizeFaceExtractorRefactored():
 
         self.max_faces = max_faces
         self.refine_landmarks = refine_landmarks
-        
-        # Initialize logger
-        self.logger = logging.getLogger(self.__class__.__name__)
-        if not self.logger.handlers:
-            handler = logging.StreamHandler()
-            handler.setFormatter(logging.Formatter(
-                '%(asctime)s - %(name)s - %(levelname)s - %(message)s'
-            ))
-            self.logger.addHandler(handler)
-            self.logger.setLevel(logging.WARNING)
 
-        print(f"DetalizeFaceExtractorRefactored | init | face_mesh params | max_faces = {max_faces}")
-        print(f"                                                          | refine_landmarks = {refine_landmarks}")
-        print(f"                                                          | min_detection_confidence = {min_detection_confidence}")
-        print(f"                                                          | min_tracking_confidence = {min_tracking_confidence}")
+        logger.info(f"DetalizeFaceExtractorRefactored | init | face_mesh params | max_faces = {max_faces}")
+        logger.info(f"                                                          | refine_landmarks = {refine_landmarks}")
+        logger.info(f"                                                          | min_detection_confidence = {min_detection_confidence}")
+        logger.info(f"                                                          | min_tracking_confidence = {min_tracking_confidence}")
 
         self.face_mesh = _FACE_MESH.FaceMesh(
             max_num_faces=max_faces,
@@ -97,9 +90,9 @@ class DetalizeFaceExtractorRefactored():
         if visualize:
             self.visualize_dir = Path(visualize_dir) if visualize_dir else Path("./face_visualizations")
             self.visualize_dir.mkdir(parents=True, exist_ok=True)
-            print(f"DetalizeFaceExtractorRefactored | init | Visualization enabled. Saving frames to: {self.visualize_dir}")
+            logger.info(f"DetalizeFaceExtractorRefactored | init | Visualization enabled. Saving frames to: {self.visualize_dir}")
 
-        print(f"DetalizeFaceExtractorRefactored | init | load modules...")
+        logger.info(f"DetalizeFaceExtractorRefactored | init | load modules...")
 
         # Загружаем модули
         modules_to_load = modules or list(MODULE_REGISTRY.keys())
@@ -107,7 +100,7 @@ class DetalizeFaceExtractorRefactored():
 
         for module_name in modules_to_load:
             if module_name not in MODULE_REGISTRY:
-                print(f"DetalizeFaceExtractorRefactored | init | Модуль '{module_name}' не найден в registry, пропускаем")
+                logger.info(f"DetalizeFaceExtractorRefactored | init | Модуль '{module_name}' не найден в registry, пропускаем")
                 continue
 
             module_class = MODULE_REGISTRY[module_name]
@@ -116,9 +109,9 @@ class DetalizeFaceExtractorRefactored():
             try:
                 module = module_class(config=module_config)
                 self.modules.append(module)
-                print(f"DetalizeFaceExtractorRefactored | init | Загружен модуль: {module_name}")
+                logger.info(f"DetalizeFaceExtractorRefactored | init | Загружен модуль: {module_name}")
             except Exception as e:
-                self.logger.error(f"DetalizeFaceExtractorRefactored | init | Ошибка при загрузке модуля '{module_name}': {e}")
+                logger.error(f"DetalizeFaceExtractorRefactored | init | Ошибка при загрузке модуля '{module_name}': {e}")
 
         if not self.modules:
             raise ValueError("DetalizeFaceExtractorRefactored | init | Не удалось загрузить ни одного модуля")
@@ -128,7 +121,7 @@ class DetalizeFaceExtractorRefactored():
             try:
                 module.initialize()
             except Exception as e:
-                self.logger.error(f"DetalizeFaceExtractorRefactored | init | Ошибка при инициализации модуля '{module.module_name}': {e}")
+                logger.error(f"DetalizeFaceExtractorRefactored | init | Ошибка при инициализации модуля '{module.module_name}': {e}")
 
     def extract(self, frame_manager, frame_indices) -> List[List[Dict[str, Any]]]:
         """
@@ -180,7 +173,7 @@ class DetalizeFaceExtractorRefactored():
                 max_aspect_ratio=self.max_aspect_ratio,
                 validate_landmarks=self.validate_landmarks,
             ):
-                self.logger.debug(
+                logger.debug(
                     f"Frame {frame_idx}: Skipping invalid face detection (face_idx={face_idx})"
                 )
                 continue
@@ -227,7 +220,7 @@ class DetalizeFaceExtractorRefactored():
                         shared_data[key] = value
 
                 except Exception as e:
-                    self.logger.error(
+                    logger.error(
                         f"Ошибка в модуле '{module.module_name}' на кадре {frame_idx}, лицо {face_idx}: {e}",
                         exc_info=True,
                     )
@@ -293,4 +286,4 @@ class DetalizeFaceExtractorRefactored():
         cv2.imwrite(str(output_path), vis_frame)
         
         if frame_idx == 0 or (frame_idx + 1) % 10 == 0:
-            print(f"Saved visualization: {output_path}")
+            logger.info(f"Saved visualization: {output_path}")

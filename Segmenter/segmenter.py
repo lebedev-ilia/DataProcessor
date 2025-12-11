@@ -22,11 +22,9 @@ import subprocess
 from typing import List, Dict, Any, Optional, Tuple
 
 import numpy as np
-import cv2  # type: ignore
+import cv2
 
-# -----------------------
-# Utilities / logging
-# -----------------------
+
 def _log(logger, *args, **kwargs):
     if logger is None:
         print(*args, **kwargs)
@@ -45,7 +43,8 @@ def _log(logger, *args, **kwargs):
 def process_video(
     video_path: str,
     out_dir: str,
-    batch_size: int = 512,
+    chunk_size: int = 512,
+    cache_size = 2,
     overwrite: bool = False,
     logger = None
 ) -> Dict[str, Any]:
@@ -53,16 +52,11 @@ def process_video(
     Сохраняет фреймы видео батчами в out_dir и возвращает метаданные.
     Формат батча: np.save(os.path.join(out_dir, "batch_{id:05d}.npy"), np.array(frames_batch, dtype=np.uint8))
     Создаёт metadata.json c полями:
-      total_frames, fps, height, width, channels, batch_size, batches: [{batch_index, path, start_frame, end_frame}, ...]
+      total_frames, fps, height, width, channels, chunk_size, batches: [{batch_index, path, start_frame, end_frame}, ...]
     """
-    os.makedirs(out_dir, exist_ok=True)
-    meta_path = os.path.join(out_dir, "frames_metadata.json")
+    output = f"{out_dir}/video"
 
-    if os.path.exists(meta_path) and not overwrite:
-        with open(meta_path, "r") as f:
-            meta = json.load(f)
-        _log(logger, f"[process_video] found existing metadata -> {meta_path}")
-        return meta
+    os.makedirs(output, exist_ok=True)
 
     cap = cv2.VideoCapture(video_path)
     if not cap.isOpened():
@@ -78,7 +72,8 @@ def process_video(
         "video_path": os.path.abspath(video_path),
         "total_frames": 0,
         "approx_frame_count": approx_frame_count,
-        "batch_size": batch_size,
+        "chunk_size": chunk_size,
+        "cache_size":cache_size,
         "fps": float(fps),
         "batches": []
     }
@@ -107,9 +102,9 @@ def process_video(
         frame_idx += 1
         meta["total_frames"] = frame_idx
 
-        if len(batch_frames) >= batch_size:
+        if len(batch_frames) >= chunk_size:
             fname = f"batch_{batch_id:05d}.npy"
-            path = os.path.join(out_dir, fname)
+            path = os.path.join(output, fname)
             np.save(path, np.stack(batch_frames, axis=0))
             _log(logger, f"[process_video] saved batch {batch_id} frames {frame_idx - len(batch_frames)}..{frame_idx-1} -> {fname}")
 
@@ -126,7 +121,7 @@ def process_video(
     # Последний неполный батч
     if len(batch_frames) > 0:
         fname = f"batch_{batch_id:05d}.npy"
-        path = os.path.join(out_dir, fname)
+        path = os.path.join(output, fname)
         np.save(path, np.stack(batch_frames, axis=0))
         _log(logger, f"[process_video] saved final batch {batch_id} frames {frame_idx - len(batch_frames)}..{frame_idx-1} -> {fname}")
 
@@ -136,10 +131,6 @@ def process_video(
             "start_frame": frame_idx - len(batch_frames),
             "end_frame": frame_idx - 1
         })
-
-    # сохраняем мета
-    with open(meta_path, "w") as f:
-        json.dump(meta, f, indent=2)
 
     cap.release()
     return meta
@@ -171,10 +162,11 @@ def extract_audio(
     Возвращает аудио-мета: {audio_path, duration_sec, sample_rate, total_samples}
     Требует ffmpeg/ffprobe в PATH.
     """
-    os.makedirs(out_dir, exist_ok=True)
+    output = f"{out_dir}/audio"
+    os.makedirs(output, exist_ok=True)
     base = os.path.splitext(os.path.basename(video_path))[0]
     audio_fname = f"{base}.wav"
-    audio_path = os.path.join(out_dir, audio_fname)
+    audio_path = os.path.join(output, audio_fname)
 
     if os.path.exists(audio_path) and not overwrite:
         _log(logger, f"[extract_audio] audio already exists: {audio_path}")
@@ -239,6 +231,7 @@ def extract_audio(
 # Extractor metadata creation
 # -----------------------
 def create_extractor_metadata(
+    output,
     frames_meta: Dict[str, Any],
     audio_meta: Optional[Dict[str, Any]],
     extractor_configs: List[Dict[str, Any]],
@@ -276,7 +269,6 @@ def create_extractor_metadata(
        "audio_segments_ms": [{"start_ms":..,"end_ms":..,"start_sample":..,"end_sample":..}, ...]  # если audio
       }
     """
-    results: List[Dict[str, Any]] = []
     total_frames = int(frames_meta.get("total_frames", 0))
     fps = float(frames_meta.get("fps", 30.0))
     video_duration = total_frames / fps if fps > 0 else None
@@ -284,7 +276,7 @@ def create_extractor_metadata(
     for cfg in extractor_configs:
         name = cfg.get("name", "unnamed")
         mod = cfg.get("modality", "video")
-        out: Dict[str, Any] = {"name": name, "modality": mod}
+        out: Dict[str, Any] = {"modality": mod}
 
         if mod == "video":
             # explicit indices
@@ -299,6 +291,9 @@ def create_extractor_metadata(
                     indices = indices[:int(maxf)]
             out["frame_indices"] = indices
             out["num_indices"] = len(indices)
+
+            frames_meta.update({name:out})
+
             _log(logger, f"[create_extractor_metadata] {name} -> {len(indices)} frames (modality=video)")
 
         elif mod == "audio":
@@ -327,14 +322,21 @@ def create_extractor_metadata(
                     start_ms += step_ms
                 out["audio_segments_ms"] = segments
                 out["num_segments"] = len(segments)
+
+                audio_meta.update({name:out})
+
                 _log(logger, f"[create_extractor_metadata] {name} -> {len(segments)} audio segments (modality=audio)")
         else:
             _log(logger, f"[create_extractor_metadata] unknown modality '{mod}' for extractor {name}")
             out["note"] = "unknown modality"
 
-        results.append(out)
+    with open(f"{output}/video/metadata.json", "w") as f:
+        json.dump(frames_meta, f, indent=2)
 
-    return results
+    with open(f"{output}/audio/metadata.json", "w") as f:
+        json.dump(audio_meta, f, indent=2)
+
+    return True
 
 # -----------------------
 # High-level orchestrator
@@ -343,9 +345,9 @@ class Segmenter:
     """
     Высокоуровневый интерфейс — делает процессинг видео + аудио + формирование extractor metadata.
     """
-    def __init__(self, out_dir: str, batch_size: int = 512, logger = None):
+    def __init__(self, out_dir: str, chunk_size: int = 512, logger = None):
         self.out_dir = out_dir
-        self.batch_size = batch_size
+        self.chunk_size = chunk_size
         self.logger = logger
         os.makedirs(self.out_dir, exist_ok=True)
 
@@ -363,34 +365,11 @@ class Segmenter:
         Возвращает dict с keys: frames_meta, audio_meta, extractor_meta
         """
         _log(self.logger, f"[Segmenter.run] starting processing {video_path}")
-        frames_meta = process_video(video_path, self.out_dir, batch_size=self.batch_size, overwrite=overwrite, logger=self.logger)
+        frames_meta = process_video(video_path, self.out_dir, chunk_size=self.chunk_size, overwrite=overwrite, logger=self.logger)
         audio_meta = extract_audio(video_path, self.out_dir, overwrite=overwrite, logger=self.logger)
-        extractor_meta = create_extractor_metadata(frames_meta, audio_meta, extractor_configs, logger=self.logger)
-
-        # сохраняем единый manifest
-        manifest = {
-            "frames_meta": frames_meta,
-            "audio_meta": audio_meta,
-            "extractor_meta": extractor_meta
-        }
-        with open(os.path.join(self.out_dir, "segmenter_manifest.json"), "w") as f:
-            json.dump(manifest, f, indent=2)
+        status = create_extractor_metadata(self.out_dir, frames_meta, audio_meta, extractor_configs, logger=self.logger)
 
         _log(self.logger, f"[Segmenter.run] finished. manifest saved -> segmenter_manifest.json")
-        return manifest
-
-# -----------------------
-# Helpers: read metadata
-# -----------------------
-def read_frames_metadata(out_dir: str) -> Dict[str, Any]:
-    p = os.path.join(out_dir, "frames_metadata.json")
-    with open(p, "r") as f:
-        return json.load(f)
-
-def read_audio_metadata(out_dir: str) -> Dict[str, Any]:
-    p = os.path.join(out_dir, "audio_metadata.json")
-    with open(p, "r") as f:
-        return json.load(f)
 
 # -----------------------
 # Example usage (if run as script)
@@ -398,17 +377,20 @@ def read_audio_metadata(out_dir: str) -> Dict[str, Any]:
 if __name__ == "__main__":
     import argparse
     parser = argparse.ArgumentParser()
-    parser.add_argument("video", help="path to video")
-    parser.add_argument("--out", default="./out_segmenter", help="out dir")
-    parser.add_argument("--batch_size", type=int, default=512)
+    parser.add_argument("--video-path", help="path to video")
+    parser.add_argument("--output", default="data", help="out dir")
+    parser.add_argument("--chunk-size", type=int, default=64)
     args = parser.parse_args()
 
-    seg = Segmenter(out_dir=args.out, batch_size=args.batch_size, logger=None)
-    # пример конфигов экстракторов
+    seg = Segmenter(out_dir=args.output, chunk_size=int(args.chunk_size), logger=None)
+
     extractor_configs = [
-        {"name": "EmotionExtractor", "modality": "video", "frame_step": 3},
-        {"name": "ObjectExtractor", "modality": "video", "frame_step": 1},
-        {"name": "AudioEmbedder", "modality": "audio", "segment_ms": 1000, "step_ms": 500}
+        {"name": "object_detection", "modality": "video", "frame_step": 3},
+        {"name": "scene_classification", "modality": "video", "frame_step": 5},
+        {"name": "face_detection", "modality": "video", "frame_step": 5},
+        {"name": "detalize_face_modules", "modality": "video", "frame_step": 5},
+        {"name": "emotion_face", "modality": "video", "frame_step": 5},
     ]
-    manifest = seg.run(args.video, extractor_configs)
-    print("Done. Manifest keys:", manifest.keys())
+
+    seg.run(args.video_path, extractor_configs)
+

@@ -1,6 +1,13 @@
 import json
 import argparse
 
+import os
+import sys
+_path = os.path.dirname(os.path.dirname(os.path.dirname(__file__)))
+
+if _path not in sys.path:
+    sys.path.append(_path)
+
 from modules.detalize_face_modules.detalize_face_refactored import DetalizeFaceExtractorRefactored
 from utils.frame_manager import FrameManager
 from utils.results_store import ResultsStore
@@ -21,7 +28,7 @@ if __name__ == "__main__":
     parser.add_argument("--frames-dir",               type=str, required=True, help="Путь к входному видео файлу или директории с изображениями")
     parser.add_argument("--rs-path",                  type=str)
     # Module configuration
-    parser.add_argument("--modules",                  type=str, nargs="+", default=None)
+    parser.add_argument("--modules",                  type=str, default=None)
     # Face detection parameters
     parser.add_argument("--max-faces",                type=int, default=4, help="Максимальное количество лиц для детекции на кадр")
     parser.add_argument("--refine-landmarks",         action="store_true", default=True, help="Использовать уточненные landmarks (468 точек)")
@@ -44,7 +51,7 @@ if __name__ == "__main__":
     modules = args.modules.split(",")
     
     extractor = DetalizeFaceExtractorRefactored(
-        modules=args.modules,
+        modules=modules,
         max_faces=args.max_faces,
         refine_landmarks=args.refine_landmarks,
         visualize=args.visualize,
@@ -60,9 +67,9 @@ if __name__ == "__main__":
     )
     
     metadata = load_json(f"{args.frames_dir}/metadata.json")
-
+    
     rs = ResultsStore(args.rs_path)
-    frame_manager = FrameManager(args.frames_dir, chunk_size=metadata["chunk_size"], cache_dir=metadata["cache_dir"])
+    frame_manager = FrameManager(args.frames_dir, chunk_size=metadata["chunk_size"], cache_size=metadata["cache_size"])
     
     results = extractor.extract(frame_manager=frame_manager, frame_indices=metadata[name]["frame_indices"])
     

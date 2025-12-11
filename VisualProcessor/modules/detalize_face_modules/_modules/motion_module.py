@@ -6,9 +6,9 @@ from typing import Dict, List, Any, Optional
 from collections import defaultdict, deque
 import numpy as np
 
-from modules.base_module import FaceModule
-from utils.landmarks_utils import LANDMARKS
-from utils.face_helpers import safe_distance, eye_opening
+from _modules.base_module import FaceModule
+from _utils.landmarks_utils import LANDMARKS
+from _utils.face_helpers import safe_distance, eye_opening
 
 
 class MotionModule(FaceModule):

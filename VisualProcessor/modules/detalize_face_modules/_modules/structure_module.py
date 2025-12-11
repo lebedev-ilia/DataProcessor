@@ -5,7 +5,7 @@
 from typing import Dict, List, Any, Optional
 import numpy as np
 
-from modules.base_module import FaceModule
+from _modules.base_module import FaceModule
 
 
 class StructureModule(FaceModule):
