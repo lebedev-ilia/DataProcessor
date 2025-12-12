@@ -20,6 +20,10 @@ build/
 .detalize_face_modules_venv/
 .emotion_face_venv/
 .face_detection_venv/
+.behavioral_venv/
+.optical_flow_venv/
+.action_recognition_venv/
+.color_light_venv/
 venv/
 env/
 ENV/
@@ -38,6 +42,7 @@ ENV/
 *.pth
 *.ckpt
 *.bin
+.artifacts/
 
 # Model caches
 models/

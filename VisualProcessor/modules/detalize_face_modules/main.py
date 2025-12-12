@@ -71,6 +71,6 @@ if __name__ == "__main__":
     rs = ResultsStore(args.rs_path)
     frame_manager = FrameManager(args.frames_dir, chunk_size=metadata["chunk_size"], cache_size=metadata["cache_size"])
     
-    results = extractor.extract(frame_manager=frame_manager, frame_indices=metadata[name]["frame_indices"])
+    results = extractor.extract(frame_manager=frame_manager)
     
     rs.store(results, name=name)

@@ -12,9 +12,9 @@ from typing import List, Optional
 
 DEVICE = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 FRAME_TMP_PREFIX = "tmp_frames"
-CHUNK_SIZE = 64
-SCAN_STRIDE = 20
 
+from utils.logger import get_logger
+logger = get_logger("VideoEmotionProcessor")
 
 def segmentation(timeline, fps=30, max_gap_seconds=0.5, max_segment_length_sec=3.0):
     """
@@ -707,7 +707,7 @@ def save_for_user(data, output, output_dir='user_results'):
     with open(output_file, 'w', encoding='utf-8') as f:
         json.dump(serializable_data, f, indent=2, ensure_ascii=False)
     
-    print(f"[INFO] User analysis saved to: {output_file}")
+    logger.info(f"[INFO] User analysis saved to: {output_file}")
     return output_file
 
 def save_for_model(data, output, output_dir='model_data'):
@@ -778,8 +778,8 @@ def save_for_model(data, output, output_dir='model_data'):
     with open(meta_file, 'w', encoding='utf-8') as f:
         json.dump(metadata, f, indent=2, ensure_ascii=False)
     
-    print(f"[INFO] Model data saved: {npy_file}")
-    print(f"[INFO] Metadata saved: {meta_file}")
+    logger.info(f"[INFO] Model data saved: {npy_file}")
+    logger.info(f"[INFO] Metadata saved: {meta_file}")
     
     return {
         'npy_file': str(npy_file),

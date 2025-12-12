@@ -30,9 +30,10 @@ from core.advanced_features import (
     SmoothnessJerkiness,
 )
 
-# Настройка логирования
-logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
-logger = logging.getLogger(__name__)
+name = "FlowStatisticsAnalyzer"
+
+from utils.logger import get_logger
+logger = get_logger(name)
 
 # Подавление предупреждений
 warnings.filterwarnings('ignore', category=RuntimeWarning)
@@ -714,8 +715,7 @@ class FlowStatisticsAnalyzer:
         self.spatial_analyzer = SpatialAnalyzer()
         self.temporal_analyzer = TemporalAnalyzer()
     
-    def analyze_video(self, flow_dir: Union[str, Path], 
-                     video_metadata: Dict[str, Any]) -> Dict[str, Any]:
+    def analyze_video(self, flow_dir: Union[str, Path], video_metadata: Dict[str, Any]) -> Dict[str, Any]:
         """
         Полный статистический анализ для обработанного видео.
         
@@ -1046,12 +1046,6 @@ class FlowStatisticsAnalyzer:
             'analysis_info': {
                 'version': '1.0.0',
                 'timestamp': datetime.now().isoformat(),
-                'config': self.config
-            },
-            'video_metadata': {
-                'video_id': video_metadata.get('video_id', 'unknown'),
-                'video_filename': video_metadata.get('video_filename', 'unknown'),
-                'original_path': video_metadata.get('original_path', 'unknown')
             },
             'processing_info': {
                 'total_frames_analyzed': len(frame_stats_list),
@@ -1115,9 +1109,6 @@ class FlowStatisticsAnalyzer:
         # Сохраняем сводную таблицу
         self._save_summary_table(results, output_dir)
         
-        # Генерируем отчет
-        self._generate_report(results, output_dir)
-        
         logger.info(f"Результаты сохранены в {output_dir}")
     
     def _save_summary_table(self, results: Dict[str, Any], output_dir: Path) -> None:
@@ -1130,46 +1121,6 @@ class FlowStatisticsAnalyzer:
                 df.to_csv(csv_path, index=False, encoding='utf-8')
         except Exception as e:
             logger.warning(f"Ошибка сохранения CSV: {e}")
-    
-    def _generate_report(self, results: Dict[str, Any], output_dir: Path) -> None:
-        """Генерация текстового отчета."""
-        try:
-            metrics = results['statistics']['summary_metrics']
-            
-            report = f"""# Отчет статистического анализа оптического потока
-
-## Общая информация
-- Video ID: {results['video_metadata']['video_id']}
-- Видео: {results['video_metadata']['video_filename']}
-- Дата анализа: {results['analysis_info']['timestamp']}
-- Проанализировано кадров: {results['processing_info']['total_frames_analyzed']}
-
-## Ключевые метрики
-
-### Активность движения
-- Средняя скорость: {metrics.get('overall_magnitude_mean', 0):.2f} px/frame
-- Интенсивность: {metrics.get('dominant_motion_intensity', 'unknown')}
-- Основное направление: {metrics.get('dominant_direction', 'unknown')}
-
-### Временные характеристики
-- Стабильность: {metrics.get('temporal_stability', 0):.2f}/1.0
-- Основной тренд: {metrics.get('dominant_trend', 'unknown')}
-- Пиков активности: {metrics.get('peak_activity_frames', 0)}
-- Резких переходов: {metrics.get('transition_count', 0)}
-
-## Структура результатов
-1. `statistical_analysis.json` - Полные результаты анализа
-2. `frame_statistics.csv` - Статистики по каждому кадру
-3. Дополнительные файлы в соответствующих директориях
-
-## Время анализа
-- Длительность: {results['processing_info'].get('analysis_duration_seconds', 0):.1f} секунд
-"""
-            
-            report_path = output_dir / 'analysis_report.md'
-            report_path.write_text(report, encoding='utf-8')
-        except Exception as e:
-            logger.warning(f"Ошибка генерации отчета: {e}")
     
     @staticmethod
     def _extract_frame_index(filename: str) -> int:

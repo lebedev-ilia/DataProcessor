@@ -12,11 +12,13 @@
 import cv2
 import numpy as np
 import mediapipe as mp
-from typing import Dict, List, Any, Optional, Tuple
+from typing import Dict, List, Any
 from collections import deque
-import json
-from pathlib import Path
 
+name = "behavior_analyzer"
+
+from utils.logger import get_logger
+logger = get_logger(name)
 
 class HandGestureClassifier:
     """Детальная классификация жестов рук"""
@@ -806,27 +808,63 @@ class BehaviorAnalyzer:
     
     def process_video(self, frame_manager, frame_indices) -> Dict[str, Any]:
         """Обрабатывает видео"""
-        
+        import time
+
         fps = frame_manager.fps
         
-        all_results = []
+        all_results = {}
+        c = 0
+        t = time.time()
         
         for frame_idx in frame_indices:
             frame = frame_manager.get(frame_idx)
             
             result = self.process_frame(frame)
-            result['frame_idx'] = frame_idx
             result['timestamp'] = frame_idx / fps
-            all_results.append(result)
-            
-            frame_idx += 1
+            all_results[frame_idx] = result
+
+            c += 1
+
+            if c % 20 == 0:
+                l = time.time()
+                d = round(l - t, 2)
+                t = l
+                logger.info(f"Behavioral | Обработано кадров: {c}/{len(frame_indices)} | Time: {d}")
         
         aggregated = self._aggregate_results(all_results)
         
         return {
-            'frame_results': all_results,
-            'aggregated': aggregated
+            'frame_results': self.make_serializable(all_results),
+            'aggregated': self.make_serializable(aggregated)
         }
+
+    def make_serializable(self, obj):
+        import numpy as np
+        # numpy bool
+        if isinstance(obj, (np.bool_,)):
+            return bool(obj)
+        # python bool
+        if isinstance(obj, bool):
+            return obj
+        # numpy int/float
+        if isinstance(obj, (np.integer, np.floating)):
+            return obj.item()
+        # numpy array
+        if isinstance(obj, np.ndarray):
+            return obj.tolist()
+        # tuple -> list
+        if isinstance(obj, tuple):
+            return [self.make_serializable(x) for x in obj]
+        # list
+        if isinstance(obj, list):
+            return [self.make_serializable(x) for x in obj]
+        # dict
+        if isinstance(obj, dict):
+            return {k: self.make_serializable(v) for k, v in obj.items()}
+        # objects with __dict__
+        if hasattr(obj, "__dict__"):
+            return self.make_serializable(obj.__dict__)
+        return obj
     
     def _aggregate_results(self, results: List[Dict[str, Any]]) -> Dict[str, Any]:
         """Агрегирует результаты по всему видео"""
@@ -836,9 +874,9 @@ class BehaviorAnalyzer:
         aggregated = {}
         
         # Средние значения
-        engagement_scores = [r.get('engagement', {}).get('engagement_score', 0) for r in results]
-        confidence_scores = [r.get('confidence', {}).get('confidence_score', 0) for r in results]
-        stress_scores = [r.get('stress', {}).get('stress_level', 0) for r in results]
+        engagement_scores = [r.get('engagement', {}).get('engagement_score', 0) for r in results.values()]
+        confidence_scores = [r.get('confidence', {}).get('confidence_score', 0) for r in results.values()]
+        stress_scores = [r.get('stress', {}).get('stress_level', 0) for r in results.values()]
         
         aggregated['avg_engagement'] = float(np.mean(engagement_scores))
         aggregated['avg_confidence'] = float(np.mean(confidence_scores))
@@ -851,7 +889,7 @@ class BehaviorAnalyzer:
         
         # Статистика жестов
         all_gestures = []
-        for r in results:
+        for r in results.values():
             all_gestures.extend(r.get('hand_gestures', []))
         
         gesture_counts = {}
@@ -861,7 +899,7 @@ class BehaviorAnalyzer:
         aggregated['gesture_statistics'] = gesture_counts
         
         # Статистика поз
-        postures = [r.get('body_language', {}).get('posture', 'unknown') for r in results]
+        postures = [r.get('body_language', {}).get('posture', 'unknown') for r in results.values()]
         posture_counts = {}
         for posture in postures:
             if posture != 'unknown':

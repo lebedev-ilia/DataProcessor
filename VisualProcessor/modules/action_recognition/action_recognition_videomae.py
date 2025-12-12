@@ -5,7 +5,7 @@ import numpy as np
 from collections import defaultdict
 import torch
 import cv2
-from transformers import VideoMAEFeatureExtractor, VideoMAEForVideoClassification
+from transformers import VideoMAEImageProcessor, VideoMAEForVideoClassification
 try:
     from scipy import stats
 except ImportError:
@@ -43,7 +43,7 @@ class VideoMAEActionRecognizer:
         self.batch_size = batch_size
         self.device = device or ("cuda" if torch.cuda.is_available() else "cpu")
 
-        self.feature_extractor = VideoMAEFeatureExtractor.from_pretrained(model_name)
+        self.feature_extractor = VideoMAEImageProcessor.from_pretrained(model_name)
         self.model = VideoMAEForVideoClassification.from_pretrained(model_name).to(self.device)
         self.model.eval()
 
@@ -189,8 +189,8 @@ class VideoMAEActionRecognizer:
             "ema_confidence": float(ema_prob.max()),  # ✅ Добавлено: используем вычисленный ema_prob
         }
 
-        if self.id2label is not None and str(dominant) in self.id2label:
-            features["dominant_action_label"] = self.id2label[str(dominant)]
+        if self.id2label is not None and dominant in self.id2label:
+            features["dominant_action_label"] = self.id2label[dominant]
 
         # Добавляем новые фичи
         # Fine-grained actions

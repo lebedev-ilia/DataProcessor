@@ -116,7 +116,7 @@ class VideoEmotionProcessor:
         self.batch_load_very_high = batch_load_very_high
         self.batch_process_very_high = batch_process_very_high
 
-        self.frames_with_face = self.frames_with_face_load("2025-12-11_17-19-00-354053_ff96ec7c")
+        self.frames_with_face = self.frames_with_face_load("auto")
 
         if emo_path == "None" or emo_path is None:
             import os
@@ -136,10 +136,12 @@ class VideoEmotionProcessor:
         
     def frames_with_face_load(self, filename):
         import os, json
-        p = os.path.dirname(os.path.dirname(os.path.dirname(os.path.dirname(__file__))))
+        p = f"{os.path.dirname(os.path.dirname(os.path.dirname(os.path.dirname(__file__))))}/result_store/face_detection"
         try:
-            with open(f"{p}/result_store/face_detection/{filename}.json", "r") as f:
-                return json.load(f) # ["frames_with_face"]
+            if filename == "auto":
+                filename = os.listdir(p)[-1]
+            with open(f"{p}/{filename}", "r") as f:
+                return json.load(f)["frames_with_face"]
         except Exception as e:
             logger.error(f"VideoEmotionProcessor | frames_with_face_load | Error: {e}")
             raise

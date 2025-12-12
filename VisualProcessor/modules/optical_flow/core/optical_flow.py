@@ -7,34 +7,16 @@ import torchvision.transforms as T
 import torchvision.models.optical_flow as models
 import numpy as np
 import cv2
-import os
 import json
-import logging
-from pathlib import Path
-from typing import Dict, List, Tuple, Optional, Any
-from dataclasses import dataclass
+from typing import Dict, Tuple, Optional, Any
 from datetime import datetime
-import hashlib
 
-# Логирование
-logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
-logger = logging.getLogger(__name__)
+from .config import FlowPipelineConfig
 
-@dataclass
-class FlowPipelineConfig:
-    """Конфигурация пайплайна обработки оптического потока."""
-    output_dir: str = "raft_output"
-    model_type: str = "small"  # "small" или "large"
-    max_dimension: int = 512
-    frame_skip: int = 5
-    save_overlay: bool = True
-    save_flow_tensors: bool = True
-    create_summary_video: bool = False
-    device: str = "auto"  # "auto", "cuda", "cpu"
-    
-    def __post_init__(self):
-        if self.device == "auto":
-            self.device = "cuda" if torch.cuda.is_available() else "cpu"
+name = "OpticalFlowProcessor"
+
+from utils.logger import get_logger
+logger = get_logger(name)
 
 class OpticalFlowProcessor:
     """Основной класс для обработки оптического потока."""
@@ -174,16 +156,18 @@ class OpticalFlowProcessor:
         Returns:
             Словарь с результатами обработки
         """
+        import os
+
         # Инициализация модели
         if self.model is None:
             self._initialize_model()
 
-        flow_dir = self.config.output_dir / "flow"
-        overlay_dir = self.config.output_dir / "overlay" if self.config.save_overlay else None
+        flow_dir = f"{self.config.output_dir}/flow"
+        overlay_dir = f"{self.config.output_dir}/overlay" if self.config.save_overlay else None
         
-        flow_dir.mkdir(parents=True, exist_ok=True)
+        os.makedirs(flow_dir, exist_ok=True)
         if overlay_dir:
-            overlay_dir.mkdir(exist_ok=True)
+            os.makedirs(overlay_dir, exist_ok=True)
         
         # Получение свойств видео
         fps = frame_manager.fps
@@ -195,94 +179,86 @@ class OpticalFlowProcessor:
         frame_buffer = []
         processed_pairs = 0
         flow_data = []
-        
-        from tqdm import tqdm
-        
-        with tqdm(total=total_frames//self.config.frame_skip, desc="Обработка потока", unit="пар") as pbar:
+
+        for frame_idx in frame_indices:
+            frame = frame_manager.get(frame_idx)
             
-            for frame_idx in frame_indices:
-                frame = frame_manager.get(frame_idx)
+            # Конвертация BGR -> RGB
+            frame_rgb = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
+            frame_tensor = torch.from_numpy(frame_rgb).permute(2, 0, 1).to(self.config.device)
+            
+            # Ресайз
+            frame_resized, orig_size = self.resize_frame(frame_tensor, self.config.max_dimension)
+            
+            frame_buffer.append({
+                'tensor_resized': frame_resized,
+                'orig_size': orig_size,
+                'original_idx': frame_idx
+            })
+            
+            # Обработка пары кадров
+            if len(frame_buffer) == 2:
+                frame1 = frame_buffer[0]
+                frame2 = frame_buffer[-1]
                 
-                # Конвертация BGR -> RGB
-                frame_rgb = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
-                frame_tensor = torch.from_numpy(frame_rgb).permute(2, 0, 1).to(self.config.device)
+                # Предобработка
+                frame1_processed, _ = self.preprocess_frame(frame1['tensor_resized'])
+                frame2_processed, _ = self.preprocess_frame(frame2['tensor_resized'])
                 
-                # Ресайз
-                frame_resized, orig_size = self.resize_frame(frame_tensor, self.config.max_dimension)
+                # Расчет оптического потока
+                with torch.no_grad():
+                    list_of_flows = self.model(
+                        frame1_processed.unsqueeze(0),
+                        frame2_processed.unsqueeze(0)
+                    )
+                    flow_tensor = list_of_flows[-1].squeeze(0)
                 
-                frame_buffer.append({
-                    'tensor_resized': frame_resized,
-                    'orig_size': orig_size,
-                    'original_idx': frame_idx
+                # Масштабирование к оригинальному размеру
+                flow_resized = self.resize_flow(flow_tensor, frame1['orig_size'])
+                
+                # Сохранение тензора потока
+                if self.config.save_flow_tensors:
+                    flow_filename = f"flow_{frame1['original_idx']:06d}.pt"
+                    flow_path = f"{flow_dir}/{flow_filename}"
+                    torch.save(flow_resized.cpu(), flow_path)
+                
+                # Визуализация
+                if self.config.save_overlay:
+                    flow_rgb = self.flow_to_color_map(flow_resized)
+                    frame_display = self._tensor_to_display(frame1['tensor_resized'])
+                    
+                    # Ресайз flow для overlay
+                    if flow_rgb.shape[:2] != frame_display.shape[:2]:
+                        flow_rgb = cv2.resize(
+                            flow_rgb,
+                            (frame_display.shape[1], frame_display.shape[0]),
+                            interpolation=cv2.INTER_LINEAR
+                        )
+                    
+                    overlay = cv2.addWeighted(frame_display, 0.6, flow_rgb, 0.4, 0)
+                    overlay_path = f"{overlay_dir}/overlay_{frame1['original_idx']:06d}.png"
+                    cv2.imwrite(str(overlay_path), overlay)
+                
+                # Сбор данных для статистик
+                flow_data.append({
+                    'frame_idx': frame1['original_idx'],
+                    'flow_tensor': flow_resized.cpu(),
+                    'orig_size': frame1['orig_size']
                 })
                 
-                # Обработка пары кадров
-                if len(frame_buffer) == self.config.frame_skip + 1:
-                    frame1 = frame_buffer[0]
-                    frame2 = frame_buffer[-1]
-                    
-                    # Предобработка
-                    frame1_processed, _ = self.preprocess_frame(frame1['tensor_resized'])
-                    frame2_processed, _ = self.preprocess_frame(frame2['tensor_resized'])
-                    
-                    # Расчет оптического потока
-                    with torch.no_grad():
-                        list_of_flows = self.model(
-                            frame1_processed.unsqueeze(0),
-                            frame2_processed.unsqueeze(0)
-                        )
-                        flow_tensor = list_of_flows[-1].squeeze(0)
-                    
-                    # Масштабирование к оригинальному размеру
-                    flow_resized = self.resize_flow(flow_tensor, frame1['orig_size'])
-                    
-                    # Сохранение тензора потока
-                    if self.config.save_flow_tensors:
-                        flow_filename = f"flow_{frame1['original_idx']:06d}.pt"
-                        flow_path = flow_dir / flow_filename
-                        torch.save(flow_resized.cpu(), flow_path)
-                    
-                    # Визуализация
-                    if self.config.save_overlay:
-                        flow_rgb = self.flow_to_color_map(flow_resized)
-                        frame_display = self._tensor_to_display(frame1['tensor_resized'])
-                        
-                        # Ресайз flow для overlay
-                        if flow_rgb.shape[:2] != frame_display.shape[:2]:
-                            flow_rgb = cv2.resize(
-                                flow_rgb,
-                                (frame_display.shape[1], frame_display.shape[0]),
-                                interpolation=cv2.INTER_LINEAR
-                            )
-                        
-                        overlay = cv2.addWeighted(frame_display, 0.6, flow_rgb, 0.4, 0)
-                        overlay_path = overlay_dir / f"overlay_{frame1['original_idx']:06d}.png"
-                        cv2.imwrite(str(overlay_path), overlay)
-                    
-                    # Сбор данных для статистик
-                    flow_data.append({
-                        'frame_idx': frame1['original_idx'],
-                        'flow_tensor': flow_resized.cpu(),
-                        'orig_size': frame1['orig_size']
-                    })
-                    
-                    # Обновление буфера
-                    frame_buffer = [frame_buffer[-1]]
-                    processed_pairs += 1
-                    pbar.update(1)
-                
-                frame_idx += 1
-                
-                # Периодическая очистка кэша CUDA
-                if frame_idx % 50 == 0 and self.config.device == "cuda":
-                    torch.cuda.empty_cache()
-        
-        cap.release()
+                # Обновление буфера
+                frame_buffer = [frame_buffer[-1]]
+                processed_pairs += 1
+            
+            frame_idx += 1
+            
+            # Периодическая очистка кэша CUDA
+            if frame_idx % 50 == 0 and self.config.device == "cuda":
+                torch.cuda.empty_cache()
         
         # Создание метаданных
         metadata = self._create_metadata(
-            video_path=video_path,
-            output_base=output_base,
+            output_dir=self.config.output_dir,
             fps=fps,
             total_frames=total_frames,
             processed_frames=processed_pairs,
@@ -293,7 +269,6 @@ class OpticalFlowProcessor:
         logger.info(f"Обработка завершена. Обработано пар: {processed_pairs}")
         
         return {
-            'output_dir': str(output_base),
             'flow_dir': str(flow_dir),
             'overlay_dir': str(overlay_dir) if overlay_dir else None,
             'metadata': metadata,
@@ -301,24 +276,17 @@ class OpticalFlowProcessor:
             'processed_pairs': processed_pairs
         }
     
-    def _create_metadata(self, video_path: Path, output_base: Path,
-                        fps: float, total_frames: int, processed_frames: int,
+    def _create_metadata(self, output_dir, fps: float, total_frames: int, processed_frames: int,
                         original_resolution: Tuple[int, int],
                         processed_resolution: Tuple[int, int]) -> Dict[str, Any]:
         """Создание метаданных видео."""
         
-        video_hash = hashlib.md5(str(video_path).encode()).hexdigest()[:8]
-        
         metadata = {
-            'video_id': video_hash,
-            'video_filename': video_path.name,
-            'original_path': str(video_path),
             'processing_date': datetime.now().isoformat(),
             
             'processing_parameters': {
                 'model': self.config.model_type,
                 'max_dimension': self.config.max_dimension,
-                'frame_skip': self.config.frame_skip,
                 'device': self.config.device,
                 'pipeline_version': '2.0.0'
             },
@@ -342,7 +310,7 @@ class OpticalFlowProcessor:
         }
         
         # Сохранение метаданных
-        metadata_path = output_base / "metadata.json"
+        metadata_path = f"{output_dir}/metadata.json"
         with open(metadata_path, 'w', encoding='utf-8') as f:
             json.dump(metadata, f, indent=2, ensure_ascii=False)
         

@@ -93,5 +93,5 @@ if __name__ == "__main__":
     
     save_path = f"{args.rs_path}/{name}"
 
-    result = processor.process(frame_manager, args.rs_path)
+    result = processor.process(frame_manager, save_path)
     

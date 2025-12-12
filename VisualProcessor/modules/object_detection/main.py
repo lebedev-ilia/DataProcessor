@@ -34,7 +34,7 @@ if __name__ == "__main__":
     )
     
     parser.add_argument('--model',    type=str,   default=None, help='')
-    parser.add_argument('--batch-size',    type=str,   default=None, help='')
+    parser.add_argument('--batch-size',    type=int,   default=None, help='')
     parser.add_argument('--use-queries',   action='store_true',   default=None, help='')
     parser.add_argument('--default-categories',    type=str,   default=None, help='')
     parser.add_argument('--model-family',  type=str,   default=None, help='')

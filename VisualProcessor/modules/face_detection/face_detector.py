@@ -73,6 +73,7 @@ class FaceDetector:
                 ti = time.time()
                 tok = round(ti - t, 2)
                 t = ti
-                logger.info(f"Detector | Обработано кадров: {c}/{len(frame_indices)} | Лиц: {len(timeline)} | Время: {tok}")
+                l = len(timeline["frames_with_face"])
+                logger.info(f"Detector | Обработано кадров: {c}/{len(frame_indices)} | Лиц: {l} | Время: {tok}")
 
         return timeline

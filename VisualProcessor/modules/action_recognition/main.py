@@ -2,6 +2,13 @@
 CLI интерфейс для модуля распознавания действий в видео.
 """
 
+import os
+import sys
+_path = os.path.dirname(os.path.dirname(os.path.dirname(__file__)))
+
+if _path not in sys.path:
+    sys.path.append(_path)
+
 import json
 import argparse
 from typing import Optional
@@ -14,6 +21,9 @@ from utils.results_store import ResultsStore
 
 name = "action_recognition"
 
+from utils.logger import get_logger
+logger = get_logger(name)
+
 def load_metadata(meta_path):
     try:
         with open(meta_path, "r") as f:
@@ -23,8 +33,8 @@ def load_metadata(meta_path):
 
 def process_video(
     frame_manager,
-    frame_skip,
-    model_dir: str,
+    total_frames,
+    model_dir: str = None,
     clip_len: int = 16,
     batch_size: int = 8,
     max_tracks: Optional[int] = None
@@ -36,12 +46,10 @@ def process_video(
         model_dir: Путь к директории с моделью VideoMAE
         clip_len: Длина клипа в кадрах
         batch_size: Размер батча для inference
-        frame_skip: Пропуск кадров (обрабатывать каждый N-й кадр)
         max_tracks: Максимальное количество треков для обработки
     """
-    
-    fps = frame_manager.fps
-    total_frames = frame_manager.total_frames
+    if not model_dir:
+        model_dir = f"{os.path.dirname(__file__)}/models"
             
     recognizer = VideoMAEActionRecognizer(
         frame_manager=frame_manager,
@@ -52,7 +60,7 @@ def process_video(
     
     # Подготавливаем треки (для простоты используем равномерную выборку)
     # В реальном сценарии треки должны приходить из модуля трекинга
-    print(f"[INFO] Подготавливаю треки для обработки...")
+    logger.info(f"[INFO] Подготавливаю треки для обработки...")
     
     # Создаем треки на основе равномерной выборки кадров
     # Для демонстрации создаем несколько треков
@@ -65,11 +73,11 @@ def process_video(
         end_frame = min(track_id * track_length, total_frames - 1)
         
         # Выбираем кадры с учетом frame_skip
-        indices = list(range(start_frame, end_frame + 1, frame_skip))
+        indices = list(range(start_frame, end_frame + 1))
         if indices:
             frame_indices_per_person[track_id] = indices
     
-    print(f"[INFO] Обрабатываю {len(frame_indices_per_person)} треков...")
+    logger.info(f"[INFO] Обрабатываю {len(frame_indices_per_person)} треков...")
     
     # Обрабатываем треки
     results = recognizer.process(frame_indices_per_person)
@@ -78,12 +86,10 @@ def process_video(
     output_data = {
         "model_dir": str(model_dir),
         "total_frames": total_frames,
-        "fps": fps,
         "num_tracks": len(results),
         "processing_params": {
             "clip_len": clip_len,
             "batch_size": batch_size,
-            "frame_skip": frame_skip
         },
         "results": {}
     }
@@ -104,15 +110,15 @@ def process_video(
                 json_results[key] = value
         output_data["results"][str(track_id)] = json_results
     
-    print(f"[INFO] Обработано треков: {len(results)}")
+    logger.info(f"[INFO] Обработано треков: {len(results)}")
     
     # Выводим краткую статистику
     for track_id, track_results in results.items():
-        print(f"\n  Трек {track_id}:")
-        print(f"    Доминирующее действие: {track_results.get('dominant_action_label', 'unknown')}")
-        print(f"    Уверенность: {track_results.get('dominant_confidence', 0.0):.2f}")
-        print(f"    Сложность действия: {track_results.get('complexity_score', 0.0):.2f}")
-        print(f"    Тип активности сцены: {track_results.get('scene_activity_type', 'unknown')}")
+        logger.info(f"\n  Трек {track_id}:")
+        logger.info(f"    Доминирующее действие: {track_results.get('dominant_action_label', 'unknown')}")
+        logger.info(f"    Уверенность: {track_results.get('dominant_confidence', 0.0):.2f}")
+        logger.info(f"    Сложность действия: {track_results.get('complexity_score', 0.0):.2f}")
+        logger.info(f"    Тип активности сцены: {track_results.get('scene_activity_type', 'unknown')}")
     
     return output_data
 
@@ -141,11 +147,8 @@ def main():
     
     parser.add_argument('--frames-dir',    type=str, required=True, help='Путь к входному видео файлу')
     parser.add_argument('--rs-path',       type=str, required=True, help='Путь к входному видео файлу')
-    
-    parser.add_argument('--model',         type=str, required=True, help='Путь к директории с моделью VideoMAE')
     parser.add_argument('--clip-len',      type=int, default=16, help='Длина клипа в кадрах для обработки')
     parser.add_argument('--batch-size',    type=int, default=8, help='Размер батча для inference')
-    parser.add_argument('--frame-skip',    type=int, default=1, help='Обрабатывать каждый N-й кадр (для ускорения)')
     parser.add_argument('--max-tracks',    type=int, default=None, help='Максимальное количество треков для обработки')
     
     args = parser.parse_args()
@@ -158,8 +161,7 @@ def main():
     
     results = process_video(
         frame_manager=frame_manager,
-        frame_skip=args.frame_skip,
-        model_dir=args.model_path,
+        total_frames=metadata[name]["num_indices"],
         clip_len=args.clip_len,
         batch_size=args.batch_size,
         max_tracks=args.max_tracks

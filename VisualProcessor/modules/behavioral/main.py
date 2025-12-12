@@ -2,6 +2,13 @@ import json
 import argparse
 from pathlib import Path
 
+import os
+import sys
+_path = os.path.dirname(os.path.dirname(os.path.dirname(__file__)))
+
+if _path not in sys.path:
+    sys.path.append(_path)
+
 from modules.behavioral.behavior_analyzer import BehaviorAnalyzer
 from utils.frame_manager import FrameManager
 from utils.results_store import ResultsStore
@@ -22,21 +29,21 @@ if __name__ == "__main__":
     parser.add_argument('--rs-path',       type=str, help='')
     parser.add_argument('--visualize',     action='store_true', help='Сохранять визуализацию результатов на кадрах')
     parser.add_argument('--visualize-dir', type=str, default='./behavior_visualizations', help='Директория для сохранения визуализаций')
-    parser.add_argument('--pose-static-image-mode')
-    parser.add_argument('--pose-model-complexity')
-    parser.add_argument('--pose-smooth-landmarks')
-    parser.add_argument('--pose-min-detection-confidence')
-    parser.add_argument('--pose-min-tracking-confidence')
-    parser.add_argument('--hands-static-image-mode')
-    parser.add_argument('--hands-max-num-hands')
-    parser.add_argument('--hands-model-complexity')
-    parser.add_argument('--hands-min-detection-confidence')
-    parser.add_argument('--hands-min-tracking-confidence')
-    parser.add_argument('--face-static-image-mode')
-    parser.add_argument('--face-max-num-faces')
-    parser.add_argument('--face-refine-landmarks')
-    parser.add_argument('--face-min-detection-confidence')
-    parser.add_argument('--face-min-tracking-confidence')
+    parser.add_argument('--pose-static-image-mode', action="store_true")
+    parser.add_argument('--pose-model-complexity', type=int)
+    parser.add_argument('--pose-smooth-landmarks', action="store_true")
+    parser.add_argument('--pose-min-detection-confidence', type=float)
+    parser.add_argument('--pose-min-tracking-confidence', type=float)
+    parser.add_argument('--hands-static-image-mode', action="store_true")
+    parser.add_argument('--hands-max-num-hands', type=int)
+    parser.add_argument('--hands-model-complexity', type=int)
+    parser.add_argument('--hands-min-detection-confidence', type=float)
+    parser.add_argument('--hands-min-tracking-confidence', type=float)
+    parser.add_argument('--face-static-image-mode', action="store_true")
+    parser.add_argument('--face-max-num-faces', type=int)
+    parser.add_argument('--face-refine-landmarks', action="store_true")
+    parser.add_argument('--face-min-detection-confidence', type=float)
+    parser.add_argument('--face-min-tracking-confidence', type=float)
     
     args = parser.parse_args()
     
@@ -64,7 +71,7 @@ if __name__ == "__main__":
     
     metadata = load_json(f"{args.frames_dir}/metadata.json")
     
-    frame_manager = FrameManager(frames_fir=args.frames_fir, chunk_size=metadata["chunk_size"], cache_size=metadata["cache_size"])
+    frame_manager = FrameManager(frames_dir=args.frames_dir, chunk_size=metadata["chunk_size"], cache_size=metadata["cache_size"])
     rs = ResultsStore(args.rs_path)
     
     results = analyzer.process_video(frame_manager=frame_manager, frame_indices=metadata[name]["frame_indices"])

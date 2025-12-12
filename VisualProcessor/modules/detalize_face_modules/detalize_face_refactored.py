@@ -62,6 +62,8 @@ class DetalizeFaceExtractorRefactored():
         :param kwargs: дополнительные параметры для BaseExtractor
         """
 
+        self.frames_with_face = self.frames_with_face_load("auto")
+
         self.max_faces = max_faces
         self.refine_landmarks = refine_landmarks
 
@@ -123,14 +125,26 @@ class DetalizeFaceExtractorRefactored():
             except Exception as e:
                 logger.error(f"DetalizeFaceExtractorRefactored | init | Ошибка при инициализации модуля '{module.module_name}': {e}")
 
-    def extract(self, frame_manager, frame_indices) -> List[List[Dict[str, Any]]]:
+    def frames_with_face_load(self, filename):
+        import os, json
+        p = f"{os.path.dirname(os.path.dirname(os.path.dirname(__file__)))}/result_store/face_detection"
+        try:
+            if filename == "auto":
+                filename = os.listdir(p)[-1]
+            with open(f"{p}/{filename}", "r") as f:
+                return json.load(f)["frames_with_face"]
+        except Exception as e:
+            logger.error(f"VideoEmotionProcessor | frames_with_face_load | Error: {e}")
+            raise
+
+    def extract(self, frame_manager) -> List[List[Dict[str, Any]]]:
         """
         Processes a sequence of OpenCV BGR frames and returns a list where each
         element corresponds to the facial feature set per frame.
         """
         outputs = {}
 
-        for frame_idx in frame_indices:
+        for frame_idx in self.frames_with_face:
 
             frame = frame_manager.get(frame_idx)
 

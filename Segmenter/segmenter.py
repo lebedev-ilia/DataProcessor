@@ -390,6 +390,10 @@ if __name__ == "__main__":
         {"name": "face_detection", "modality": "video", "frame_step": 5},
         {"name": "detalize_face_modules", "modality": "video", "frame_step": 5},
         {"name": "emotion_face", "modality": "video", "frame_step": 5},
+        {"name": "behavioral", "modality": "video", "frame_step": 5},
+        {"name": "optical_flow", "modality": "video", "frame_step": 5},
+        {"name": "action_recognition", "modality": "video", "frame_step": 5},
+        {"name": "color_light", "modality": "video", "frame_step": 5},
     ]
 
     seg.run(args.video_path, extractor_configs)

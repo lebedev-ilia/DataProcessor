@@ -1,4 +1,11 @@
+import os
 import json
+
+import sys
+_path = os.path.dirname(os.path.dirname(os.path.dirname(__file__)))
+
+if _path not in sys.path:
+    sys.path.append(_path)
 
 from core.flow_statistics import FlowStatisticsAnalyzer
 from core.optical_flow import OpticalFlowProcessor
@@ -7,8 +14,7 @@ from core.config import FlowPipelineConfig, FlowStatisticsConfig
 from utils.frame_manager import FrameManager
 from utils.results_store import ResultsStore
 
-name = "object_detection"
-
+name = "optical_flow"
 
 def load_metadata(meta_path):
     try:
@@ -26,27 +32,27 @@ if __name__ == "__main__":
     parser.add_argument('--rs-path',    type=str, help='')
     
     parser.add_argument('--model',                type=str, default='small', choices=['small', 'large'], help='Модель RAFT')
-    parser.add_argument('--max_dim',              type=int, default=256, help='Максимальный размер стороны')
-    parser.add_argument('--no_overlay',           action='store_true', help='Не сохранять overlay')
-    parser.add_argument('--run_stats',            action='store_true', help='Запустить статистический анализ')
+    parser.add_argument('--max-dim',              type=int, default=256, help='Максимальный размер стороны')
+    parser.add_argument('--no-overlay',           action='store_true', help='Не сохранять overlay')
+    parser.add_argument('--run-stats',            action='store_true', help='Запустить статистический анализ')
     
-    parser.add_argument('--grid-size',                help='')
-    parser.add_argument('--motion-thresholds',        help='')
-    parser.add_argument('--direction-bins',           help='')
-    parser.add_argument('--spatial-sample-rate',      help='')
-    parser.add_argument('--top-regions-count',        help='')
-    parser.add_argument('--savgol-window',            help='')
-    parser.add_argument('--min-frames-for-temporal',  help='')
-    parser.add_argument('--peak-detection-height',    help='')
-    parser.add_argument('--enable-camera-motion',     help='')
-    parser.add_argument('--enable-advanced-features', help='')
-    parser.add_argument('--enable-mei',               help='')
-    parser.add_argument('--enable-fg-bg',             help='')
-    parser.add_argument('--enable-clusters',          help='')
-    parser.add_argument('--enable-smoothness',        help='')
-    parser.add_argument('--fg-bg-method',             help='')
-    parser.add_argument('--fg-bg-threshold',          help='')
-    parser.add_argument('--motion-clusters-n',        help='')
+    parser.add_argument('--grid-size',                type=str, help='')
+    parser.add_argument('--motion-thresholds',        type=str, help='')
+    parser.add_argument('--direction-bins',           type=int, help='')
+    parser.add_argument('--spatial-sample-rate',      type=int, help='')
+    parser.add_argument('--top-regions-count',        type=int, help='')
+    parser.add_argument('--savgol-window',            type=int, help='')
+    parser.add_argument('--min-frames-for-temporal',  type=int, help='')
+    parser.add_argument('--peak-detection-height',    type=float, help='')
+    parser.add_argument('--enable-camera-motion',     action="store_true", help='')
+    parser.add_argument('--enable-advanced-features', action="store_true", help='')
+    parser.add_argument('--enable-mei',               action="store_true", help='')
+    parser.add_argument('--enable-fg-bg',             action="store_true", help='')
+    parser.add_argument('--enable-clusters',          action="store_true", help='')
+    parser.add_argument('--enable-smoothness',        action="store_true", help='')
+    parser.add_argument('--fg-bg-method',             type=str, help='')
+    parser.add_argument('--fg-bg-threshold',          type=float, help='')
+    parser.add_argument('--motion-clusters-n',        type=int, help='')
     
     args = parser.parse_args()
     
@@ -56,10 +62,18 @@ if __name__ == "__main__":
         save_overlay=not args.no_overlay,
         save_flow_tensors=True
     )
+
+    p = f"{os.path.dirname(os.path.dirname(os.path.dirname(__file__)))}/result_store/{name}"
+    os.makedirs(p, exist_ok=True)
+
+    flow_config.output_dir = p
+
+    grid_size = tuple([int(i) for i in args.grid_size.split(",")])
+    motion_thresholds = tuple([float(i) for i in args.motion_thresholds.split(",")])
     
     stats_config = FlowStatisticsConfig(
-        grid_size = args.grid_size,
-        motion_thresholds = args.motion_thresholds,
+        grid_size = grid_size,
+        motion_thresholds = motion_thresholds,
         direction_bins = args.direction_bins,
         spatial_sample_rate = args.spatial_sample_rate,
         top_regions_count = args.top_regions_count,
@@ -76,9 +90,6 @@ if __name__ == "__main__":
         fg_bg_threshold = args.fg_bg_threshold,
         motion_clusters_n = args.motion_clusters_n
     )
-    
-    stats_config.enable_camera_motion = args.run_camera_motion
-    stats_config.enable_advanced_features = not args.no_advanced_features
 
     flow_processor = OpticalFlowProcessor(flow_config)
     stats_analyzer = FlowStatisticsAnalyzer(stats_config)
@@ -92,6 +103,4 @@ if __name__ == "__main__":
     flow_results = flow_processor.process_video(frame_manager=frame_manager, frame_indices=metadata[name]["frame_indices"])
     stats_results = stats_analyzer.analyze_video(flow_results['flow_dir'], flow_results['metadata'])
     
-    result = {"flow_results":flow_results, "stats_results":stats_results}
-    
-    rs.store(result, name=name)
+    # result = {"flow_results":flow_results, "stats_results":stats_results}

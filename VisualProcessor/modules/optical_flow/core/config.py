@@ -36,8 +36,8 @@ CAMERA_MOTION_CONFIG = {
 @dataclass
 class FlowStatisticsConfig:
     """Конфигурация для статистического анализа."""
-    grid_size: Tuple[int, int] = DEFAULT_GRID_SIZE
-    motion_thresholds: List[float] = DEFAULT_MOTION_THRESHOLDS
+    grid_size: List[int] = field(default_factory=tuple)
+    motion_thresholds: List[int] = field(default_factory=list)
     direction_bins: int = DIRECTION_BINS
     spatial_sample_rate: int = 10
     top_regions_count: int = 3

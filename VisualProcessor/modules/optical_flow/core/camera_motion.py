@@ -108,6 +108,7 @@ def decompose_affine(M: np.ndarray) -> Dict[str, float]:
     scale = math.sqrt(a * a + b * b)
     # rotation approximation: angle of the first column
     rotation = math.atan2(c, a)
+
     return dict(scale=scale, rotation=rotation, tx=float(tx), ty=float(ty))
 
 
@@ -155,74 +156,102 @@ def detect_zoom_from_affines(prev_affine: Optional[np.ndarray], cur_affine: Opti
         return 0.0
     return float(cur['scale'] - prev['scale'])
 
+def _safe_float(x):
+    """Convert to safe float, replacing NaN/inf with 0.0."""
+    try:
+        xf = float(x)
+        if math.isnan(xf) or math.isinf(xf):
+            return 0.0
+        return xf
+    except Exception:
+        return 0.0
 
-# --- single-frame camera features ---
+def _safe_dict(d: Dict[str, float]) -> Dict[str, float]:
+    """Convert all values in dict to safe floats."""
+    return {k: _safe_float(v) for k, v in d.items()}
+
 def compute_frame_motion_features(flow: np.ndarray,
                                   flow_prev: Optional[np.ndarray] = None,
                                   mag_bg_thresh: float = 0.5) -> Dict[str, float]:
     """
-    Compute a dictionary of camera-related features for a single frame (i.e. flow between frame_t and frame_t+skip).
-    Inputs:
-      flow: HxWx2 current flow
-      flow_prev: if provided, used to compute rotation_speed / accel
-    Returns:
-      dict with keys:
-        motion_mean, motion_std, motion_max, motion_energy, motion_entropy,
-        shake_var, shake_mean, shake_max,
-        affine_scale, affine_rotation, affine_tx, affine_ty,
-        background_ratio (fraction of background pixels)
+    Compute a dictionary of camera-related features for a single frame.
+    All outputs are guaranteed to be numeric and NaN-free.
     """
-    # basic motion stats
+
+    # ---------- BASICS ----------
     mag, ang = flow_magnitude_angle(flow)
     flat = mag.ravel()
-    motion_mean = float(np.mean(flat)) if flat.size else 0.0
-    motion_std = float(np.std(flat)) if flat.size else 0.0
-    motion_max = float(np.max(flat)) if flat.size else 0.0
-    motion_energy = float(np.sum(flat ** 2))
-    # entropy of directions
-    # bin angles into 36 bins
+
+    motion_mean = _safe_float(np.mean(flat)) if flat.size else 0.0
+    motion_std = _safe_float(np.std(flat)) if flat.size else 0.0
+    motion_max = _safe_float(np.max(flat)) if flat.size else 0.0
+    motion_energy = _safe_float(np.sum(flat ** 2))
+
+    # ---------- ENTROPY ----------
     try:
         hist, _ = np.histogram(ang.ravel(), bins=36, range=(-math.pi, math.pi))
         p = hist / (hist.sum() + 1e-9)
-        motion_entropy = float(-np.sum([x * math.log(x + 1e-12) for x in p if x > 0]))
+        motion_entropy = _safe_float(-np.sum([float(x) * math.log(float(x) + 1e-12)
+                                              for x in p if x > 0]))
     except Exception:
         motion_entropy = 0.0
 
-    # background mask
-    bg_mask = background_mask_by_magnitude(flow, mag_bg_thresh)
-    background_ratio = float(np.mean(bg_mask))
+    # ---------- BACKGROUND ----------
+    try:
+        bg_mask = background_mask_by_magnitude(flow, mag_bg_thresh)
+        background_ratio = _safe_float(np.mean(bg_mask))
+    except Exception:
+        bg_mask = None
+        background_ratio = 0.0
 
-    shakiness = compute_shakiness(flow, background_mask=bg_mask)
+    # ---------- SHAKINESS ----------
+    try:
+        shakiness = compute_shakiness(flow, background_mask=bg_mask)
+        shakiness = _safe_dict(shakiness)
+    except Exception:
+        shakiness = dict(shake_var=0.0, shake_mean=0.0, shake_max=0.0)
 
-    # affine
-    M = estimate_affine_from_flow(flow, mask=bg_mask)
-    affine = decompose_affine(M)
+    # ---------- AFFINE ----------
+    try:
+        M = estimate_affine_from_flow(flow, mask=bg_mask)
+        affine = _safe_dict(decompose_affine(M))
+    except Exception:
+        affine = dict(scale=1.0, rotation=0.0, tx=0.0, ty=0.0)
 
-    # rotation_speed (if prev provided)
+    # ---------- ROTATION SPEED ----------
     rotation_speed = 0.0
     if flow_prev is not None:
-        Mprev = estimate_affine_from_flow(flow_prev, mask=background_mask_by_magnitude(flow_prev, mag_bg_thresh))
-        prev_affine = decompose_affine(Mprev)
-        if not math.isnan(prev_affine['rotation']) and not math.isnan(affine['rotation']):
-            rotation_speed = float(affine['rotation'] - prev_affine['rotation'])
+        try:
+            Mprev = estimate_affine_from_flow(
+                flow_prev,
+                mask=background_mask_by_magnitude(flow_prev, mag_bg_thresh)
+            )
+            prev_affine = _safe_dict(decompose_affine(Mprev))
+            rotation_speed = _safe_float(affine["rotation"] - prev_affine["rotation"])
+        except Exception:
+            rotation_speed = 0.0
 
-    out = dict(
+    # ---------- OUTPUT ----------
+    return dict(
         motion_mean=motion_mean,
         motion_std=motion_std,
         motion_max=motion_max,
         motion_energy=motion_energy,
         motion_entropy=motion_entropy,
+
         shake_var=shakiness['shake_var'],
         shake_mean=shakiness['shake_mean'],
         shake_max=shakiness['shake_max'],
+
         affine_scale=affine['scale'],
         affine_rotation=affine['rotation'],
         affine_tx=affine['tx'],
         affine_ty=affine['ty'],
+
         background_ratio=background_ratio,
         rotation_speed=rotation_speed
     )
-    return out
+
 
 
 # --- aggregation over video ---

@@ -12,75 +12,6 @@ import warnings
 warnings.filterwarnings('ignore', category=RuntimeWarning)
 
 
-class FrameManager:
-
-    def __init__(self, frames_dir: str, chunk_size: int = 64, cache_size: int = 2):
-        self.frames_dir = Path(frames_dir)
-        meta_path = self.frames_dir / "metadata.json"
-        if not meta_path.exists():
-            raise FileNotFoundError(f"metadata.json not found in {self.frames_dir}")
-        meta = json.load(open(meta_path, "r", encoding="utf-8"))
-        self.total_frames = int(meta["total_frames"])
-        self.batch_size = int(meta.get("batch_size", chunk_size))
-        self.batches = meta["batches"]
-        # Добавлено: читаем размеры из meta
-        self.height = meta["height"]
-        self.width = meta["width"]
-        self.channels = meta["channels"]
-        self.fps = meta.get("fps", 30)
-        # create mapping of batch_index -> batch_info
-        self.batch_by_idx = {b["batch_index"]: b for b in self.batches}
-        self.cache = {}  # pid -> memmap ndarray
-        self.cache_order = []  # LRU list
-        self.cache_size = int(cache_size)
-
-    def _load_batch_pid(self, pid: int):
-        if pid in self.cache:
-            # move to MRU
-            try:
-                self.cache_order.remove(pid)
-            except ValueError:
-                pass
-            self.cache_order.append(pid)
-            return self.cache[pid]
-        batch = self.batch_by_idx.get(pid)
-        if batch is None:
-            raise IndexError(f"batch {pid} not found")
-        p = self.frames_dir / batch["path"]
-        # Добавлено: вычисляем реальный num_frames для батча (для частичных)
-        num_frames = batch["end_frame"] - batch["start_frame"] + 1
-        # Изменено: используем np.memmap вместо np.load (для raw файлов без заголовка)
-        arr = np.memmap(
-            str(p),
-            dtype=np.uint8,
-            mode="r",
-            shape=(num_frames, self.height, self.width, self.channels)
-        )
-        self.cache[pid] = arr
-        self.cache_order.append(pid)
-        # evict
-        while len(self.cache_order) > self.cache_size:
-            ev = self.cache_order.pop(0)
-            self.cache.pop(ev, None)
-        return arr
-
-    def get(self, idx: int) -> np.ndarray:
-        if idx < 0 or idx >= self.total_frames:
-            raise IndexError("Frame index out of bounds")
-        pid = idx // self.batch_size
-        local = idx - pid * self.batch_size
-        arr = self._load_batch_pid(pid)
-        if local >= arr.shape[0]:
-            # should not happen but guard
-            raise IndexError(f"Local index {local} >= chunk size {arr.shape[0]} (global {idx})")
-        return np.asarray(arr[local])
-
-    # Добавлено: метод для очистки кэша (вызовем после видео)
-    def close(self):
-        self.cache.clear()
-        self.cache_order.clear()
-
-
 class ColorLightProcessor:
     """Процессор для анализа цвета и освещения видео"""
     
@@ -433,7 +364,7 @@ class ColorLightProcessor:
         
         return features
     
-    def extract_frame_features(self, frame: np.ndarray, frame_idx: int, fps: float) -> Dict[str, Any]:
+    def extract_frame_features(self, frame: np.ndarray, frame_idx: int) -> Dict[str, Any]:
         """Извлекает все frame-level фичи для одного кадра"""
         # Убеждаемся, что frame в RGB формате и правильном типе
         if frame.dtype != np.uint8:
@@ -467,15 +398,12 @@ class ColorLightProcessor:
         # Направление света
         features.update(self._compute_light_direction(frame))
         
-        # Таймкод
-        timestamp = frame_idx / fps
-        
         return {
-            "timestamp": timestamp,
+            "frame_idx": frame_idx,
             "features": features
         }
     
-    def extract_scene_features(self, frame_features: List[Dict], scene_start: int, scene_end: int, fps: float) -> Dict[str, Any]:
+    def extract_scene_features(self, frame_features: List[Dict], scene_start: int, scene_end: int) -> Dict[str, Any]:
         """Извлекает scene-level фичи из списка frame features"""
         if not frame_features:
             return {}
@@ -484,9 +412,7 @@ class ColorLightProcessor:
         
         # Базовые метрики сцены
         num_frames = len(frame_features)
-        scene_duration = (scene_end - scene_start + 1) / fps
         scene_features['num_frames'] = num_frames
-        scene_features['duration'] = scene_duration
         
         # Извлекаем значения фич из всех кадров
         feature_arrays = {}
@@ -692,7 +618,7 @@ class ColorLightProcessor:
         
         # Агрегация всех сцен: mean/std/min/max по каждой фиче
         scene_feature_dict = {}
-        for scene_feat in all_scene_features:
+        for scene_feat in all_scene_features.values():
             for key, value in scene_feat.items():
                 if isinstance(value, (int, float)) and not isinstance(value, bool):
                     if key not in scene_feature_dict:
@@ -777,7 +703,7 @@ class ColorLightProcessor:
         
         # Scene sequence features [N_scenes, D_scene_features]
         scene_sequence = []
-        for scene_feat in scene_features:
+        for scene_feat in scene_features.values():
             feat_vec = []
             numeric_keys = sorted([k for k in scene_feat.keys() 
                                  if isinstance(scene_feat[k], (int, float)) and not isinstance(scene_feat[k], bool)])
@@ -796,29 +722,22 @@ class ColorLightProcessor:
         
         return sequences
     
-    def process(self, frame_manager: FrameManager, input_data: Dict[str, Any], 
-                video_id: Optional[str] = None) -> Dict[str, Any]:
+    def process(self, frame_manager, scenes) -> Dict[str, Any]:
         """
         Главный метод обработки видео
         
         Args:
             frame_manager: FrameManager для доступа к кадрам
-            input_data: Словарь с total_frames и scenes {scene_id: [start_frame, end_frame]}
-            video_id: Идентификатор видео (опционально)
         
         Returns:
             Словарь с результатами в формате из README
         """
-        total_frames = input_data.get('total_frames', frame_manager.total_frames)
-        scenes = input_data.get('scenes', {})
-        fps = frame_manager.fps
-        
         # Обработка кадров по сценам
-        all_frame_features = []
-        all_scene_features = []
+        all_frame_features = {}
+        all_scene_features = {}
         
-        for scene_id, frame_range in scenes.items():
-            start_frame, end_frame = frame_range[0], frame_range[1]
+        for scene_label, frame_range in scenes.items():
+            start_frame, end_frame = frame_range["indices"][0], frame_range["indices"][-1]
             
             # Ограничиваем количество кадров для оптимизации
             num_frames_in_scene = end_frame - start_frame + 1
@@ -830,24 +749,24 @@ class ColorLightProcessor:
                 frame_indices = np.linspace(start_frame, end_frame, num_samples, dtype=int)
                 # Убираем дубликаты и сортируем
                 frame_indices = np.unique(frame_indices)
+
+            all_frame_features[scene_label] = ()
             
             scene_frame_features = []
             for frame_idx in frame_indices:
                 try:
                     frame = frame_manager.get(frame_idx)
-                    frame_feat = self.extract_frame_features(frame, frame_idx, fps)
+                    frame_feat = self.extract_frame_features(frame, frame_idx)
                     scene_frame_features.append(frame_feat)
-                    all_frame_features.append(frame_feat)
+                    all_frame_features[scene_label][frame_idx] = frame_feat
                 except Exception as e:
                     print(f"Warning: Failed to process frame {frame_idx}: {e}")
                     continue
             
             # Scene-level фичи
             if scene_frame_features:
-                scene_feat = self.extract_scene_features(scene_frame_features, start_frame, end_frame, fps)
-                scene_feat['start'] = start_frame / fps
-                scene_feat['end'] = end_frame / fps
-                all_scene_features.append(scene_feat)
+                scene_feat = self.extract_scene_features(scene_frame_features, start_frame, end_frame)
+                all_scene_features[scene_label] = scene_feat
         
         # Video-level фичи
         video_features = self.extract_video_features(all_scene_features, all_frame_features)
@@ -857,7 +776,6 @@ class ColorLightProcessor:
         
         # Формируем результат
         result = {
-            "video_id": video_id or "unknown",
             "frames": all_frame_features,
             "scenes": all_scene_features,
             "video_features": video_features,
