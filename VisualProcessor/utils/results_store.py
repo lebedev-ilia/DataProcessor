@@ -29,6 +29,76 @@ class ResultsStore:
         uid = uuid.uuid4().hex[:8]
         return f"{timestamp}_{uid}.json"
 
+    def _to_json_serializable(self, obj: Any) -> Any:
+        """
+        Преобразует объект в JSON-совместимый формат.
+        Поддержка: numpy, datetime, uuid, списки, dict, NaN, Inf, кастомные объекты.
+        """
+        import math
+
+        # ---- None, str, bool, int ----
+        if obj is None or isinstance(obj, (str, bool, int)):
+            return obj
+
+        # ---- float + обработка NaN/Inf ----
+        if isinstance(obj, float):
+            if math.isnan(obj):
+                return None              # JSON-compatible
+            if math.isinf(obj):
+                return "inf" if obj > 0 else "-inf"
+            return obj
+
+        # ---- numpy ----
+        try:
+            import numpy as np
+
+            if isinstance(obj, (np.integer,)):
+                return int(obj)
+
+            if isinstance(obj, (np.floating,)):
+                f = float(obj)
+                if math.isnan(f):
+                    return None
+                if math.isinf(f):
+                    return "inf" if f > 0 else "-inf"
+                return f
+
+            if isinstance(obj, np.ndarray):
+                arr = obj.astype(object).tolist()  # сохраним структуру
+                return self._to_json_serializable(arr)
+        except ImportError:
+            pass
+
+        # ---- datetime ----
+        if isinstance(obj, (datetime.datetime, datetime.date)):
+            return obj.isoformat()
+
+        # ---- uuid ----
+        if isinstance(obj, uuid.UUID):
+            return str(obj)
+
+        # ---- списки / tuples ----
+        if isinstance(obj, (list, tuple)):
+            return [self._to_json_serializable(x) for x in obj]
+
+        # ---- dict ----
+        if isinstance(obj, dict):
+            return {str(k): self._to_json_serializable(v) for k, v in obj.items()}
+
+        # ---- объекты с __dict__ ----
+        if hasattr(obj, "__dict__"):
+            return {k: self._to_json_serializable(v) for k, v in obj.__dict__.items()}
+
+        # ---- объекты с tolist() ----
+        if hasattr(obj, "tolist"):
+            try:
+                return self._to_json_serializable(obj.tolist())
+            except Exception:
+                pass
+
+        # ---- fallback ----
+        return repr(obj)
+
     def store(self, result: Any, name: str) -> str:
         """Сохраняет результат в формате JSON и возвращает путь к файлу."""
         directory = self._build_dir(name)
@@ -36,7 +106,7 @@ class ResultsStore:
         filepath = os.path.join(directory, filename)
 
         with open(filepath, "w", encoding="utf-8") as f:
-            json.dump(result, f, indent=2, ensure_ascii=False)
+            json.dump(self._to_json_serializable(result), f, indent=2, ensure_ascii=False)
 
         return filepath
 

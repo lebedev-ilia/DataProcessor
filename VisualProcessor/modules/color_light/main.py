@@ -48,11 +48,12 @@ def main():
     parser.add_argument('--frames-dir', type=str, default=None, help='Директория с уже извлеченными кадрами (если не указана, кадры будут извлечены автоматически)')
 
     parser.add_argument('--max-frames-per-scene', type=int, default=350, help='Максимальное количество кадров для обработки на сцену')
+    parser.add_argument('--stride', type=int, default=5, help='')
 
     args = parser.parse_args()
         
     # Инициализируем процессор
-    processor = ColorLightProcessor(max_frames_per_scene=args.max_frames_per_scene)
+    processor = ColorLightProcessor(max_frames_per_scene=args.max_frames_per_scene, stride=args.stride)
 
     metadata = load_json(f"{args.frames_dir}/metadata.json")
 
@@ -69,7 +70,7 @@ def main():
     # Конвертируем numpy типы в JSON-совместимые
     result_json = _convert_to_json(result)
 
-    rs.store(result_json, nema=name)
+    rs.store(result_json, name=name)
     
     print(f"\n[SUCCESS] Анализ завершен успешно!")
     print(f"  - Обработано кадров: {len(result['frames'])}")

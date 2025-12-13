@@ -1,0 +1,9 @@
+
+ftfy
+regex 
+tqdm
+
+# clip        git+https://github.com/openai/CLIP.git
+# dncnn       https://github.com/cszn/DnCNN.git
+# cbdnet      https://github.com/IDKiro/CBDNet-pytorch.git
+# веса cbdnet https://drive.google.com/drive/folders/1-e2nPCr_eP1cTDhFFes27Rjj-QXzMk5u

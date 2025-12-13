@@ -24,6 +24,8 @@ build/
 .optical_flow_venv/
 .action_recognition_venv/
 .color_light_venv/
+.frames_composition_venv/
+.shot_quality_venv/
 venv/
 env/
 ENV/

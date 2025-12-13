@@ -393,7 +393,12 @@ if __name__ == "__main__":
         {"name": "behavioral", "modality": "video", "frame_step": 5},
         {"name": "optical_flow", "modality": "video", "frame_step": 5},
         {"name": "action_recognition", "modality": "video", "frame_step": 5},
-        {"name": "color_light", "modality": "video", "frame_step": 5},
+        {"name": "frames_composition", "modality": "video", "frame_step": 5},
+        {"name": "shot_quality", "modality": "video", "frame_step": 5},
+        # {"name": "", "modality": "video", "frame_step": 5},
+        # {"name": "", "modality": "video", "frame_step": 5},
+        # {"name": "", "modality": "video", "frame_step": 5},
+        # {"name": "", "modality": "video", "frame_step": 5},
     ]
 
     seg.run(args.video_path, extractor_configs)

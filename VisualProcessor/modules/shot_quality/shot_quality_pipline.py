@@ -4,7 +4,7 @@ import clip
 import numpy as np
 from PIL import Image
 from scipy.stats import entropy
-from typing import List, Dict, Optional
+from typing import Dict
 try:
     from aesthetic_predictor import AestheticPredictor
 except ImportError:
@@ -20,25 +20,133 @@ except ImportError:
             # Combine brightness and contrast for aesthetic score
             return float(0.5 + 0.3 * brightness + 0.2 * contrast)
 
+import warnings
+warnings.filterwarnings("ignore", category=UserWarning)
+warnings.filterwarnings(
+    "ignore",
+    category=torch.serialization.SourceChangeWarning
+)
+
+name = "ShotQualityZeroShot"
+
+import os
+import sys
+_path = os.path.dirname(os.path.dirname(os.path.dirname(__file__)))
+
+if _path not in sys.path:
+    sys.path.append(_path)
+
+from utils.logger import get_logger
+logger = get_logger(name)
+
 # -----------------------------
 # DNN MODELS: DnCNN, CBDNet, MiDaS
 # -----------------------------
 
 def load_midas(device="cuda"):
-    midas = torch.hub.load("intel-isl/MiDaS", "DPT_Large").to(device)
-    midas.eval()
-    transform = torch.hub.load("intel-isl/MiDaS", "transforms").dpt_transform
-    return midas, transform
+    import torch
 
-def load_dncnn(device="cuda"):
-    dncnn = torch.hub.load("cszn/DnCNN", "DnCNN").to(device)
-    dncnn.eval()
-    return dncnn
+    model = torch.hub.load(
+        "intel-isl/MiDaS",
+        "MiDaS_small",
+        pretrained=True,
+        trust_repo=True,
+        verbose=False
+    ).to(device).eval()
+
+    transforms = torch.hub.load(
+        "intel-isl/MiDaS",
+        "transforms",
+        trust_repo=True,
+        verbose=False
+    )
+
+    _midas = {
+        "model": model,
+        "transform": transforms.small_transform
+    }
+
+    return _midas["model"], _midas["transform"]
+
+def load_dncnn(device: str = "cuda") -> torch.nn.Module:
+    """
+    Загружает модель DnCNN с предобученными весами.
+    
+    Поддерживает:
+    - DataParallel (удаляет префикс 'module.')
+    - Цветные RGB изображения
+    - Корректное размещение на cpu/cuda
+
+    Возвращает:
+        torch.nn.Module: модель DnCNN в eval режиме
+    """
+    base_dir = os.path.dirname(os.path.abspath(__file__))
+    repo_dir = os.path.join(base_dir, "models", "DnCNN")
+
+    if repo_dir not in sys.path:
+        sys.path.insert(0, repo_dir)
+
+    try:
+        from TrainingCodes.dncnn_pytorch.main_test import DnCNN
+    except ImportError as e:
+        raise ImportError(f"Не удалось импортировать класс DnCNN: {e}")
+
+    sys.modules['__main__'].DnCNN = DnCNN
+
+    weights_path = os.path.join(repo_dir, "TrainingCodes/dncnn_pytorch/models/DnCNN_sigma25/model.pth")
+
+    with torch.serialization.safe_globals([DnCNN]):
+        model = torch.load(weights_path, map_location=device, weights_only=False)
+
+    model.to(device)
+    model.eval()
+
+    return model
 
 def load_cbdnet(device="cuda"):
-    cbd = torch.hub.load("yzhou359/CBANet", "CBDNet").to(device)
-    cbd.eval()
-    return cbd
+    import os
+    import sys
+    import subprocess
+    import torch
+    import torch.nn as nn
+
+    base_dir = os.path.dirname(os.path.abspath(__file__))
+    models_dir = os.path.join(base_dir, "models")
+    repo_dir = os.path.join(models_dir, "CBDNet_pytorch")
+
+    os.makedirs(models_dir, exist_ok=True)
+
+    # Клонируем репозиторий
+    if not os.path.exists(repo_dir):
+        subprocess.run(
+            ["git", "clone", "https://github.com/IDKiro/CBDNet-pytorch.git", repo_dir],
+            check=True
+        )
+
+    # Добавляем в PYTHONPATH
+    if repo_dir not in sys.path:
+        sys.path.insert(0, repo_dir)
+
+    checkpoint_path = os.path.join(models_dir, "checkpoint.pth.tar")
+    if not os.path.exists(checkpoint_path):
+        raise RuntimeError("CBDNet: checkpoint.pth.tar не найден")
+
+    from model.cbdnet import Network # type: ignore
+
+    model = Network()
+    model.to(device)
+    model = nn.DataParallel(model)
+
+    model.eval()
+
+    ckpt = torch.load(checkpoint_path, map_location=device)
+    if isinstance(ckpt, dict) and "state_dict" in ckpt:
+        model.load_state_dict(ckpt["state_dict"])
+    else:
+        model.load_state_dict(ckpt)
+
+    return model
+
 
 # ---------------------------------------------------------------
 # SHARPNESS METRICS
@@ -105,20 +213,62 @@ def spatial_frequency_mean(frame):
 # NOISE METRICS (DnCNN, CBDNet)
 # ---------------------------------------------------------------
 
-def noise_estimation_dncnn(dncnn, frame_rgb, device="cuda"):
-    img = frame_rgb.astype(np.float32) / 255.0
-    tensor = torch.from_numpy(img).permute(2, 0, 1).unsqueeze(0).to(device)
+def noise_estimation_dncnn(
+    dncnn: torch.nn.Module,
+    frame_rgb: np.ndarray,
+    device: str = "cuda"
+) -> float:
+    """
+    Оценка уровня шума через DnCNN (grayscale).
+    """
+
+    # RGB → Gray (perceptual)
+    if frame_rgb.ndim == 3:
+        gray = (
+            0.299 * frame_rgb[..., 0] +
+            0.587 * frame_rgb[..., 1] +
+            0.114 * frame_rgb[..., 2]
+        )
+    else:
+        gray = frame_rgb
+
+    gray = gray.astype(np.float32) / 255.0
+
+    tensor = (
+        torch.from_numpy(gray)
+        .unsqueeze(0)
+        .unsqueeze(0)
+        .to(device)
+    )
+
     with torch.no_grad():
         denoised = dncnn(tensor)
-    noise = torch.abs(denoised - tensor).mean().item()
-    return noise
+        noise_map = torch.abs(denoised - tensor)
+        noise_level = float(noise_map.mean().item())
+
+    return noise_level
 
 def noise_estimation_cbdnet(cbdnet, frame_rgb, device="cuda"):
+    import torch
+    import numpy as np
+
+    # [H, W, C] → [1, C, H, W]
     img = frame_rgb.astype(np.float32) / 255.0
     tensor = torch.from_numpy(img).permute(2, 0, 1).unsqueeze(0).to(device)
+
     with torch.no_grad():
-        pred, _ = cbdnet(tensor)
-    return float(pred.mean().item())
+        noise_map, _ = cbdnet(tensor)
+
+    # Noise statistics
+    noise_mean = noise_map.mean().item()
+    noise_std = noise_map.std().item()
+    noise_energy = (noise_map ** 2).mean().item()
+
+    return {
+        "noise_mean": float(noise_mean),
+        "noise_std": float(noise_std),
+        "noise_energy": float(noise_energy)
+    }
 
 def noise_level_luma(gray):
     """Уровень шума в яркостном канале"""
@@ -589,10 +739,26 @@ class ShotQualityPipeline:
     def __init__(self, device="cuda"):
         self.device = device
 
-        self.midas, self.midas_tf = load_midas(device)
-        self.dncnn = load_dncnn(device)
-        self.cbdnet = load_cbdnet(device)
-        self.classifier = ShotQualityZeroShot(device)
+        try:
+            self.midas, self.midas_tf = load_midas(device)
+            logger.info("Загружена модель midas")
+        except Exception as e:
+            logger.error(f"Ошибка загрузки midas : {e}")
+        try:
+            self.dncnn = load_dncnn(device)
+            logger.info("Загружена модель dncnn")
+        except Exception as e:
+            logger.error(f"Ошибка загрузки dncnn : {e}")
+        try:
+            self.cbdnet = load_cbdnet(device)
+            logger.info("Загружена модель cbdnet")
+        except Exception as e:
+            logger.error(f"Ошибка загрузки cbdnet : {e}")
+        try:
+            self.classifier = ShotQualityZeroShot(device)
+            logger.info("Загружена модель ShotQualityZeroShot")
+        except Exception as e:
+            logger.error(f"Ошибка загрузки ShotQualityZeroShot : {e}")
 
         self.prev_gray = None
         self.prev_frame = None
@@ -618,8 +784,8 @@ class ShotQualityPipeline:
         spatial_freq = spatial_frequency_mean(frame)
 
         # Noise
-        noise_dn = noise_estimation_dncnn(self.dncnn, frame_rgb, self.device)
-        noise_cbd = noise_estimation_cbdnet(self.cbdnet, frame_rgb, self.device)
+        noise_level = noise_estimation_dncnn(self.dncnn, frame_rgb, self.device)
+        noise_cbdnet_stats = noise_estimation_cbdnet(self.cbdnet, frame_rgb, self.device)
         noise_luma = noise_level_luma(gray)
         noise_chroma = noise_level_chroma(frame)
         iso_est = iso_estimated_value(frame)
@@ -690,8 +856,8 @@ class ShotQualityPipeline:
             "spatial_frequency_mean": spatial_freq,
 
             # Noise
-            "noise_dncnn": noise_dn,
-            "noise_cbdnet": noise_cbd,
+            "noise_level": noise_level,
+            "noise_cbdnet_stats": noise_cbdnet_stats,
             "noise_level_luma": noise_luma,
             "noise_level_chroma": noise_chroma,
             "iso_estimated_value": iso_est,
@@ -743,76 +909,87 @@ class ShotQualityPipeline:
             **qc
         }
 
-    def process(self, frames: List[np.ndarray], frame_skip: int = 1) -> Dict:
-        """
-        Обрабатывает последовательность кадров и возвращает агрегированные метрики.
-        
-        Args:
-            frames: Список кадров (BGR или RGB)
-            frame_skip: Обрабатывать каждый N-й кадр
-            
-        Returns:
-            Словарь с frame-level и video-level метриками
-        """
-        frame_results = []
-        
-        # Обрабатываем кадры
-        for i, frame in enumerate(frames[::frame_skip]):
-            if len(frame.shape) == 3 and frame.shape[2] == 3:
-                # Предполагаем RGB, конвертируем в BGR для OpenCV
-                frame_bgr = cv2.cvtColor(frame, cv2.COLOR_RGB2BGR) if frame.dtype == np.uint8 else frame
+    def process(self, frame_manager, frame_indices) -> Dict:
+        frame_results: Dict[int, Dict] = {}
+
+        # --- Frame-level обработка ---
+        for i, idx in enumerate(frame_indices):
+            frame = frame_manager.get(idx)
+
+            if frame.ndim == 3 and frame.shape[2] == 3:
+                frame_bgr = (
+                    cv2.cvtColor(frame, cv2.COLOR_RGB2BGR)
+                    if frame.dtype == np.uint8
+                    else frame
+                )
             else:
                 frame_bgr = frame
-            
+
             result = self.process_frame(frame_bgr)
-            frame_results.append(result)
-        
-        # Агрегируем frame-level метрики
-        frame_features = {}
+            frame_results[idx] = result
+
+            logger.info(f"Обработано кадров: {i + 1}/{len(frame_indices)}")
+
+        # --- Агрегация frame-level метрик ---
+        frame_features: Dict[str, float] = {}
+
         numeric_keys = set()
-        
-        # Собираем все числовые ключи
-        for result in frame_results:
-            for key, value in result.items():
-                if isinstance(value, (int, float, np.number)) and not isinstance(value, bool):
-                    numeric_keys.add(key)
-        
-        # Вычисляем статистики для числовых метрик
+        for result in frame_results.values():
+            for k, v in result.items():
+                if isinstance(v, (int, float, np.number)) and not isinstance(v, bool):
+                    numeric_keys.add(k)
+
         for key in numeric_keys:
-            values = [r.get(key, 0) for r in frame_results if key in r and isinstance(r[key], (int, float, np.number))]
-            if values:
-                frame_features[f"avg_{key}"] = float(np.mean(values))
-                frame_features[f"std_{key}"] = float(np.std(values))
-                frame_features[f"min_{key}"] = float(np.min(values))
-                frame_features[f"max_{key}"] = float(np.max(values))
-        
-        # Temporal метрики
-        temporal_features = {}
+            values = [
+                float(r[key])
+                for r in frame_results.values()
+                if key in r and isinstance(r[key], (int, float, np.number))
+            ]
+
+            if not values:
+                continue
+
+            values_np = np.array(values, dtype=np.float32)
+
+            frame_features[f"avg_{key}"] = float(values_np.mean())
+            frame_features[f"std_{key}"] = float(values_np.std())
+            frame_features[f"min_{key}"] = float(values_np.min())
+            frame_features[f"max_{key}"] = float(values_np.max())
+
+        # --- Temporal метрики ---
+        temporal_features: Dict[str, float] = {}
+
+        def stability(x):
+            x = np.array(x, dtype=np.float32)
+            return float(1.0 - np.std(x) / (np.mean(x) + 1e-8))
+
         if len(self.frame_history["sharpness"]) > 1:
-            sharpness_values = self.frame_history["sharpness"]
-            temporal_features["temporal_sharpness_stability"] = float(1.0 - np.std(sharpness_values) / (np.mean(sharpness_values) + 1e-10))
-        
+            temporal_features["temporal_sharpness_stability"] = stability(
+                self.frame_history["sharpness"]
+            )
+
         if len(self.frame_history["exposure"]) > 1:
-            exposure_values = self.frame_history["exposure"]
-            temporal_features["temporal_exposure_stability"] = float(1.0 - np.std(exposure_values) / (np.mean(exposure_values) + 1e-10))
-        
+            temporal_features["temporal_exposure_stability"] = stability(
+                self.frame_history["exposure"]
+            )
+            temporal_features["exposure_consistency_over_time"] = float(
+                np.clip(1.0 - np.std(self.frame_history["exposure"]), 0.0, 1.0)
+            )
+
         if len(self.frame_history["noise"]) > 1:
-            noise_values = self.frame_history["noise"]
-            temporal_features["temporal_noise_variation"] = float(np.std(noise_values) / (np.mean(noise_values) + 1e-10))
-        
-        # Exposure consistency over time
-        if len(self.frame_history["exposure"]) > 1:
-            exposure_consistency = 1.0 - np.std(self.frame_history["exposure"])
-            temporal_features["exposure_consistency_over_time"] = float(np.clip(exposure_consistency, 0, 1))
-        
-        # Очищаем историю для следующего видео
+            noise = np.array(self.frame_history["noise"], dtype=np.float32)
+            temporal_features["temporal_noise_variation"] = float(
+                np.std(noise) / (np.mean(noise) + 1e-8)
+            )
+
+        # --- Reset ---
         self.frame_history = {"sharpness": [], "exposure": [], "noise": []}
         self.prev_gray = None
         self.prev_frame = None
-        
+
         return {
             "frames": frame_results,
             "frame_features": frame_features,
             "temporal_features": temporal_features,
-            "total_frames_processed": len(frame_results)
+            "total_frames_processed": len(frame_results),
         }

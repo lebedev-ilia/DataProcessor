@@ -1,4 +1,11 @@
-import json
+import os, sys
+
+_path = os.path.dirname(os.path.dirname(os.path.dirname(__file__)))
+
+if _path not in sys.path:
+    sys.path.append(_path)
+
+import math
 import numpy as np
 import cv2
 from pathlib import Path
@@ -6,21 +13,27 @@ from typing import Dict, List, Tuple, Optional, Any
 from scipy import stats
 from scipy.stats import entropy
 from scipy.signal import find_peaks
+from scipy.ndimage import gaussian_filter, label
 from sklearn.cluster import KMeans
 from collections import Counter
 import warnings
 warnings.filterwarnings('ignore', category=RuntimeWarning)
 
+name = "ColorLightProcessor"
+
+from utils.logger import get_logger
+logger = get_logger(name)
 
 class ColorLightProcessor:
     """Процессор для анализа цвета и освещения видео"""
     
-    def __init__(self, max_frames_per_scene: int = 350):
+    def __init__(self, max_frames_per_scene: int = 350, stride=5):
         """
         Args:
             max_frames_per_scene: Максимальное количество кадров для обработки на сцену
         """
         self.max_frames_per_scene = max_frames_per_scene
+        self.stride = stride
     
     def _compute_rgb_stats(self, frame: np.ndarray) -> Dict[str, float]:
         """Вычисляет RGB статистики: mean/std/min/max/skew/kurt для каждого канала"""
@@ -211,159 +224,274 @@ class ColorLightProcessor:
         
         return features
     
-    def _compute_lighting_features(self, frame: np.ndarray) -> Dict[str, float]:
-        """Вычисляет фичи освещения: brightness, contrast, overexposed/underexposed pixels"""
-        features = {}
-        
-        # Яркость (grayscale)
-        gray = cv2.cvtColor(frame, cv2.COLOR_RGB2GRAY).flatten()
-        features['brightness_mean'] = float(np.mean(gray))
-        features['brightness_std'] = float(np.std(gray))
-        
-        # Энтропия яркости
-        hist, _ = np.histogram(gray, bins=256, range=(0, 256))
-        probs = hist / (hist.sum() + 1e-10)
-        features['brightness_entropy'] = float(entropy(probs + 1e-10))
-        
-        # Переэкспонированные/недоэкспонированные пиксели
-        overexposed = np.sum(gray > 250)
-        underexposed = np.sum(gray < 5)
-        total_pixels = len(gray)
-        features['overexposed_pixels'] = float(overexposed / total_pixels)
-        features['underexposed_pixels'] = float(underexposed / total_pixels)
-        
-        # Global contrast (RMS contrast)
-        features['global_contrast'] = float(np.std(gray))
-        
-        # Local contrast (среднее стандартное отклонение в окнах)
-        h, w = gray.shape
-        window_size = min(8, min(h, w) // 4)
-        if window_size > 1:
-            local_stds = []
-            for i in range(0, h - window_size, window_size):
-                for j in range(0, w - window_size, window_size):
-                    window = gray[i:i+window_size, j:j+window_size]
-                    local_stds.append(np.std(window))
-            features['local_contrast'] = float(np.mean(local_stds)) if local_stds else 0.0
-            features['local_contrast_std'] = float(np.std(local_stds)) if local_stds else 0.0
-        else:
-            features['local_contrast'] = features['global_contrast']
-            features['local_contrast_std'] = 0.0
-        
-        # Contrast entropy
-        contrast_hist, _ = np.histogram(gray, bins=64, range=(0, 256))
-        contrast_probs = contrast_hist / (contrast_hist.sum() + 1e-10)
-        features['contrast_entropy'] = float(entropy(contrast_probs + 1e-10))
-        
-        # Dynamic Range (HDR score) - улучшенная версия
-        # Используем log-scale luminance для более точной оценки
-        gray_float = gray.astype(np.float32)
-        # Избегаем log(0)
-        log_luminance = np.log1p(gray_float)  # log(1+x) для стабильности
-        features['dynamic_range_db'] = float(np.max(log_luminance) - np.min(log_luminance))
-        
-        # Highlight clipping ratio (пиксели близкие к максимальной яркости)
-        highlight_threshold = 250
-        highlight_clipped = np.sum(gray >= highlight_threshold)
-        features['highlight_clipping_ratio'] = float(highlight_clipped / total_pixels)
-        
-        # Shadow clipping ratio (пиксели близкие к минимальной яркости)
-        shadow_threshold = 5
-        shadow_clipped = np.sum(gray <= shadow_threshold)
-        features['shadow_clipping_ratio'] = float(shadow_clipped / total_pixels)
-        
-        # Lighting Uniformity features
-        uniformity_features = self._compute_lighting_uniformity(gray)
-        features.update(uniformity_features)
-        
-        return features
-    
+    def _safe_entropy_from_hist(self, hist: np.ndarray, eps: float = 1e-12) -> float:
+        probs = hist.astype(np.float64)
+        s = probs.sum()
+        if s <= 0:
+            return 0.0
+        probs = probs / (s + eps)
+        probs = probs + eps
+        return float(-np.sum(probs * np.log(probs)))
+
     def _compute_lighting_uniformity(self, gray: np.ndarray) -> Dict[str, float]:
-        """Вычисляет фичи равномерности освещения: uniformity_index, center/corner brightness, vignetting"""
-        features = {}
-        h, w = gray.shape
-        
-        # Разделяем кадр на сетку (3x3 для анализа распределения яркости)
+        """
+        Вычисляет фичи равномерности освещения: uniformity_index, center/corner brightness, vignetting.
+        Вход: gray — 2D np.ndarray (H, W), dtype=uint8 or numeric.
+        Возвращает dict со значениями float.
+        """
+        features: Dict[str, float] = {}
+
+        if gray.ndim != 2:
+            raise ValueError("_compute_lighting_uniformity expects 2D gray image")
+
+        # cast to float for stable stats
+        grayf = np.asarray(gray, dtype=np.float32)
+        h, w = grayf.shape
+        if h == 0 or w == 0:
+            # degenerate
+            return {
+                "lighting_uniformity_index": 0.0,
+                "center_brightness": 0.0,
+                "corner_brightness": 0.0,
+                "vignetting_score": 0.0,
+            }
+
+        # grid 3x3
         grid_h, grid_w = 3, 3
-        cell_h, cell_w = h // grid_h, w // grid_w
-        
+        cell_h = max(1, h // grid_h)
+        cell_w = max(1, w // grid_w)
+
         brightness_grid = []
         for i in range(grid_h):
             for j in range(grid_w):
                 y_start = i * cell_h
-                y_end = (i + 1) * cell_h if i < grid_h - 1 else h
                 x_start = j * cell_w
-                x_end = (j + 1) * cell_w if j < grid_w - 1 else w
-                cell = gray[y_start:y_end, x_start:x_end]
-                brightness_grid.append(np.mean(cell))
-        
-        brightness_grid = np.array(brightness_grid)
-        
-        # Lighting uniformity index (чем меньше вариация, тем равномернее)
-        uniformity_std = np.std(brightness_grid)
-        uniformity_mean = np.mean(brightness_grid)
-        features['lighting_uniformity_index'] = float(1.0 - min(uniformity_std / (uniformity_mean + 1e-10), 1.0))
-        
-        # Center brightness (центральная ячейка сетки)
-        center_idx = grid_h * grid_w // 2  # средняя ячейка
-        features['center_brightness'] = float(brightness_grid[center_idx])
-        
-        # Corner brightness (среднее по угловым ячейкам)
+                # include remainder in last cell
+                if i == grid_h - 1:
+                    y_end = h
+                else:
+                    y_end = y_start + cell_h
+                if j == grid_w - 1:
+                    x_end = w
+                else:
+                    x_end = x_start + cell_w
+
+                cell = grayf[y_start:y_end, x_start:x_end]
+                if cell.size == 0:
+                    brightness_grid.append(0.0)
+                else:
+                    brightness_grid.append(float(np.mean(cell)))
+
+        brightness_grid = np.array(brightness_grid, dtype=np.float32)
+        uniformity_std = float(np.std(brightness_grid))
+        uniformity_mean = float(np.mean(brightness_grid))
+
+        # normalized std: divide by (mean + eps) to be scale invariant
+        eps = 1e-6
+        norm_std = uniformity_std / (uniformity_mean + eps)
+
+        # uniformity index in (0,1], higher = more uniform
+        features["lighting_uniformity_index"] = float(1.0 / (1.0 + norm_std))
+
+        # center brightness (central cell)
+        center_idx = (grid_h * grid_w) // 2
+        features["center_brightness"] = float(brightness_grid[center_idx])
+
+        # corner brightness (average of 4 corners)
         corner_indices = [0, grid_w - 1, (grid_h - 1) * grid_w, grid_h * grid_w - 1]
-        corner_brightness = np.mean([brightness_grid[idx] for idx in corner_indices if idx < len(brightness_grid)])
-        features['corner_brightness'] = float(corner_brightness)
-        
-        # Vignetting score (затемнение по краям) - чем больше разница центр/углы, тем сильнее виньетирование
-        if features['center_brightness'] > 0:
-            vignetting_ratio = features['corner_brightness'] / (features['center_brightness'] + 1e-10)
-            features['vignetting_score'] = float(1.0 - min(vignetting_ratio, 1.0))  # 0 = нет виньетирования, 1 = сильное
+        corner_vals = [brightness_grid[idx] for idx in corner_indices if idx < len(brightness_grid)]
+        features["corner_brightness"] = float(np.mean(corner_vals)) if corner_vals else 0.0
+
+        # vignetting score: 0 no vignetting, 1 strong (clamped)
+        # compute ratio corner/center (safe), invert to have 0..1
+        if features["center_brightness"] > 0:
+            ratio = features["corner_brightness"] / (features["center_brightness"] + eps)
+            # if corners brighter than center ratio>1 -> vignetting negative (we clamp to 0)
+            v = 1.0 - min(max(ratio, 0.0), 1.0)
+            features["vignetting_score"] = float(max(0.0, min(v, 1.0)))
         else:
-            features['vignetting_score'] = 0.0
-        
+            features["vignetting_score"] = 0.0
+
         return features
-    
-    def _compute_light_direction(self, frame: np.ndarray) -> Dict[str, float]:
-        """Оценивает направление света: angle, source count, soft/hard probability"""
-        features = {}
-        
-        gray = cv2.cvtColor(frame, cv2.COLOR_RGB2GRAY).astype(np.float32)
+
+
+    def _compute_lighting_features(self, frame: np.ndarray) -> Dict[str, float]:
+        """
+        Вычисляет фичи освещения: brightness, contrast, entropy, clipping ratios, dynamic range (dB),
+        highlight/shadow clipping, local contrast, uniformity (via helper).
+        Вход: frame — HxWx3 RGB (uint8) или совместимый numeric array.
+        """
+        features: Dict[str, float] = {}
+
+        if frame is None:
+            # return zeros for robustness
+            zero_keys = [
+                "brightness_mean", "brightness_std", "brightness_entropy",
+                "overexposed_pixels", "underexposed_pixels", "global_contrast",
+                "local_contrast", "local_contrast_std", "contrast_entropy",
+                "dynamic_range_db", "highlight_clipping_ratio", "shadow_clipping_ratio"
+            ]
+            return {k: 0.0 for k in zero_keys}
+
+        # ensure numpy array and RGB uint8
+        im = np.asarray(frame)
+        if im.ndim == 3 and im.shape[-1] == 4:
+            im = im[..., :3]
+        if im.ndim != 3 or im.shape[-1] != 3:
+            # if grayscale 2D, expand
+            if im.ndim == 2:
+                im = np.stack([im, im, im], axis=-1)
+            else:
+                raise ValueError(f"_compute_lighting_features: unexpected frame shape {im.shape}")
+
+        # ensure ordering is RGB for cv2.cvtColor conversion to gray; if your frames are BGR, change accordingly
+        # Here we assume incoming frames are RGB (consistent with your pipeline earlier).
+        rgb = im.astype(np.uint8)
+        gray = cv2.cvtColor(rgb, cv2.COLOR_RGB2GRAY)  # 2D uint8
+
+        # Basic brightness stats
+        gray_f = gray.astype(np.float32)
+        total_pixels = gray_f.size
+        eps = 1e-10
+
+        features["brightness_mean"] = float(np.mean(gray_f))
+        features["brightness_std"] = float(np.std(gray_f))
+        features["global_contrast"] = float(np.std(gray_f))  # RMS contrast = std
+
+        # Brightness entropy (histogram over 256 bins)
+        hist, _ = np.histogram(gray, bins=256, range=(0, 256))
+        features["brightness_entropy"] = self._safe_entropy_from_hist(hist)
+
+        # Over/under exposed ratios (fractions)
+        overexposed = int(np.sum(gray >= 250))
+        underexposed = int(np.sum(gray <= 5))
+        features["overexposed_pixels"] = float(overexposed / (total_pixels + eps))
+        features["underexposed_pixels"] = float(underexposed / (total_pixels + eps))
+
+        # Highlight & shadow clipping (same as above but slightly different thresholds)
+        highlight_threshold = 250
+        shadow_threshold = 5
+        highlight_clipped = int(np.sum(gray >= highlight_threshold))
+        shadow_clipped = int(np.sum(gray <= shadow_threshold))
+        features["highlight_clipping_ratio"] = float(highlight_clipped / (total_pixels + eps))
+        features["shadow_clipping_ratio"] = float(shadow_clipped / (total_pixels + eps))
+
+        # Contrast entropy (coarser histogram)
+        contrast_hist, _ = np.histogram(gray, bins=64, range=(0, 256))
+        features["contrast_entropy"] = self._safe_entropy_from_hist(contrast_hist)
+
+        # Dynamic range: use max/min luminance and convert to decibels (20*log10)
+        # Protect against zero; add tiny eps
+        max_lum = float(np.max(gray_f))
+        min_lum = float(np.min(gray_f))
+        if min_lum <= 0:
+            min_lum = 1e-3
+        # ratio in linear domain
+        dr_ratio = max_lum / (min_lum + eps)
+        # convert to decibels (20*log10 for amplitude-like measure)
+        dynamic_range_db = 20.0 * math.log10(dr_ratio + eps)
+        features["dynamic_range_db"] = float(max(0.0, dynamic_range_db))
+
+        # Local contrast: sliding non-overlapping windows (window_size adaptive)
         h, w = gray.shape
-        
-        # Вычисляем градиенты для оценки направления света
-        grad_x = cv2.Sobel(gray, cv2.CV_64F, 1, 0, ksize=3)
-        grad_y = cv2.Sobel(gray, cv2.CV_64F, 0, 1, ksize=3)
-        
-        # Угол направления света (основное направление градиента)
-        angles = np.arctan2(grad_y, grad_x)
-        # Усредняем по модулю градиента
-        magnitudes = np.sqrt(grad_x**2 + grad_y**2)
-        weighted_angle = np.average(angles, weights=magnitudes.flatten() + 1e-10)
-        features['light_direction_angle'] = float(np.degrees(weighted_angle))
-        
-        # Оценка количества источников света (по пикам яркости)
-        blurred = cv2.GaussianBlur(gray, (15, 15), 0)
-        peaks, _ = find_peaks(blurred.flatten(), height=np.percentile(blurred, 90), distance=w//10)
-        features['light_source_count_estimate'] = float(min(len(peaks), 5))
-        
-        # Soft vs hard light (по резкости переходов)
-        laplacian_var = cv2.Laplacian(gray, cv2.CV_64F).var()
-        # Нормализуем (эмпирические значения)
-        soft_threshold = 100
-        hard_threshold = 500
-        if laplacian_var < soft_threshold:
-            features['soft_light_probability'] = 1.0
-            features['hard_light_probability'] = 0.0
-        elif laplacian_var > hard_threshold:
-            features['soft_light_probability'] = 0.0
-            features['hard_light_probability'] = 1.0
+        # choose window size proportional to smaller dimension but not too large
+        window_size = max(4, min(32, min(h, w) // 8))  # sensible defaults
+        local_stds = []
+        for i in range(0, h, window_size):
+            for j in range(0, w, window_size):
+                window = gray_f[i : min(i + window_size, h), j : min(j + window_size, w)]
+                if window.size:
+                    local_stds.append(float(np.std(window)))
+        if local_stds:
+            features["local_contrast"] = float(np.mean(local_stds))
+            features["local_contrast_std"] = float(np.std(local_stds))
         else:
-            # Линейная интерполяция
-            ratio = (laplacian_var - soft_threshold) / (hard_threshold - soft_threshold)
-            features['soft_light_probability'] = float(1.0 - ratio)
-            features['hard_light_probability'] = float(ratio)
-        
+            features["local_contrast"] = float(features["global_contrast"])
+            features["local_contrast_std"] = 0.0
+
+        # Lighting uniformity (grid-based) and vignetting via helper
+        uniformity_features = self._compute_lighting_uniformity(gray)
+        features.update(uniformity_features)
+
+        # Final safety: cast to native floats and ensure keys exist
+        for k, v in list(features.items()):
+            try:
+                features[k] = float(v)
+            except Exception:
+                features[k] = 0.0
+
         return features
-    
+
+    def _compute_light_direction(self, frame: np.ndarray) -> Dict[str, float]:
+        """Оценивает направление света, количество источников, мягкость/жёсткость."""
+        features = {}
+
+        # --- Validate & convert ---
+        if frame.ndim == 3 and frame.shape[-1] == 4:
+            frame = frame[..., :3]
+        if frame.ndim != 3 or frame.shape[-1] != 3:
+            raise ValueError(f"_compute_light_direction: unexpected frame shape {frame.shape}")
+
+        rgb = frame.astype(np.uint8)
+        gray = cv2.cvtColor(rgb, cv2.COLOR_RGB2GRAY).astype(np.float32)
+
+        h, w = gray.shape
+        eps = 1e-8
+
+        # === 1. GRADIENT-BASED LIGHT DIRECTION (ROBUST CIRCULAR MEAN) ===
+        grad_x = cv2.Sobel(gray, cv2.CV_32F, 1, 0, ksize=3)
+        grad_y = cv2.Sobel(gray, cv2.CV_32F, 0, 1, ksize=3)
+
+        magnitudes = np.sqrt(grad_x**2 + grad_y**2)
+        angles = np.arctan2(grad_y, grad_x)  # radians
+
+        # если нет текстуры — направление неопределено
+        if np.sum(magnitudes) < eps:
+            features["light_direction_angle"] = 0.0
+        else:
+            # circular mean
+            sin_sum = float(np.sum(np.sin(angles) * (magnitudes + eps)))
+            cos_sum = float(np.sum(np.cos(angles) * (magnitudes + eps)))
+            mean_angle = np.arctan2(sin_sum, cos_sum)
+            features["light_direction_angle"] = float(np.degrees(mean_angle))
+
+        # === 2. LIGHT SOURCE COUNT (ROBUST 2D PEAK DETECTION) ===
+        # Сглаживаем картинку и ищем bright blobs
+        blur = gaussian_filter(gray, sigma=7)
+        threshold = np.percentile(blur, 96)
+
+        mask = blur > threshold
+        labeled, num_labels = label(mask)  # connected components
+
+        # Ограничиваем количество источников света
+        source_count = min(int(num_labels), 5)
+        features["light_source_count_estimate"] = float(source_count)
+
+        # === 3. SOFT vs HARD LIGHT (LAPLACIAN VARIANCE + NORMALIZATION) ===
+        lap_var = float(cv2.Laplacian(gray, cv2.CV_32F).var())
+
+        # нормировка в диапазон [0..1]
+        # low variance → soft light; high → hard
+        # границы подогнаны под реальные кадры
+        soft_min = 50      # ультрамягкий
+        hard_max = 600     # ультражёсткий
+
+        if lap_var <= soft_min:
+            soft_prob = 1.0
+        elif lap_var >= hard_max:
+            soft_prob = 0.0
+        else:
+            # линейное уменьшение мягкости
+            soft_prob = 1.0 - (lap_var - soft_min) / (hard_max - soft_min)
+
+        hard_prob = 1.0 - soft_prob
+
+        features["soft_light_probability"] = float(soft_prob)
+        features["hard_light_probability"] = float(hard_prob)
+
+        return features
+
+        
     def extract_frame_features(self, frame: np.ndarray, frame_idx: int) -> Dict[str, Any]:
         """Извлекает все frame-level фичи для одного кадра"""
         # Убеждаемся, что frame в RGB формате и правильном типе
@@ -379,25 +507,37 @@ class ColorLightProcessor:
             pass
         
         features = {}
-        
-        # RGB статистики
-        features.update(self._compute_rgb_stats(frame))
-        
-        # HSV фичи
-        features.update(self._compute_hsv_features(frame))
-        
-        # LAB фичи
-        features.update(self._compute_lab_features(frame))
-        
-        # Палитра и гармонии
-        features.update(self._compute_palette_features(frame))
-        
-        # Освещение
-        features.update(self._compute_lighting_features(frame))
-        
-        # Направление света
-        features.update(self._compute_light_direction(frame))
-        
+        try:
+            # RGB статистики
+            features.update(self._compute_rgb_stats(frame))
+        except Exception as e:
+            print(f"ColorLightProcessor | extract_frame_features | Ошибка вычисления RGB статистики: {e}")
+        try:
+            # HSV фичи
+            features.update(self._compute_hsv_features(frame))
+        except Exception as e:
+            print(f"ColorLightProcessor | extract_frame_features | Ошибка вычисления HSV фичи: {e}")
+        try:
+            # LAB фичи
+            features.update(self._compute_lab_features(frame))
+        except Exception as e:
+            print(f"ColorLightProcessor | extract_frame_features | Ошибка вычисления LAB фичи: {e}")
+        try:
+            # Палитра и гармонии
+            features.update(self._compute_palette_features(frame))
+        except Exception as e:
+            print(f"ColorLightProcessor | extract_frame_features | Ошибка вычисления Палитра и гармонии: {e}")
+        try:
+            # Освещение
+            features.update(self._compute_lighting_features(frame))
+        except Exception as e:
+            print(f"ColorLightProcessor | extract_frame_features | Ошибка вычисления Освещение: {e}")
+        try:
+            # Направление света
+            features.update(self._compute_light_direction(frame))
+        except Exception as e:
+            print(f"ColorLightProcessor | extract_frame_features | Ошибка вычисления Направление света: {e}")
+
         return {
             "frame_idx": frame_idx,
             "features": features
@@ -609,118 +749,183 @@ class ColorLightProcessor:
         index = np.arange(1, n + 1)
         return float((2 * np.sum(index * sorted_values)) / (n * np.sum(sorted_values)) - (n + 1) / n)
     
-    def extract_video_features(self, all_scene_features: List[Dict], all_frame_features: List[Dict]) -> Dict[str, Any]:
-        """Извлекает video-level агрегированные фичи"""
+    def extract_video_features(self, all_scene_features: Dict[str, Dict], all_frame_features: Dict[str, Dict]) -> Dict[str, Any]:
+        """Агрегирует video-level фичи."""
         features = {}
-        
+
+        # -------------------------------
+        # 1. Проверки
+        # -------------------------------
         if not all_scene_features or not all_frame_features:
             return features
-        
-        # Агрегация всех сцен: mean/std/min/max по каждой фиче
-        scene_feature_dict = {}
+
+        # -------------------------------
+        # 2. Scene-level агрегаты
+        # -------------------------------
+        scene_agg = {}
+
         for scene_feat in all_scene_features.values():
-            for key, value in scene_feat.items():
-                if isinstance(value, (int, float)) and not isinstance(value, bool):
-                    if key not in scene_feature_dict:
-                        scene_feature_dict[key] = []
-                    scene_feature_dict[key].append(value)
-        
-        for key, values in scene_feature_dict.items():
-            if len(values) > 0:
-                features[f'{key}_mean'] = float(np.mean(values))
-                features[f'{key}_std'] = float(np.std(values))
-                features[f'{key}_min'] = float(np.min(values))
-                features[f'{key}_max'] = float(np.max(values))
-        
-        # Entropy и Gini для распределений
-        # Color distribution entropy
-        hue_values = [f['features'].get('hue_mean', 0) for f in all_frame_features]
-        if hue_values:
+            for key, val in scene_feat.items():
+                if isinstance(val, (float, int)) and not isinstance(val, bool):
+                    scene_agg.setdefault(key, []).append(val)
+
+        for key, vals in scene_agg.items():
+            if len(vals) > 0:
+                features[f"{key}_mean"] = float(np.mean(vals))
+                features[f"{key}_std"] = float(np.std(vals))
+                features[f"{key}_min"] = float(np.min(vals))
+                features[f"{key}_max"] = float(np.max(vals))
+
+        # -------------------------------
+        # 3. Собираем frame-level фичи
+        # -------------------------------
+
+        # Собираем ВСЕ кадры в список
+        frame_list = []
+        for scene_dict in all_frame_features.values():
+            for frame_idx, frame_feat in scene_dict.items():
+                frame_list.append(frame_feat)
+
+        # Нечего анализировать
+        if len(frame_list) == 0:
+            return features
+
+        # Универсальный safe getter
+        def getf(frame, key, default=0.0):
+            return frame.get(key, default)
+
+        # -------------------------------
+        # 4. Color/Hue distribution
+        # -------------------------------
+        hue_values = [getf(f, "hue_mean", 0) for f in frame_list]
+
+        if len(hue_values) > 0:
             hue_hist, _ = np.histogram(hue_values, bins=36)
             hue_probs = hue_hist / (hue_hist.sum() + 1e-10)
-            features['color_distribution_entropy'] = float(entropy(hue_probs + 1e-10))
-            features['color_distribution_gini'] = self._compute_gini_coefficient(np.array(hue_values))
-        
-        # Стиль цветокоррекции
-        features.update(self._compute_color_style_features(all_frame_features))
-        
-        # Aesthetic & Cinematic Scores
-        features.update(self._compute_aesthetic_scores(all_frame_features))
-        
-        # Глобальная динамика
-        brightness_values = [f['features'].get('brightness_mean', 0) for f in all_frame_features]
+            features["color_distribution_entropy"] = float(entropy(hue_probs + 1e-10))
+            features["color_distribution_gini"] = float(self._compute_gini_coefficient(np.array(hue_values)))
+
+        # -------------------------------
+        # 5. Color style features
+        # -------------------------------
+        features.update(self._compute_color_style_features(frame_list))
+
+        # -------------------------------
+        # 6. Aesthetic scores
+        # -------------------------------
+        features.update(self._compute_aesthetic_scores(frame_list))
+
+        # -------------------------------
+        # 7. Global brightness dynamics
+        # -------------------------------
+        brightness_values = [getf(f, "brightness_mean", 0) for f in frame_list]
+
         if len(brightness_values) > 1:
-            brightness_diff = np.diff(brightness_values)
-            features['global_brightness_change_speed'] = float(np.mean(np.abs(brightness_diff)))
-        
-        hue_values = [f['features'].get('hue_mean', 0) for f in all_frame_features]
+            diff = np.diff(brightness_values)
+            features["global_brightness_change_speed"] = float(np.mean(np.abs(diff)))
+
+        # -------------------------------
+        # 8. Global color change speed
+        # -------------------------------
         if len(hue_values) > 1:
             hue_diff = np.diff(hue_values)
+            # корректный hue wrap-around
             hue_diff = np.minimum(np.abs(hue_diff), 180 - np.abs(hue_diff))
-            features['global_color_change_speed'] = float(np.mean(np.abs(hue_diff)))
-        
-        # Частота стробоскопических переходов
+            features["global_color_change_speed"] = float(np.mean(np.abs(hue_diff)))
+
+        # -------------------------------
+        # 9. Strobe transitions
+        # -------------------------------
         if len(brightness_values) > 2:
-            brightness_diff = np.abs(np.diff(brightness_values))
-            strobe_threshold = np.mean(brightness_values) + 1.5 * np.std(brightness_values)
-            strobe_count = np.sum(brightness_diff > strobe_threshold)
-            features['strobe_transition_frequency'] = float(strobe_count / len(brightness_diff))
-        
-        # Periodicity и color shift (глобальные)
+            diff = np.abs(np.diff(brightness_values))
+            threshold = np.mean(brightness_values) + 1.5 * np.std(brightness_values)
+            strobe_count = np.sum(diff > threshold)
+            features["strobe_transition_frequency"] = float(strobe_count / len(diff))
+
+        # -------------------------------
+        # 10. Color periodicity + color shift
+        # -------------------------------
         if len(hue_values) > 3:
-            hue_array = np.array(hue_values)
-            autocorr = np.correlate(hue_array - np.mean(hue_array),
-                                   hue_array - np.mean(hue_array), mode='full')
+            arr = np.array(hue_values)
+            autocorr = np.correlate(arr - np.mean(arr), arr - np.mean(arr), mode="full")
             autocorr = autocorr[len(autocorr)//2:]
-            autocorr = autocorr / (autocorr[0] + 1e-10)
+            autocorr /= (autocorr[0] + 1e-10)
+
             if len(autocorr) > 2:
                 peaks, _ = find_peaks(autocorr[1:], height=0.2)
-                features['global_color_periodicity'] = float(len(peaks) / len(autocorr))
+                features["global_color_periodicity"] = float(len(peaks) / len(autocorr))
             else:
-                features['global_color_periodicity'] = 0.0
-            
-            features['global_color_shift'] = float(np.mean(np.abs(np.diff(hue_values))))
-        
+                features["global_color_periodicity"] = 0.0
+
+            features["global_color_shift"] = float(np.mean(np.abs(np.diff(hue_values))))
+
         return features
+
     
-    def _create_sequence_inputs(self, frame_features: List[Dict], scene_features: List[Dict], 
-                                video_features: Dict) -> Dict[str, List]:
-        """Создает sequence inputs для трансформера"""
+    def _create_sequence_inputs(self, all_frame_features: Dict[str, Dict[int, Dict]],
+                                all_scene_features: Dict[str, Dict[str, Any]],
+                                video_features: Dict[str, Any]) -> Dict[str, List]:
+        """
+        Создает sequence inputs для трансформера
+        
+        Args:
+            all_frame_features: {scene_label: {frame_idx: {"features": {...}}}}
+            all_scene_features: {scene_label: {"feat1":..., "feat2":...}}
+            video_features: {"feat": value}
+        """
         sequences = {}
-        
-        # Frame sequence features [N_frames, D_frame_features]
+
+        # ============================================================
+        # 1) FRAME SEQUENCE → [N_frames_total, D_frame_features]
+        # ============================================================
         frame_sequence = []
-        for frame_feat in frame_features:
-            feat_vec = []
-            feat_dict = frame_feat['features']
-            # Извлекаем числовые фичи в фиксированном порядке
-            numeric_keys = sorted([k for k in feat_dict.keys() 
-                                 if isinstance(feat_dict[k], (int, float)) and not isinstance(feat_dict[k], bool)])
-            for key in numeric_keys:
-                feat_vec.append(float(feat_dict[key]))
-            frame_sequence.append(feat_vec)
-        sequences['frames'] = frame_sequence
-        
-        # Scene sequence features [N_scenes, D_scene_features]
+
+        # Собираем все кадры ПЛОСКО по всем сценам
+        for scene_label, frames_dict in all_frame_features.items():
+            for frame_idx, frame_feat in sorted(frames_dict.items(), key=lambda x: x[0]):
+                feat_dict = frame_feat["features"]
+
+                # только числовые фичи
+                numeric_keys = sorted([
+                    k for k, v in feat_dict.items()
+                    if isinstance(v, (int, float)) and not isinstance(v, bool)
+                ])
+
+                frame_vector = [float(feat_dict[k]) for k in numeric_keys]
+                frame_sequence.append(frame_vector)
+
+        sequences["frames"] = frame_sequence
+
+        # ============================================================
+        # 2) SCENE SEQUENCE → [N_scenes, D_scene_features]
+        # ============================================================
         scene_sequence = []
-        for scene_feat in scene_features.values():
-            feat_vec = []
-            numeric_keys = sorted([k for k in scene_feat.keys() 
-                                 if isinstance(scene_feat[k], (int, float)) and not isinstance(scene_feat[k], bool)])
-            for key in numeric_keys:
-                feat_vec.append(float(scene_feat[key]))
-            scene_sequence.append(feat_vec)
-        sequences['scenes'] = scene_sequence
-        
-        # Video global features [D_global_features]
+
+        for scene_label, scene_feat in all_scene_features.items():
+            numeric_keys = sorted([
+                k for k, v in scene_feat.items()
+                if isinstance(v, (int, float)) and not isinstance(v, bool)
+            ])
+            scene_vector = [float(scene_feat[k]) for k in numeric_keys]
+            scene_sequence.append(scene_vector)
+
+        sequences["scenes"] = scene_sequence
+
+        # ============================================================
+        # 3) GLOBAL → [D_global_features]
+        # ============================================================
         global_sequence = []
-        numeric_keys = sorted([k for k in video_features.keys() 
-                             if isinstance(video_features[k], (int, float)) and not isinstance(video_features[k], bool)])
-        for key in numeric_keys:
-            global_sequence.append(float(video_features[key]))
-        sequences['global'] = global_sequence
-        
+
+        numeric_keys = sorted([
+            k for k, v in video_features.items()
+            if isinstance(v, (int, float)) and not isinstance(v, bool)
+        ])
+
+        global_sequence = [float(video_features[k]) for k in numeric_keys]
+        sequences["global"] = global_sequence
+
         return sequences
+
     
     def process(self, frame_manager, scenes) -> Dict[str, Any]:
         """
@@ -736,40 +941,66 @@ class ColorLightProcessor:
         all_frame_features = {}
         all_scene_features = {}
         
-        for scene_label, frame_range in scenes.items():
-            start_frame, end_frame = frame_range["indices"][0], frame_range["indices"][-1]
-            
-            # Ограничиваем количество кадров для оптимизации
-            num_frames_in_scene = end_frame - start_frame + 1
-            num_samples = min(self.max_frames_per_scene, num_frames_in_scene)
-            
-            if num_samples == 1:
-                frame_indices = [start_frame]
-            else:
-                frame_indices = np.linspace(start_frame, end_frame, num_samples, dtype=int)
+        for i, (scene_label, frame_range) in enumerate(scenes.items()):
+                start_frame = frame_range["indices"][0]
+                end_frame = frame_range["indices"][-1]
+
+                num_frames_in_scene = end_frame - start_frame + 1
+
+                # ==== STRIDE LOGIC ====
+                if self.stride and self.stride > 1:
+                    # Берём кадры по шагу
+                    frame_indices = np.arange(start_frame, end_frame + 1, self.stride)
+                    # Гарантируем включение конца сцены
+                    if frame_indices[-1] != end_frame:
+                        frame_indices = np.append(frame_indices, end_frame)
+
+                else:
+                    # ==== OLD RANDOM SAMPLING LOGIC ====
+                    num_samples = min(self.max_frames_per_scene, num_frames_in_scene)
+
+                    if num_samples == 1:
+                        frame_indices = np.array([start_frame])
+                    else:
+                        frame_indices = np.linspace(start_frame, end_frame, num_samples, dtype=int)
+
                 # Убираем дубликаты и сортируем
                 frame_indices = np.unique(frame_indices)
 
-            all_frame_features[scene_label] = ()
-            
-            scene_frame_features = []
-            for frame_idx in frame_indices:
-                try:
-                    frame = frame_manager.get(frame_idx)
-                    frame_feat = self.extract_frame_features(frame, frame_idx)
-                    scene_frame_features.append(frame_feat)
-                    all_frame_features[scene_label][frame_idx] = frame_feat
-                except Exception as e:
-                    print(f"Warning: Failed to process frame {frame_idx}: {e}")
-                    continue
-            
-            # Scene-level фичи
-            if scene_frame_features:
-                scene_feat = self.extract_scene_features(scene_frame_features, start_frame, end_frame)
-                all_scene_features[scene_label] = scene_feat
+                all_frame_features[scene_label] = {}
+                scene_frame_features = []
+
+                # ==== FEATURE EXTRACTION ====
+                for k, frame_idx in enumerate(frame_indices):
+                    try:
+                        frame = frame_manager.get(frame_idx)
+                        frame_feat = self.extract_frame_features(frame, frame_idx)
+
+                        scene_frame_features.append(frame_feat)
+                        all_frame_features[scene_label][frame_idx] = frame_feat
+
+                        logger.info(
+                            f"Сцена {i+1}/{len(scenes)} | Кадр {k+1}/{len(frame_indices)} обработан"
+                        )
+                    except Exception as e:
+                        logger.error(f"Failed to process frame {frame_idx}: {e}")
+                        continue
+
+                # ==== SCENE FEATURES ====
+                if scene_frame_features:
+                    scene_feat = self.extract_scene_features(
+                        scene_frame_features,
+                        start_frame,
+                        end_frame
+                    )
+                    all_scene_features[scene_label] = scene_feat
+
+                logger.info(f"Сцена {i+1}/{len(scenes)} | Scene-level фичи извлечены")
         
         # Video-level фичи
         video_features = self.extract_video_features(all_scene_features, all_frame_features)
+
+        logger.info(f"Видео фичи извлечены")
         
         # Sequence inputs
         sequence_inputs = self._create_sequence_inputs(all_frame_features, all_scene_features, video_features)

@@ -7,7 +7,9 @@ modules:
     behavioral: false
     optical_flow: false
     action_recognition: false
-    color_light: true
+    color_light: false
+    frames_composition: false
+    shot_quality: true
 
 global:
     root_path: "/home/ilya/Рабочий стол/TrendFlowML/DataProcessor"
@@ -136,3 +138,20 @@ action_recognition:
 
 color_light:
     max_frames_per_scene: 350
+    stride: 9
+
+frames_composition:
+    device: "cuda"
+    yolo_model_path: 'yolo11n.pt'
+    yolo_conf_threshold: 0.3
+    max_num_faces: 5
+    min_detection_confidence: 0.5
+    use_midas: true
+    num_depth_layers: 3
+    slic_n_segments: 100
+    slic_compactness: 10
+    brightness_weight: 0.65
+    object_weight: 0.35
+
+shot_quality:
+    device: "cuda"
