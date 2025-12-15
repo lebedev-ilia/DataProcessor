@@ -48,6 +48,18 @@ try:
 except Exception:
     MEDIAPIPE_AVAILABLE = False
 
+name = "CutDetectionPipeline"
+
+import os
+import sys
+_path = os.path.dirname(os.path.dirname(os.path.dirname(__file__)))
+
+if _path not in sys.path:
+    sys.path.append(_path)
+
+from utils.logger import get_logger
+logger = get_logger(name)
+
 # -----------------------------
 # Utilities
 # -----------------------------
@@ -170,16 +182,26 @@ def optical_flow_direction_consistency(flow_angles, window_size=5):
 # High-level cut detectors
 # -----------------------------
 
-def detect_hard_cuts(frames, fps, hist_thresh=None, ssim_thresh=None, flow_thresh=None,
-                     use_deep_features=True, use_adaptive_thresholds=True, 
-                     temporal_smoothing=True, embed_model=None, transform=None, device='cpu'):
+def detect_hard_cuts(
+    frame_manager, 
+    frame_indices, 
+    hist_thresh=None, 
+    ssim_thresh=None, 
+    flow_thresh=None,
+    use_deep_features=True, 
+    use_adaptive_thresholds=True, 
+    temporal_smoothing=True, 
+    embed_model=None, 
+    transform=None, 
+    device='cpu'
+    ):
     """
     Improved hard cut detection with adaptive thresholds, deep features, and temporal smoothing.
     frames: list of BGR frames
     returns list of cut_indices (frame index where cut occurs) and strengths
     Strategy: combine histogram diff, SSIM drop, optical flow jump, and deep embeddings.
     """
-    n = len(frames)
+    n = len(frame_indices)
     if n < 2:
         return [], []
     
@@ -189,10 +211,10 @@ def detect_hard_cuts(frames, fps, hist_thresh=None, ssim_thresh=None, flow_thres
     flow_mags = []
     deep_diffs = []
     
-    prev_gray = cv2.cvtColor(frames[0], cv2.COLOR_BGR2GRAY)
+    prev_gray = cv2.cvtColor(frame_manager.get(frame_indices[0]), cv2.COLOR_BGR2GRAY)
     for i in range(1, n):
-        fA = frames[i-1]
-        fB = frames[i]
+        fA = frame_manager.get(frame_indices[i-1])
+        fB = frame_manager.get(frame_indices[i])
         hdiff = frame_histogram_diff(fA, fB)
         s = frame_ssim(fA, fB)
         gray = cv2.cvtColor(fB, cv2.COLOR_BGR2GRAY)
@@ -259,13 +281,13 @@ def detect_hard_cuts(frames, fps, hist_thresh=None, ssim_thresh=None, flow_thres
     
     return cut_idxs, strengths
 
-def detect_soft_cuts(frames, fps, fade_threshold=0.02, min_duration_frames=4, use_flow_consistency=True):
+def detect_soft_cuts(frame_manager, frame_indices, fps, fade_threshold=0.02, min_duration_frames=4, use_flow_consistency=True):
     """
     Improved soft cut detection with gradient-based analysis and optical flow consistency.
     Detect fade-in/out and dissolves by monitoring brightness/histogram changes over a window.
     Returns events: list of dicts {'type':'fade_in'/'fade_out'/'dissolve', 'start', 'end', 'duration_s'}
     """
-    n = len(frames)
+    n = len(frame_indices)
     if n < 3:
         return []
     
@@ -275,10 +297,12 @@ def detect_soft_cuts(frames, fps, fade_threshold=0.02, min_duration_frames=4, us
     hist_diffs = []
     flow_mags = []
     
-    prev_gray = cv2.cvtColor(frames[0], cv2.COLOR_BGR2GRAY)
+    prev_gray = cv2.cvtColor(frame_manager.get(frame_indices[0]), cv2.COLOR_BGR2GRAY)
     prev_hsv_hist = None
     
-    for i, f in enumerate(frames):
+    for i, idx in enumerate(frame_indices):
+        f = frame_manager.get(idx)
+
         # HSV analysis
         hsv = cv2.cvtColor(f, cv2.COLOR_BGR2HSV)
         v = hsv[:,:,2].mean() / 255.0
@@ -341,7 +365,7 @@ def detect_soft_cuts(frames, fps, fade_threshold=0.02, min_duration_frames=4, us
                 lab_change = abs(lab_values[j] - lab_values[i]) if j < len(lab_values) else 0
                 if hsv_change > fade_threshold or lab_change > fade_threshold:
                     typ = 'fade_in' if (hsv_values[j] > hsv_values[i] if j < len(hsv_values) else False) else 'fade_out'
-                    events.append({'type': typ, 'start': i, 'end': min(j, len(frames)-1), 
+                    events.append({'type': typ, 'start': i, 'end': min(j, len(frame_indices)-1), 
                                  'duration_s': seconds_from_fps(duration, fps)})
             i = j
         else:
@@ -371,14 +395,20 @@ def detect_soft_cuts(frames, fps, fade_threshold=0.02, min_duration_frames=4, us
     
     return events
 
-def detect_motion_based_cuts(frames, fps, flow_spike_factor=None, use_direction_analysis=True, 
-                             adaptive_threshold=True, detect_speed_ramps=True):
+def detect_motion_based_cuts(
+    frame_manager,
+    frame_indices, 
+    flow_spike_factor=None, 
+    use_direction_analysis=True, 
+    adaptive_threshold=True, 
+    detect_speed_ramps=True
+):
     """
     Improved motion-based cut detection with direction analysis and adaptive thresholds.
     Detect whip pans / zoom transitions / speed ramp cuts by measuring spikes in optical-flow magnitude variance.
     Returns list of indices, intensities, and types ('whip_pan', 'zoom', or 'speed_ramp').
     """
-    n = len(frames)
+    n = len(frame_indices)
     if n < 2:
         return [], [], []
     
@@ -387,11 +417,11 @@ def detect_motion_based_cuts(frames, fps, flow_spike_factor=None, use_direction_
     direction_consistencies = []
     mag_variances = []  # For speed ramp detection
     
-    prev_gray = cv2.cvtColor(frames[0], cv2.COLOR_BGR2GRAY)
+    prev_gray = cv2.cvtColor(frame_manager.get(frame_indices[0]), cv2.COLOR_BGR2GRAY)
     prev_mag_map = None
     
     for i in range(1, n):
-        gray = cv2.cvtColor(frames[i], cv2.COLOR_BGR2GRAY)
+        gray = cv2.cvtColor(frame_manager.get(frame_indices[i]), cv2.COLOR_BGR2GRAY)
         mag, mag_map, angles = optical_flow_magnitude(prev_gray, gray)
         mags.append(mag)
         angles_list.append(angles)
@@ -613,9 +643,15 @@ class StylizedTransitionZeroShot:
 # -----------------------------
 # Jump-cut detection (pose/face based)
 # -----------------------------
-def detect_jump_cuts(frames, fps, face_threshold=0.6, pose_threshold=0.6, 
-                     use_background_embedding=True, use_pose_estimation=True,
-                     embed_model=None, transform=None, device='cpu'):
+def detect_jump_cuts(
+    frame_manager, 
+    frame_indices, 
+    use_background_embedding=True, 
+    use_pose_estimation=True,
+    embed_model=None, 
+    transform=None, 
+    device='cuda'
+    ):
     """
     Improved jump cut detection with background embedding and pose estimation.
     Uses Mediapipe face/pose landmarks and deep embeddings to detect jump cuts where main subject reappears
@@ -635,7 +671,10 @@ def detect_jump_cuts(frames, fps, face_threshold=0.6, pose_threshold=0.6,
     jump_idxs = []
     jump_scores = []
     
-    for i, f in enumerate(frames):
+    for i, idx in enumerate(frame_indices):
+
+        f = frame_manager.get(idx)
+
         img_rgb = cv2.cvtColor(f, cv2.COLOR_BGR2RGB)
         
         # Face detection
@@ -738,17 +777,22 @@ def scene_boundaries_from_shots(shot_cut_indices, shots_duration_frames, fps,
     
     # Semantic clustering approach
     if use_semantic_clustering and frame_embeddings is not None:
-        # Use embeddings to cluster shots
         shot_embeddings = []
-        for i, (start_idx, duration) in enumerate(zip([0] + shot_cut_indices, shots_duration_frames)):
-            # Use middle frame of shot as representative
+
+        for i, (start_idx, duration) in enumerate(
+            zip([0] + shot_cut_indices, shots_duration_frames)
+        ):
             mid_frame_idx = start_idx + duration // 2
+
             if mid_frame_idx < len(frame_embeddings):
                 shot_embeddings.append(frame_embeddings[mid_frame_idx])
             else:
-                shot_embeddings.append(frame_embeddings[-1] if frame_embeddings else np.zeros(512))
-        
-        shot_embeddings = np.array(shot_embeddings)
+                if frame_embeddings is not None and frame_embeddings.shape[0] > 0:
+                    shot_embeddings.append(frame_embeddings[-1])
+                else:
+                    shot_embeddings.append(np.zeros(512, dtype=np.float32))
+
+        shot_embeddings = np.asarray(shot_embeddings, dtype=np.float32)
         
         # Normalize embeddings
         if len(shot_embeddings) > 0:
@@ -947,87 +991,122 @@ def audio_cut_alignment_score(cut_times_seconds, onset_env, onset_times, window=
     
     return float(aligned / len(cut_times_seconds))
 
-def detect_scene_whoosh_transitions(audio_path, scene_boundaries_times, sr=22050, hop_length=512):
+def detect_scene_whoosh_transitions(
+    audio_path,
+    scene_boundaries_times,
+    sr=22050,
+    hop_length=512,
+    n_fft=2048,
+    window_sec=0.5,
+):
     """
-    Detect whoosh transitions between scenes using audio spectral analysis.
-    Whoosh sounds are characterized by:
-    - Rapid increase in high-frequency energy
-    - Sweeping spectral characteristics
-    - Short duration (0.1-0.5 seconds)
-    
-    Returns probability of whoosh transition for each scene boundary.
+    Detect whoosh-like audio transitions near scene boundaries.
+
+    Whoosh characteristics:
+    - Rising high-frequency content
+    - High spectral flux (rapid spectral change)
+    - Short transient duration (0.1–0.5s)
+
+    Returns:
+        List[float]: probability (0–1) of whoosh for each scene boundary
     """
+
     if audio_path is None or not os.path.exists(audio_path):
         return None
-    
+
     try:
-        y, sr = librosa.load(audio_path, sr=sr)
-        
-        # Compute spectral features
-        # Spectral rolloff: frequency below which a certain percentage of energy is contained
-        spectral_rolloff = librosa.feature.spectral_rolloff(y=y, sr=sr, hop_length=hop_length)[0]
-        
-        # Spectral centroid: "brightness" of the sound
-        spectral_centroid = librosa.feature.spectral_centroid(y=y, sr=sr, hop_length=hop_length)[0]
-        
-        # Spectral flux: rate of change of spectral energy
-        stft = librosa.stft(y, hop_length=hop_length)
+        # === Load audio ===
+        y, sr = librosa.load(audio_path, sr=sr, mono=True)
+
+        # === STFT ===
+        stft = librosa.stft(y, n_fft=n_fft, hop_length=hop_length)
         magnitude = np.abs(stft)
-        spectral_flux = np.sum(np.diff(magnitude, axis=1) ** 2, axis=0)
-        
-        # High-frequency energy (above 5kHz)
-        freq_bins = librosa.fft_frequencies(sr=sr, n_fft=2048)
-        high_freq_mask = freq_bins > 5000
-        high_freq_energy = np.sum(magnitude[high_freq_mask, :], axis=0)
-        
-        times = librosa.times_like(spectral_rolloff, sr=sr, hop_length=hop_length)
-        
-        # For each scene boundary, analyze nearby audio
+        n_frames = magnitude.shape[1]
+
+        # === Time axis ===
+        times = librosa.frames_to_time(
+            np.arange(n_frames),
+            sr=sr,
+            hop_length=hop_length,
+            n_fft=n_fft,
+        )
+
+        # === Spectral features ===
+        spectral_centroid = librosa.feature.spectral_centroid(
+            S=magnitude, sr=sr
+        )[0]
+
+        spectral_rolloff = librosa.feature.spectral_rolloff(
+            S=magnitude, sr=sr, roll_percent=0.85
+        )[0]
+
+        # === Spectral flux (same length as others) ===
+        spectral_flux = np.zeros(n_frames)
+        spectral_flux[1:] = np.sum(
+            np.diff(magnitude, axis=1) ** 2, axis=0
+        )
+
+        # === High-frequency energy ===
+        freqs = librosa.fft_frequencies(sr=sr, n_fft=n_fft)
+        hf_mask = freqs > 5000  # whoosh ≈ high-frequency sweep
+        high_freq_energy = magnitude[hf_mask].sum(axis=0)
+
+        # === Normalize features (robust) ===
+        def norm(x):
+            return (x - np.median(x)) / (np.std(x) + 1e-9)
+
+        spectral_rolloff_n = norm(spectral_rolloff)
+        spectral_flux_n = norm(spectral_flux)
+        high_freq_energy_n = norm(high_freq_energy)
+
+        # === Global thresholds ===
+        flux_thr = np.percentile(spectral_flux_n, 85)
+        hf_thr = np.percentile(high_freq_energy_n, 85)
+
+        # === Evaluate each scene boundary ===
         whoosh_probs = []
+
         for scene_time in scene_boundaries_times:
-            # Look for whoosh in window around scene boundary
-            window = 0.5  # 0.5 seconds before and after
-            time_mask = (times >= scene_time - window) & (times <= scene_time + window)
-            
-            if np.any(time_mask):
-                # Whoosh characteristics:
-                # 1. Rapid increase in spectral rolloff (high frequencies)
-                # 2. High spectral flux (rapid spectral change)
-                # 3. Increase in high-frequency energy
-                
-                rolloff_window = spectral_rolloff[time_mask]
-                flux_window = spectral_flux[time_mask]
-                hf_energy_window = high_freq_energy[time_mask]
-                
-                # Check for upward trend in rolloff
-                rolloff_diff = np.diff(rolloff_window)
-                rolloff_increase = np.mean(rolloff_diff[rolloff_diff > 0]) if np.any(rolloff_diff > 0) else 0.0
-                
-                # Check for high spectral flux
-                flux_mean = np.mean(flux_window)
-                flux_threshold = np.percentile(spectral_flux, 85)
-                
-                # Check for high-frequency energy spike
-                hf_energy_diff = np.diff(hf_energy_window)
-                hf_spike = np.max(hf_energy_window) / (np.mean(high_freq_energy) + 1e-9)
-                
-                # Combine features into probability
-                prob = 0.0
-                if rolloff_increase > 500:  # Significant rolloff increase
-                    prob += 0.3
-                if flux_mean > flux_threshold:  # High spectral flux
-                    prob += 0.3
-                if hf_spike > 1.5:  # High-frequency spike
-                    prob += 0.4
-                
-                whoosh_probs.append(min(prob, 1.0))
-            else:
+            mask = (
+                (times >= scene_time - window_sec)
+                & (times <= scene_time + window_sec)
+            )
+
+            if not np.any(mask):
                 whoosh_probs.append(0.0)
-        
+                continue
+
+            roll = spectral_rolloff_n[mask]
+            flux = spectral_flux_n[mask]
+            hf = high_freq_energy_n[mask]
+
+            # === Feature scores ===
+
+            # 1. Rising rolloff (HF sweep)
+            roll_diff = np.diff(roll)
+            roll_score = np.mean(roll_diff[roll_diff > 0]) if np.any(roll_diff > 0) else 0.0
+
+            # 2. High spectral flux
+            flux_score = np.mean(flux > flux_thr)
+
+            # 3. HF energy spike
+            hf_score = np.mean(hf > hf_thr)
+
+            # === Combine (soft probability) ===
+            prob = (
+                0.35 * np.tanh(roll_score) +
+                0.35 * flux_score +
+                0.30 * hf_score
+            )
+
+            whoosh_probs.append(float(np.clip(prob, 0.0, 1.0)))
+
         return whoosh_probs
+
     except Exception as e:
-        print(f"Error in whoosh detection: {e}")
+        print(f"[WhooshDetectionError] {e}")
         return None
+
 
 def analyze_scene_transition_types(scene_boundaries_shot_idx, shot_boundaries_frames, 
                                    hard_cuts, soft_events, motion_cuts, stylized_counts,
@@ -1240,13 +1319,27 @@ def classify_edit_style(cut_timing_stats, shot_stats, motion_cuts_count, jump_cu
 # High-level pipeline wrapper
 # -----------------------------
 class CutDetectionPipeline:
-    def __init__(self, fps=30, device='cpu', clip_zero_shot=True, use_deep_features=True,
-                 use_adaptive_thresholds=True, use_semantic_clustering=True):
+    def __init__(
+        self, 
+        fps=30, 
+        device='cuda', 
+        clip_zero_shot=True, 
+        use_deep_features=True,
+        use_adaptive_thresholds=True, 
+        use_semantic_clustering=True,
+        fade_threshold=0.02,
+        min_duration_frames=4,
+        use_flow_consistency=True,
+    ):
         self.fps = fps
         self.device = device
         self.use_deep_features = use_deep_features
         self.use_adaptive_thresholds = use_adaptive_thresholds
         self.use_semantic_clustering = use_semantic_clustering
+
+        self.fade_threshold = fade_threshold
+        self.min_duration_frames = min_duration_frames
+        self.use_flow_consistency = use_flow_consistency
         
         # Initialize embedding model for deep features
         self.embed_model = None
@@ -1261,21 +1354,24 @@ class CutDetectionPipeline:
             use_multimodal=True
         ) if clip_zero_shot and CLIP_AVAILABLE else None
 
-    def process_video_frames(self, frames_bgr, audio_path=None):
+    def process_video_frames(self, frame_manager, frame_indices, audio_path=None):
         """
         Improved pipeline with all enhanced features.
         frames_bgr: list of BGR frames (np.uint8)
         audio_path: optional path to audio file for audio-assisted detection
         Returns dict of features and detections
         """
-        n = len(frames_bgr)
+        n = len(frame_indices)
         duration_s = seconds_from_fps(n, self.fps)
         
+        tik = time.time()
+
         # Pre-compute frame embeddings for semantic clustering
         frame_embeddings = None
         if self.use_semantic_clustering and self.embed_model is not None:
             frame_embeddings = []
-            for frame in frames_bgr[::10]:  # Sample every 10th frame for efficiency
+            for idx in frame_indices[::10]:  # Sample every 10th frame for efficiency
+                frame = frame_manager.get(idx)
                 img_tensor = self.transform(ImageFromCV(frame)).unsqueeze(0).to(self.device)
                 with torch.no_grad():
                     emb = self.embed_model(img_tensor)
@@ -1283,10 +1379,16 @@ class CutDetectionPipeline:
                     emb = emb / (emb.norm(dim=1, keepdim=True)+1e-9)
                     frame_embeddings.append(emb.cpu().numpy()[0])
             frame_embeddings = np.array(frame_embeddings)
+
         
+        tok = round(time.time() - tik, 2)
+        logger.info(f"Frame embeddings success | Time: {tok}")
+        tik = time.time()
+
         # 1. Hard cuts with improvements
         hard_idxs, hard_strengths = detect_hard_cuts(
-            frames_bgr, self.fps,
+            frame_manager=frame_manager,
+            frame_indices=frame_indices,
             use_deep_features=self.use_deep_features,
             use_adaptive_thresholds=self.use_adaptive_thresholds,
             temporal_smoothing=True,
@@ -1295,19 +1397,36 @@ class CutDetectionPipeline:
             device=self.device
         )
 
+        tok = round(time.time() - tik, 2)
+        logger.info(f"Hard cuts success | Time: {tok}")
+        tik = time.time()
+
         # 2. Soft cuts (fades/dissolves) with improvements
         soft_events = detect_soft_cuts(
-            frames_bgr, self.fps,
-            use_flow_consistency=True
+            frame_manager=frame_manager,
+            frame_indices=frame_indices,
+            fps=self.fps,
+            fade_threshold=self.fade_threshold,
+            min_duration_frames=self.min_duration_frames,
+            use_flow_consistency=self.use_flow_consistency,
         )
+
+        tok = round(time.time() - tik, 2)
+        logger.info(f"Soft cuts success | Time: {tok}")
+        tik = time.time()
 
         # 3. Motion-based cuts (whip/zoom/speed_ramp) with improvements
         motion_idxs, motion_int, motion_types = detect_motion_based_cuts(
-            frames_bgr, self.fps,
+            frame_manager=frame_manager,
+            frame_indices=frame_indices,
             use_direction_analysis=True,
             adaptive_threshold=True,
             detect_speed_ramps=True
         )
+
+        tok = round(time.time() - tik, 2)
+        logger.info(f"Motion-based cuts success | Time: {tok}")
+        tik = time.time()
 
         # 4. Stylized transitions via CLIP zero-shot with temporal aggregation
         stylized_counts = {}
@@ -1317,7 +1436,7 @@ class CutDetectionPipeline:
             for idx in range(1, n-1):
                 start = max(0, idx - window//2)
                 end = min(n, idx + window//2 + 1)
-                window_frames = frames_bgr[start:end]
+                window_frames = [frame_manager.get(idx) for idx in frame_indices[start:end]]
                 # Use temporal aggregation
                 if self.clip_detector.use_temporal_aggregation:
                     probs = self.clip_detector.predict_transition_temporal(window_frames, window_size=5)
@@ -1331,9 +1450,14 @@ class CutDetectionPipeline:
             labels = self.clip_detector.labels if self.clip_detector else []
             stylized_counts = {lbl: 0 for lbl in labels}
 
+        tok = round(time.time() - tik, 2)
+        logger.info(f"Stylized transitions via CLIP success | Time: {tok}")
+        tik = time.time()
+
         # 5. Jump cuts detection with improvements
         jump_idxs, jump_scores = detect_jump_cuts(
-            frames_bgr, self.fps,
+            frame_manager=frame_manager,
+            frame_indices=frame_indices,
             use_background_embedding=True,
             use_pose_estimation=True,
             embed_model=self.embed_model,
@@ -1341,9 +1465,17 @@ class CutDetectionPipeline:
             device=self.device
         ) if MEDIAPIPE_AVAILABLE else ([], [])
 
+        tok = round(time.time() - tik, 2)
+        logger.info(f"Jump cuts success | Time: {tok}")
+        tik = time.time()
+
         # 6. Shots segmentation
         shot_boundaries = [0] + hard_idxs + [n]
         shot_lengths = [shot_boundaries[i+1] - shot_boundaries[i] for i in range(len(shot_boundaries)-1)]
+
+        tok = round(time.time() - tik, 2)
+        logger.info(f"Shots segmentation success | Time: {tok}")
+        tik = time.time()
 
         # 7. Audio processing for scene detection
         audio_events = None
@@ -1354,6 +1486,10 @@ class CutDetectionPipeline:
             audio_events = onset_times[onset_env > threshold].tolist()
         else:
             onset_env, onset_times, rms, loudness = None, None, None, None
+
+        tok = round(time.time() - tik, 2)
+        logger.info(f"Audio processing success | Time: {tok}")
+        tik = time.time()
 
         # 8. Scenes grouping with semantic clustering
         scenes = scene_boundaries_from_shots(
@@ -1367,6 +1503,10 @@ class CutDetectionPipeline:
         )
         scene_count = len(scenes)
         scene_avg_len = float(np.mean([end-start+1 for (start,end) in scenes])) if scenes else 0.0
+
+        tok = round(time.time() - tik, 2)
+        logger.info(f"Scenes grouping success | Time: {tok}")
+        tik = time.time()
 
         # 9. Audio assisted cut alignment
         audio_align_score = None
@@ -1385,6 +1525,10 @@ class CutDetectionPipeline:
         # 9. Aggregation stats
         cut_timing_stats_dict = cut_timing_statistics(hard_idxs, self.fps, duration_s)
         shot_stats = shot_length_stats(shot_lengths, self.fps)
+
+        tok = round(time.time() - tik, 2)
+        logger.info(f"Audio assisted success | Time: {tok}")
+        tik = time.time()
 
         # 10. Compose features
         features = {}
@@ -1431,7 +1575,11 @@ class CutDetectionPipeline:
         features['scene_count'] = scene_count
         features['avg_scene_length_shots'] = scene_avg_len
         features['scene_to_shot_ratio'] = float(scene_count / (len(shot_lengths)+1e-9))
-        
+
+        tok = round(time.time() - tik, 2)
+        logger.info(f"Compose success | Time: {tok}")
+        tik = time.time()
+
         # Scene transition types analysis
         if scenes:
             scene_transition_analysis = analyze_scene_transition_types(
@@ -1453,6 +1601,10 @@ class CutDetectionPipeline:
                 'scene_motion_transitions': 0,
                 'scene_stylized_transitions': 0
             })
+
+        tok = round(time.time() - tik, 2)
+        logger.info(f"Scene transition success | Time: {tok}")
+        tik = time.time()
 
         # audio
         features['audio_cut_alignment_score'] = float_or_zero(audio_align_score) if audio_align_score is not None else 0.0
@@ -1483,6 +1635,10 @@ class CutDetectionPipeline:
         else:
             features['scene_whoosh_transition_prob'] = 0.0
 
+        tok = round(time.time() - tik, 2)
+        logger.info(f"Scene whoosh transition success | Time: {tok}")
+        tik = time.time()
+
         # stylistic edit classification (zero-shot): we can compute per-video by averaging stylized_probs_per_cut
         if self.clip_detector is not None and stylized_probs_per_cut:
             # average prob per label
@@ -1501,7 +1657,10 @@ class CutDetectionPipeline:
                 labels = self.clip_detector.labels
                 for lbl in labels:
                     features[f"edit_style_{lbl.replace(' ','_').lower()}_prob"] = 0.0
-        
+
+        tok = round(time.time() - tik, 2)
+        logger.info(f"stylistic edit classification success | Time: {tok}")
+
         # Edit style classification based on statistics (from FEATURES.MD)
         edit_styles = classify_edit_style(
             cut_timing_stats_dict, shot_stats, len(motion_idxs), len(jump_idxs),
@@ -1530,103 +1689,3 @@ class CutDetectionPipeline:
         }
 
         return {'features': features, 'detections': detections}
-
-# -----------------------------
-# Demo usage / CLI
-# -----------------------------
-if __name__ == "__main__":
-    import argparse
-    import json
-    
-    parser = argparse.ArgumentParser(description='Cut Detection Module - Detects cuts, transitions, and analyzes editing style')
-    parser.add_argument('--video', type=str, required=True, help='Input video file path')
-    parser.add_argument('--audio', type=str, default=None, help='Optional audio file path for audio-assisted detection')
-    parser.add_argument('--fps', type=int, default=None, help='Override FPS (auto-detected from video if not specified)')
-    parser.add_argument('--output', type=str, default=None, help='Output JSON file path (if not specified, prints to stdout)')
-    parser.add_argument('--device', type=str, default='auto', choices=['auto', 'cpu', 'cuda'], help='Device to use (default: auto)')
-    parser.add_argument('--no-clip', action='store_true', help='Disable CLIP-based transition classification')
-    parser.add_argument('--no-deep-features', action='store_true', help='Disable deep feature extraction')
-    parser.add_argument('--max-frames', type=int, default=5000, help='Maximum number of frames to process (default: 5000)')
-    args = parser.parse_args()
-
-    if not os.path.exists(args.video):
-        print(f"Error: Video file not found: {args.video}")
-        exit(1)
-
-    # Determine device
-    if args.device == 'auto':
-        device = 'cuda' if torch.cuda.is_available() else 'cpu'
-    else:
-        device = args.device
-    
-    print(f"Using device: {device}")
-    print(f"Loading video: {args.video}")
-
-    # Read video frames
-    cap = cv2.VideoCapture(args.video)
-    video_fps = cap.get(cv2.CAP_PROP_FPS) or args.fps or 24
-    if args.fps:
-        video_fps = args.fps
-    
-    frames = []
-    idx = 0
-    while True:
-        ret, frame = cap.read()
-        if not ret or idx >= args.max_frames:
-            break
-        frames.append(frame)
-        idx += 1
-    cap.release()
-    fps = int(video_fps)
-
-    print(f"Loaded {len(frames)} frames at {fps} FPS")
-    
-    if len(frames) == 0:
-        print("Error: No frames loaded from video")
-        exit(1)
-
-    # Initialize pipeline
-    pipeline = CutDetectionPipeline(
-        fps=fps, 
-        device=device, 
-        clip_zero_shot=CLIP_AVAILABLE and not args.no_clip,
-        use_deep_features=not args.no_deep_features,
-        use_adaptive_thresholds=True,
-        use_semantic_clustering=True
-    )
-    
-    print("Processing video...")
-    out = pipeline.process_video_frames(frames, audio_path=args.audio)
-    
-    print("\n=== Cut Detection Results ===")
-    
-    # Print summary
-    print(f"\nSummary:")
-    print(f"  Hard cuts: {out['features'].get('hard_cuts_count', 0)}")
-    print(f"  Cuts per minute: {out['features'].get('cuts_per_minute', 0):.2f}")
-    print(f"  Jump cuts: {out['features'].get('jump_cuts_count', 0)}")
-    print(f"  Motion cuts: {out['features'].get('motion_cuts_count', 0)}")
-    print(f"  Speed ramp cuts: {out['features'].get('speed_ramp_cuts_count', 0)}")
-    print(f"  Scenes: {out['features'].get('scene_count', 0)}")
-    
-    # Print edit style classification
-    print(f"\nEdit Style Classification:")
-    print(f"  Fast-cut montage: {out['features'].get('edit_style_fast_prob', 0):.3f}")
-    print(f"  Slow-paced: {out['features'].get('edit_style_slow_prob', 0):.3f}")
-    print(f"  Cinematic: {out['features'].get('edit_style_cinematic_prob', 0):.3f}")
-    print(f"  Social media: {out['features'].get('edit_style_social_prob', 0):.3f}")
-    print(f"  Meme-style: {out['features'].get('edit_style_meme_prob', 0):.3f}")
-    print(f"  High-action: {out['features'].get('edit_style_high_action_prob', 0):.3f}")
-
-    # Output to file or stdout
-    if args.output:
-        with open(args.output, 'w') as f:
-            json.dump(out, f, indent=2, default=str)
-        print(f"\nResults saved to: {args.output}")
-    else:
-        print("\n=== All Features ===")
-        for k, v in sorted(out['features'].items()):
-            print(f"{k}: {v}")
-        
-        # Print detected cuts
-        print(f"\nDetected hard cuts (frame indexes): {out['detections']['hard_cut_indices'][:10]}...")  # Show first 10

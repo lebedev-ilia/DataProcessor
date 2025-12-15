@@ -30,7 +30,6 @@ class AccessoriesModule(FaceModule):
 
         h, w = roi.shape[:2]
         gray = cv2.cvtColor(roi, cv2.COLOR_BGR2GRAY)
-        mean_roi = float(np.mean(gray))
 
         # Eyes region / glasses
         glasses_prob = 0.0
@@ -109,7 +108,6 @@ class AccessoriesModule(FaceModule):
             earrings_prob = float(np.clip((left_spot + right_spot) / 2.0, 0.0, 1.0))
         except Exception:
             pass
-
         earrings_presence = bool(earrings_prob > 0.03)
 
         # Jewelry / necklace detection

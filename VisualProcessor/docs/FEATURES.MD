@@ -1817,7 +1817,7 @@ ActionRecognitionModule:
 
 > 💡 Всего можно получить 100–200 цветовых/осветительных фичей.
 
-## 4.2. Композиция кадра                🟩🟥🟥🟥 🟪🟪
+## 4.2. Композиция кадра                🟩🟩🟩🟥 🟪🟪
 
 ### 🧱 A) Правило третей (Rule of Thirds)
 
@@ -2036,7 +2036,7 @@ attention_to_product_ratio
 
 Разбора стиля создания контента
 
-## 4.3. Shot Quality Metrics            🟩🟥🟥🟥 🟪🟪
+## 4.3. Shot Quality Metrics            🟩🟩🟩🟥 🟪🟪
 
 🧼 A) Sharpness & Clarity (резкость)
 
@@ -2199,7 +2199,7 @@ attention_to_product_ratio
 
 # ✂️ 5. Монтаж, ритм, структура
 
-## 5.1. Cut detection                   🟩🟥🟥🟥 🟪🟪
+## 5.1. Cut detection                   🟩🟩🟩🟥 🟪🟪
 
 🔧 A) Типы склеек (детектируемые)
 ✔ Hard Cuts (моментальное переключение)
@@ -2413,7 +2413,7 @@ edit_style_slow_prob
 | Аудио-связь | audio-cut sync score |
 | Стиль монтажа | fast/cinematic/meme |
 
-## 5.2. Video pacing                    🟩🟥🟥🟥 🟪🟪
+## 5.2. Video pacing                    🟩🟩🟩🟥 🟪🟪
 
 🔥 A. Метрические фичи темпа монтажа (чистый pace)
 1. Cut rate per second
@@ -2634,7 +2634,7 @@ scene_duration_variance
 - `climax_speed`
 - `pacing_symmetry`
 
-## 5.3. Story Structure                 🟩🟥🟥🟥 🟪🟪
+## 5.3. Story Structure                 🟩🟩🟩🟥 🟪🟪
 
 🧩 A. Сегментация истории (Story Segmentation)
 

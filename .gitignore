@@ -26,6 +26,9 @@ build/
 .color_light_venv/
 .frames_composition_venv/
 .shot_quality_venv/
+.cut_detection_venv/
+.video_pacing_venv/
+.story_structure_venv/
 venv/
 env/
 ENV/

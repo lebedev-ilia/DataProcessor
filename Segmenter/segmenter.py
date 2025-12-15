@@ -395,9 +395,9 @@ if __name__ == "__main__":
         {"name": "action_recognition", "modality": "video", "frame_step": 5},
         {"name": "frames_composition", "modality": "video", "frame_step": 5},
         {"name": "shot_quality", "modality": "video", "frame_step": 5},
-        # {"name": "", "modality": "video", "frame_step": 5},
-        # {"name": "", "modality": "video", "frame_step": 5},
-        # {"name": "", "modality": "video", "frame_step": 5},
+        {"name": "cut_detection", "modality": "video", "frame_step": 5},
+        {"name": "video_pacing", "modality": "video", "frame_step": 5},
+        {"name": "story_structure", "modality": "video", "frame_step": 5},
         # {"name": "", "modality": "video", "frame_step": 5},
     ]
 

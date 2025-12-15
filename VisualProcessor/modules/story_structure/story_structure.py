@@ -8,35 +8,17 @@ from sklearn.metrics.pairwise import cosine_similarity
 from sklearn.cluster import AgglomerativeClustering
 import torch
 import clip
+import os
 from sentence_transformers import SentenceTransformer
 import mediapipe as mp
 from scipy.ndimage import uniform_filter1d
 
-# -----------------------------
-# Helper Functions
-# -----------------------------
-def extract_frames(video_path, fps=1):
-    """Extract frames at given fps"""
-    cap = cv2.VideoCapture(video_path)
-    video_fps = cap.get(cv2.CAP_PROP_FPS)
-    step = max(int(video_fps // fps), 1)
-    frames = []
-    frame_idx = 0
-    while True:
-        ret, frame = cap.read()
-        if not ret:
-            break
-        if frame_idx % step == 0:
-            frames.append(cv2.cvtColor(frame, cv2.COLOR_BGR2RGB))
-        frame_idx += 1
-    cap.release()
-    return frames
-
-def compute_optical_flow(frames):
+def compute_optical_flow(frame_manager, frames):
     """Compute dense optical flow magnitude per frame"""
     flows = []
-    prev_gray = cv2.cvtColor(frames[0], cv2.COLOR_RGB2GRAY)
-    for frame in frames[1:]:
+    prev_gray = cv2.cvtColor(frame_manager.get(frames[0]), cv2.COLOR_RGB2GRAY)
+    for idx in frames[1:]:
+        frame = frame_manager.get(idx)
         gray = cv2.cvtColor(frame, cv2.COLOR_RGB2GRAY)
         flow = cv2.calcOpticalFlowFarneback(prev_gray, gray, None,
                                             0.5, 3, 15, 3, 5, 1.2, 0)
@@ -54,20 +36,22 @@ def embedding_diff(embeddings):
     return np.array(diffs)
 
 def smooth_signal(signal, window=3):
-    return uniform_filter1d(signal, size=window)
+    return uniform_filter1d(signal.astype(np.float32), size=window)
 
 # -----------------------------
 # Story Structure Pipeline
 # -----------------------------
 class StoryStructurePipelineOptimized:
-    def __init__(self, video_path, clip_model='ViT-B/32', sentence_model='all-MiniLM-L6-v2'):
-        self.video_path = video_path
-        self.frames = extract_frames(video_path, fps=1)  # 1 FPS for story-level analysis
+    def __init__(self, frame_manager, frame_indices, clip_model='ViT-B/32', sentence_model='all-MiniLM-L6-v2'):
+        self.frame_manager = frame_manager
+        self.frame_indices = frame_indices
 
         # Load models
         self.device = "cuda" if torch.cuda.is_available() else "cpu"
         self.clip_model, self.clip_preprocess = clip.load(clip_model, device=self.device)
-        self.sentence_model = SentenceTransformer(sentence_model)
+        m_name = sentence_model.replace("-","_")
+        model_path = f"{os.path.dirname(__file__)}/models/{m_name}"
+        self.sentence_model = SentenceTransformer(model_name_or_path=sentence_model, cache_folder=model_path)
         
         # Face tracking
         self.mp_face = mp.solutions.face_mesh.FaceMesh(static_image_mode=True)
@@ -80,7 +64,8 @@ class StoryStructurePipelineOptimized:
     # -----------------------------
     def compute_clip_embeddings(self):
         embeddings = []
-        for frame in tqdm(self.frames, desc="CLIP embeddings"):
+        for idx in tqdm(self.frame_indices, desc="CLIP embeddings"):
+            frame = self.frame_manager.get(idx)
             img = Image.fromarray(frame)
             img_input = self.clip_preprocess(img).unsqueeze(0).to(self.device)
             with torch.no_grad():
@@ -98,7 +83,7 @@ class StoryStructurePipelineOptimized:
         # Smooth embeddings
         smooth_emb = smooth_signal(self.clip_embeddings, window=3)
         # Hierarchical clustering
-        clustering = AgglomerativeClustering(n_clusters=n_segments, affinity='cosine', linkage='average')
+        clustering = AgglomerativeClustering(n_clusters=n_segments, metric='cosine', linkage='average')
         labels = clustering.fit_predict(smooth_emb)
         self.segment_labels = labels
         
@@ -124,12 +109,12 @@ class StoryStructurePipelineOptimized:
     # 3. Hook Features
     # -----------------------------
     def hook_features(self, hook_seconds=5):
-        n_frames = min(len(self.frames), hook_seconds)
-        hook_frames = self.frames[:n_frames]
+        n_frames = min(len(self.frame_indices), hook_seconds)
+        hook_frames = self.frame_indices[:n_frames]
 
         # Optical flow
         if len(hook_frames) > 1:
-            hook_flow = compute_optical_flow(hook_frames)
+            hook_flow = compute_optical_flow(self.frame_manager, hook_frames)
             hook_flow_smooth = smooth_signal(hook_flow)
             self.features['hook_motion_intensity'] = np.mean(hook_flow_smooth)
             self.features['hook_cut_rate'] = np.sum(hook_flow_smooth > np.percentile(hook_flow_smooth,75)) / hook_seconds
@@ -141,7 +126,8 @@ class StoryStructurePipelineOptimized:
 
         # Face presence
         face_count = 0
-        for frame in hook_frames:
+        for idx in self.frame_indices:
+            frame = self.frame_manager.get(idx)
             results = self.mp_face.process(cv2.cvtColor(frame, cv2.COLOR_RGB2BGR))
             if results.multi_face_landmarks:
                 face_count +=1
@@ -156,7 +142,8 @@ class StoryStructurePipelineOptimized:
         # Brightness / Saturation spike
         brightness = []
         saturation = []
-        for frame in hook_frames:
+        for idx in hook_frames:
+            frame = self.frame_manager.get(idx)
             hsv = cv2.cvtColor(frame, cv2.COLOR_RGB2HSV)
             brightness.append(np.mean(hsv[:,:,2]))
             saturation.append(np.mean(hsv[:,:,1]))
@@ -169,7 +156,7 @@ class StoryStructurePipelineOptimized:
     # -----------------------------
     def climax_detection(self):
         # Combine signals: motion + embedding diff
-        motion = compute_optical_flow(self.frames)
+        motion = compute_optical_flow(self.frame_manager, self.frame_indices)
         motion_smooth = smooth_signal(motion)
         embed_diff = embedding_diff(self.clip_embeddings)
         embed_diff_smooth = smooth_signal(embed_diff)
@@ -188,7 +175,8 @@ class StoryStructurePipelineOptimized:
     # -----------------------------
     def character_features(self):
         face_tracks = []
-        for frame in self.frames:
+        for idx in self.frame_indices:
+            frame = self.frame_manager.get(idx)
             results = self.mp_face.process(cv2.cvtColor(frame, cv2.COLOR_RGB2BGR))
             face_tracks.append(len(results.multi_face_landmarks) if results.multi_face_landmarks else 0)
         face_tracks = np.array(face_tracks)
@@ -211,7 +199,7 @@ class StoryStructurePipelineOptimized:
             return self.features
         
         embeddings = self.sentence_model.encode(subtitles)
-        clustering = AgglomerativeClustering(n_clusters=min(5,len(subtitles)), affinity='cosine', linkage='average')
+        clustering = AgglomerativeClustering(n_clusters=min(5,len(subtitles)), metric='cosine', linkage='average')
         labels = clustering.fit_predict(embeddings)
         self.features['number_of_topics'] = len(np.unique(labels))
         durations = [sum(np.array(labels)==i) for i in range(len(np.unique(labels)))]
@@ -239,14 +227,3 @@ class StoryStructurePipelineOptimized:
         self.character_features()
         self.topic_features(subtitles=subtitles)
         return self.features
-
-# -----------------------------
-# Example usage
-# -----------------------------
-if __name__ == "__main__":
-    video_path = "example.mp4"
-    subtitles = ["Hello everyone", "Welcome to my vlog", "Today we will..."]  # optional
-    pipeline = StoryStructurePipelineOptimized(video_path)
-    features = pipeline.extract_all_features(subtitles=subtitles)
-    for k,v in features.items():
-        print(f"{k}: {v}")

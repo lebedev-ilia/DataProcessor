@@ -15,7 +15,7 @@ if _path not in sys.path:
 from utils.frame_manager import FrameManager
 from utils.results_store import ResultsStore
 
-name = "frames_composition"
+name = "shot_quality"
 
 def load_metadata(meta_path):
     try:

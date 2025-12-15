@@ -7,6 +7,7 @@ _path = os.path.dirname(__file__)
 if _path not in sys.path:
     sys.path.append(_path)
 
+import time
 
 from utils.logger import get_logger
 logger = get_logger("DataProcessor")
@@ -34,6 +35,8 @@ if __name__ == "__main__":
 
     logger.info("DataProcessor | main | Запуск main VisualProcessor")
 
+    st = time.time()
+
     cmd = [
         f"{_path}/VisualProcessor/.venv/bin/python",
         f"{_path}/VisualProcessor/main.py",
@@ -42,3 +45,6 @@ if __name__ == "__main__":
 
     subprocess.run(cmd)
 
+    en = round(time.time() - st, 2)
+
+    logger.info(f"DataProcessor | main | Все модули VisualProcessor отработали | Time: {en}")

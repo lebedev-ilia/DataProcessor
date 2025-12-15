@@ -5,11 +5,14 @@ modules:
     detalize_face_modules: false
     emotion_face: false
     behavioral: false
-    optical_flow: false
-    action_recognition: false
-    color_light: false
-    frames_composition: false
+    optical_flow: true
+    action_recognition: true
+    color_light: true
+    frames_composition: true
     shot_quality: true
+    cut_detection: true
+    video_pacing: true
+    story_structure: true
 
 global:
     root_path: "/home/ilya/Рабочий стол/TrendFlowML/DataProcessor"
@@ -31,7 +34,7 @@ scene_classification:
     batch_size: 1
     min_scene_length: 20
     device: "cuda"
-    categories_path: "VisualProcessor/modules/scene_classification"
+    categories_path: "VisualProcessor/modules/scene_classification/categories_places365.txt"
     cache_dir: null
     gpu_memory_threshold: 0.95
     log_metrics_every_n_frames: 10
@@ -155,3 +158,17 @@ frames_composition:
 
 shot_quality:
     device: "cuda"
+
+cut_detection:
+    device: "cuda"
+    use_clip: true
+    use_deep_features: true
+
+video_pacing:
+    batch_size: 6
+    downscale_factor: 0.5
+
+story_structure:
+    clip_model: "ViT-B/32"
+    sentence_model: "all-MiniLM-L6-v2"
+    subtitles: "Hello everyone,Welcome to my vlog,Today we will..."

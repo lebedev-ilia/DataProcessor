@@ -19,6 +19,9 @@ def load_json(path):
     with open(path, 'r', encoding='utf-8') as f:
         return json.load(f)
 
+from utils.logger import get_logger
+logger = get_logger(name)
+
 if __name__ == "__main__":
     parser = argparse.ArgumentParser(
         description='Анализ поведения людей в видео',
@@ -78,3 +81,4 @@ if __name__ == "__main__":
     
     rs.store(results, name=name)
 
+    logger.info("Behavioral | main | Результат сохранен")
