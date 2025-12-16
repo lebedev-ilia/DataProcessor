@@ -191,8 +191,7 @@ def compute_frame_motion_features(flow: np.ndarray,
     try:
         hist, _ = np.histogram(ang.ravel(), bins=36, range=(-math.pi, math.pi))
         p = hist / (hist.sum() + 1e-9)
-        motion_entropy = _safe_float(-np.sum([float(x) * math.log(float(x) + 1e-12)
-                                              for x in p if x > 0]))
+        motion_entropy = _safe_float(-np.sum([float(x) * math.log(float(x) + 1e-12) for x in p if x > 0]))
     except Exception:
         motion_entropy = 0.0
 

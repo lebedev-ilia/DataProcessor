@@ -898,6 +898,7 @@ class FlowStatisticsAnalyzer:
                     continue
             
             per_frame = []
+            
             prev = None
             for flow in flows:
                 feats = compute_frame_motion_features(flow, flow_prev=prev, mag_bg_thresh=mag_bg_thresh)
