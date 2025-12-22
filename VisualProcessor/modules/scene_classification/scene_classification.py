@@ -74,6 +74,7 @@ class Places365SceneClassifier:
         model_arch: str = "resnet50",
         use_timm: bool = False,
         min_scene_length: int = 30,
+        min_scene_seconds: Optional[float] = None,
         batch_size: int = 1,
         device: Optional[str] = None,
         categories_path: Optional[str] = None,
@@ -108,10 +109,16 @@ class Places365SceneClassifier:
         :param use_multi_crop: enable multi-crop inference (5 crops: center + 4 corners)
         :param temporal_smoothing: enable temporal smoothing for video sequences
         :param smoothing_window: window size for temporal smoothing (number of frames)
+        :param min_scene_seconds: minimal scene length in seconds (fps‑aware). If None,
+            value will be derived from ``min_scene_length`` and runtime FPS.
         :param enable_advanced_features: enable advanced features (indoor/outdoor, time of day, etc.)
         :param use_clip_for_semantics: use CLIP for semantic features (aesthetic, atmosphere)
         """
-        self.min_scene_length = min_scene_length
+        # Store both frame‑based and time‑based scene length thresholds.
+        # Frame threshold is kept for backwards compatibility, but aggregation
+        # logic is fps‑aware and primarily uses seconds.
+        self.min_scene_length_frames = max(1, int(min_scene_length))
+        self.min_scene_seconds = float(min_scene_seconds) if min_scene_seconds is not None else None
         self.device = device or ("cuda" if torch.cuda.is_available() else "cpu")
         self.batch_size = max(1, batch_size)
         self.input_size = input_size
@@ -298,17 +305,45 @@ class Places365SceneClassifier:
         batch_predictions: List[List[Dict[str, Any]]] = []
 
         for sample_probs in probs:  # sample_probs: [num_classes]
-            frame_predictions = []
+            # --- Global confidence statistics for this frame ---
+            # Shannon entropy over class probabilities
+            entropy_val = float(
+                -torch.sum(sample_probs * torch.log(sample_probs + 1e-8)).item()
+            )
+
+            # Top‑K (for ontology‑based features later)
+            top_k = min(5, sample_probs.shape[0])
+            topk_vals, topk_indices = torch.topk(sample_probs, k=top_k)
+            top1_prob_val = float(topk_vals[0].item())
+            top2_prob_val = float(topk_vals[1].item()) if top_k > 1 else 0.0
+            top1_top2_gap = float(max(0.0, top1_prob_val - top2_prob_val))
+            topk_indices_list = [int(i.item()) for i in topk_indices]
+            topk_probs_list = [float(v.item()) for v in topk_vals]
+            top1_idx = topk_indices_list[0]
+
+            frame_predictions: List[Dict[str, Any]] = []
             for class_idx, prob in enumerate(sample_probs):
                 label = (
                     self.categories[class_idx]
                     if 0 <= class_idx < len(self.categories)
                     else f"class_{class_idx}"
                 )
-                frame_predictions.append({
+                entry: Dict[str, Any] = {
                     "label": label,
-                    "score": float(prob)
-                })
+                    "score": float(prob),
+                    # Per‑frame confidence summary (same for all classes for this frame)
+                    "entropy": entropy_val,
+                    "top1_prob": top1_prob_val,
+                    "top2_prob": top2_prob_val,
+                    "top1_top2_gap": top1_top2_gap,
+                    "class_idx": int(class_idx),
+                }
+                # Store compact top‑K only once (on the top‑1 entry) to avoid bloat.
+                if class_idx == top1_idx:
+                    entry["topk_class_indices"] = topk_indices_list
+                    entry["topk_class_probs"] = topk_probs_list
+
+                frame_predictions.append(entry)
 
             batch_predictions.append(frame_predictions)
 
@@ -506,7 +541,7 @@ class Places365SceneClassifier:
     
     def _init_scene_mappings(self) -> None:
         """Initialize mappings for indoor/outdoor and nature/urban classification."""
-        # Indoor keywords
+        # Indoor keywords (used as a simple ontology over Places365 labels)
         self.indoor_keywords = [
             "room", "bedroom", "kitchen", "bathroom", "living", "dining", "office",
             "hall", "corridor", "staircase", "attic", "basement", "garage", "shop",
@@ -558,51 +593,82 @@ class Places365SceneClassifier:
             logger.warning(f"Failed to load CLIP model: {e}. Semantic features will be limited.")
             self.use_clip_for_semantics = False
     
-    def _classify_indoor_outdoor(self, scene_label: str) -> Dict[str, float]:
+    def _ontology_indoor_outdoor(
+        self,
+        topk_labels: Sequence[str],
+        topk_probs: Sequence[float],
+    ) -> Dict[str, float]:
         """
-        Classify scene as indoor or outdoor based on Places365 label.
-        
-        :param scene_label: Scene label from Places365
-        :return: Dictionary with indoor/outdoor probabilities
+        Soft indoor/outdoor score based on ontology mapping of top‑K Places labels.
+
+        indoor_score = sum(prob_i * I(label_i is indoor))
+        outdoor_score = sum(prob_i * I(label_i is outdoor))
         """
-        label_lower = scene_label.lower()
-        
-        indoor_score = sum(1 for keyword in self.indoor_keywords if keyword in label_lower)
-        outdoor_score = sum(1 for keyword in self.outdoor_keywords if keyword in label_lower)
-        
+        if not topk_labels or not topk_probs:
+            return {"indoor": 0.5, "outdoor": 0.5}
+
+        indoor_score = 0.0
+        outdoor_score = 0.0
+
+        for label, p in zip(topk_labels, topk_probs):
+            p = float(p)
+            lname = label.lower()
+            has_indoor = any(k in lname for k in self.indoor_keywords)
+            has_outdoor = any(k in lname for k in self.outdoor_keywords)
+
+            if has_indoor and not has_outdoor:
+                indoor_score += p
+            elif has_outdoor and not has_indoor:
+                outdoor_score += p
+            elif has_indoor and has_outdoor:
+                indoor_score += 0.5 * p
+                outdoor_score += 0.5 * p
+
         total = indoor_score + outdoor_score
-        if total == 0:
-            # Default: try to infer from label structure
-            if any(word in label_lower for word in ["room", "hall", "indoor"]):
-                return {"indoor": 0.7, "outdoor": 0.3}
-            else:
-                return {"indoor": 0.5, "outdoor": 0.5}
-        
-        indoor_prob = indoor_score / total
-        outdoor_prob = outdoor_score / total
-        
-        return {"indoor": indoor_prob, "outdoor": outdoor_prob}
-    
-    def _classify_nature_urban(self, scene_label: str) -> Dict[str, float]:
+        if total <= 0.0:
+            return {"indoor": 0.5, "outdoor": 0.5}
+
+        return {
+            "indoor": float(indoor_score / total),
+            "outdoor": float(outdoor_score / total),
+        }
+
+    def _ontology_nature_urban(
+        self,
+        topk_labels: Sequence[str],
+        topk_probs: Sequence[float],
+    ) -> Dict[str, float]:
         """
-        Classify scene as nature or urban based on Places365 label.
-        
-        :param scene_label: Scene label from Places365
-        :return: Dictionary with nature/urban probabilities
+        Soft nature/urban score based on ontology mapping of top‑K Places labels.
         """
-        label_lower = scene_label.lower()
-        
-        nature_score = sum(1 for keyword in self.nature_keywords if keyword in label_lower)
-        urban_score = sum(1 for keyword in self.urban_keywords if keyword in label_lower)
-        
-        total = nature_score + urban_score
-        if total == 0:
+        if not topk_labels or not topk_probs:
             return {"nature": 0.5, "urban": 0.5}
-        
-        nature_prob = nature_score / total
-        urban_prob = urban_score / total
-        
-        return {"nature": nature_prob, "urban": urban_prob}
+
+        nature_score = 0.0
+        urban_score = 0.0
+
+        for label, p in zip(topk_labels, topk_probs):
+            p = float(p)
+            lname = label.lower()
+            has_nature = any(k in lname for k in self.nature_keywords)
+            has_urban = any(k in lname for k in self.urban_keywords)
+
+            if has_nature and not has_urban:
+                nature_score += p
+            elif has_urban and not has_nature:
+                urban_score += p
+            elif has_nature and has_urban:
+                nature_score += 0.5 * p
+                urban_score += 0.5 * p
+
+        total = nature_score + urban_score
+        if total <= 0.0:
+            return {"nature": 0.5, "urban": 0.5}
+
+        return {
+            "nature": float(nature_score / total),
+            "urban": float(urban_score / total),
+        }
     
     def _detect_time_of_day(self, frame: np.ndarray) -> Dict[str, float]:
         """
@@ -901,13 +967,23 @@ class Places365SceneClassifier:
             "depth_cues": float(np.clip(depth_cues, 0.0, 1.0))
         }
     
-    def aggregate_scenes(self, res, min_scene_length: int = 30):
+    def aggregate_scenes(self, res, fps: float) -> Dict[str, Any]:
         """
         Aggregate consecutive frames with the same scene label.
 
         Args:
             res: dict[frame_idx] = {
-                "predictions": {"label": str, "score": float},
+                "predictions": {
+                    "label": str,
+                    "score": float,
+                    "entropy": float,
+                    "top1_prob": float,
+                    "top2_prob": float,
+                    "top1_top2_gap": float,
+                    "class_idx": int,
+                    "topk_class_indices": Optional[List[int]],
+                    "topk_class_probs": Optional[List[float]],
+                },
                 "advanced_features": {
                     "indoor_outdoor": {"indoor": float, "outdoor": float},
                     "nature_urban": {"nature": float, "urban": float},
@@ -918,7 +994,7 @@ class Places365SceneClassifier:
                     "geometric_features": {"openness": float, "clutter": float, "depth_cues": float}
                 }
             }
-            min_scene_length: minimal number of consecutive frames for a segment to be included
+            fps: frames per second for current video (used for time‑based stats)
 
         Returns:
             dict: aggregated segments with means and indices
@@ -928,29 +1004,142 @@ class Places365SceneClassifier:
         if not res:
             return {}
 
-        aggregated = {}
+        aggregated: Dict[str, Any] = {}
         current_label = None
         current_indices = []
         current_values = None
+        current_topk_indices: List[Sequence[int]] = []
+        current_topk_probs: List[Sequence[float]] = []
 
         def reset_values():
             return {
-                "score": [],
+                "score": [], "entropy": [],
+                "top1_prob": [], "top2_prob": [], "top1_top2_gap": [],
                 "indoor": [], "outdoor": [],
                 "nature": [], "urban": [],
                 "morning": [], "day": [], "evening": [], "night": [],
                 "aesthetic_score": [], "luxury_score": [],
                 "cozy": [], "scary": [], "epic": [], "neutral": [],
-                "openness": [], "clutter": [], "depth_cues": []
+                "openness": [], "clutter": [], "depth_cues": [],
+                "labels": [],
             }
 
-        def finalize_segment(label, indices, values):
-            """Return mean-aggregated segment dict."""
-            if (indices[-1] - indices[0]) < min_scene_length:  # исправлено
+        def finalize_segment(label, indices, values, topk_idx_seq, topk_prob_seq):
+            """Return aggregated segment dict."""
+            if not indices:
                 return None
+            # FPS‑aware duration
+            length_frames = len(indices)
+            fps_safe = float(fps) if fps and fps > 0 else 30.0
+            length_seconds = float(length_frames) / fps_safe
+
+            # Determine minimal duration in seconds
+            if self.min_scene_seconds is not None:
+                min_len_s = self.min_scene_seconds
+            else:
+                # Backwards‑compatible: interpret frame threshold at runtime FPS
+                min_len_s = float(self.min_scene_length_frames) / fps_safe
+
+            if length_seconds < min_len_s:
+                return None
+
+            start_frame = int(indices[0])
+            end_frame = int(indices[-1])
+
+            # Scene‑level time‑of‑day distribution
+            tod_vec = np.array([
+                np.mean(values["morning"]),
+                np.mean(values["day"]),
+                np.mean(values["evening"]),
+                np.mean(values["night"]),
+            ], dtype=np.float32)
+            tod_sum = float(tod_vec.sum()) or 1.0
+            tod_probs = (tod_vec / tod_sum).tolist()
+            tod_top_idx = int(np.argmax(tod_vec))
+            tod_labels = ["morning", "day", "evening", "night"]
+            tod_top_label = tod_labels[tod_top_idx]
+            tod_conf = float(tod_vec[tod_top_idx])
+
+            # Aesthetic / luxury aggregates
+            aesthetic_arr = np.asarray(values["aesthetic_score"], dtype=np.float32)
+            luxury_arr = np.asarray(values["luxury_score"], dtype=np.float32)
+            aesthetic_mean = float(np.mean(aesthetic_arr)) if aesthetic_arr.size else 0.0
+            aesthetic_std = float(np.std(aesthetic_arr)) if aesthetic_arr.size else 0.0
+            aesthetic_frac_high = float(np.mean(aesthetic_arr > 0.8)) if aesthetic_arr.size else 0.0
+            luxury_mean = float(np.mean(luxury_arr)) if luxury_arr.size else 0.0
+
+            # Atmosphere entropy
+            atm_mat = np.stack(
+                [
+                    np.asarray(values["cozy"], dtype=np.float32),
+                    np.asarray(values["scary"], dtype=np.float32),
+                    np.asarray(values["epic"], dtype=np.float32),
+                    np.asarray(values["neutral"], dtype=np.float32),
+                ],
+                axis=0,
+            )
+            atm_mean = atm_mat.mean(axis=1)
+            atm_sum = float(atm_mean.sum()) or 1.0
+            atm_probs = atm_mean / atm_sum
+            atm_entropy = float(-np.sum(atm_probs * np.log(atm_probs + 1e-8)))
+
+            # Label stability
+            labels = values["labels"]
+            if labels:
+                from collections import Counter
+                cnt = Counter(labels)
+                scene_label = cnt.most_common(1)[0][0]
+                label_stability = float(cnt[scene_label] / len(labels))
+            else:
+                scene_label = label
+                label_stability = 0.0
+
+            # Scene change score: within‑scene variance of confidence
+            score_arr = np.asarray(values["score"], dtype=np.float32)
+            scene_change_score = float(np.std(score_arr)) if score_arr.size else 0.0
+
+            # Places confidence aggregates
+            top1_arr = np.asarray(values["top1_prob"], dtype=np.float32)
+            entropy_arr = np.asarray(values["entropy"], dtype=np.float32)
+            gap_arr = np.asarray(values["top1_top2_gap"], dtype=np.float32)
+            places_top1_prob_mean = float(np.mean(top1_arr)) if top1_arr.size else 0.0
+            places_entropy_mean = float(np.mean(entropy_arr)) if entropy_arr.size else 0.0
+            places_top1_vs_top2_gap_mean = float(np.mean(gap_arr)) if gap_arr.size else 0.0
+            fraction_high_confidence_frames = (
+                float(np.mean(top1_arr > 0.7)) if top1_arr.size else 0.0
+            )
+
+            # Dominant Places top‑K ids aggregated over scene
+            dominant_topk_ids: List[int] = []
+            dominant_topk_probs: List[float] = []
+            if topk_idx_seq:
+                from collections import Counter
+
+                # Flatten indices and accumulate weights using probs
+                weight_by_class: Dict[int, float] = {}
+                for idx_list, prob_list in zip(topk_idx_seq, topk_prob_seq):
+                    for cid, p in zip(idx_list, prob_list):
+                        weight_by_class[int(cid)] = weight_by_class.get(int(cid), 0.0) + float(p)
+                if weight_by_class:
+                    # Take top‑5 by accumulated weight
+                    sorted_items = sorted(
+                        weight_by_class.items(), key=lambda x: x[1], reverse=True
+                    )
+                    for cid, w in sorted_items[:5]:
+                        dominant_topk_ids.append(int(cid))
+                        dominant_topk_probs.append(float(w))
+
             return {
                 "indices": indices,
+                "start_frame": start_frame,
+                "end_frame": end_frame,
+                "length_frames": length_frames,
+                "length_seconds": length_seconds,
                 "mean_score": float(np.mean(values["score"])),
+                "class_entropy_mean": places_entropy_mean,
+                "top1_prob_mean": places_top1_prob_mean,
+                "top1_vs_top2_gap_mean": places_top1_vs_top2_gap_mean,
+                "fraction_high_confidence_frames": fraction_high_confidence_frames,
                 "mean_indoor": float(np.mean(values["indoor"])),
                 "mean_outdoor": float(np.mean(values["outdoor"])),
                 "mean_nature": float(np.mean(values["nature"])),
@@ -959,15 +1148,30 @@ class Places365SceneClassifier:
                 "mean_day": float(np.mean(values["day"])),
                 "mean_evening": float(np.mean(values["evening"])),
                 "mean_night": float(np.mean(values["night"])),
-                "mean_aesthetic_score": float(np.mean(values["aesthetic_score"])),
-                "mean_luxury_score": float(np.mean(values["luxury_score"])),
+                "time_of_day_probs": {
+                    "morning": tod_probs[0],
+                    "day": tod_probs[1],
+                    "evening": tod_probs[2],
+                    "night": tod_probs[3],
+                },
+                "time_of_day_top": tod_top_label,
+                "time_of_day_confidence": tod_conf,
+                "mean_aesthetic_score": aesthetic_mean,
+                "aesthetic_std": aesthetic_std,
+                "aesthetic_frac_high": aesthetic_frac_high,
+                "mean_luxury_score": luxury_mean,
                 "mean_cozy": float(np.mean(values["cozy"])),
                 "mean_scary": float(np.mean(values["scary"])),
                 "mean_epic": float(np.mean(values["epic"])),
                 "mean_neutral": float(np.mean(values["neutral"])),
+                "atmosphere_entropy": atm_entropy,
                 "mean_openness": float(np.mean(values["openness"])),
                 "mean_clutter": float(np.mean(values["clutter"])),
-                "mean_depth_cues": float(np.mean(values["depth_cues"]))
+                "mean_depth_cues": float(np.mean(values["depth_cues"])),
+                "scene_change_score": scene_change_score,
+                "label_stability": label_stability,
+                "dominant_places_topk_ids": dominant_topk_ids,
+                "dominant_places_topk_probs": dominant_topk_probs,
             }
 
         for idx in sorted(res.keys()):
@@ -976,19 +1180,36 @@ class Places365SceneClassifier:
 
             if current_label != label:
                 if current_label is not None:
-                    segment = finalize_segment(current_label, current_indices, current_values)
+                    segment = finalize_segment(
+                        current_label, current_indices, current_values,
+                        current_topk_indices, current_topk_probs,
+                    )
                     if segment:
                         aggregated[f"{current_label}_{current_indices[0]}"] = segment
                 # Start new segment
                 current_label = label
                 current_indices = [idx]
                 current_values = reset_values()
+                current_topk_indices = []
+                current_topk_probs = []
             else:
                 current_indices.append(idx)
 
             # Fill values
             adv = d["advanced_features"]
             current_values["score"].append(d["predictions"]["score"])
+            current_values["entropy"].append(d["predictions"].get("entropy", 0.0))
+            current_values["top1_prob"].append(d["predictions"].get("top1_prob", d["predictions"]["score"]))
+            current_values["top2_prob"].append(d["predictions"].get("top2_prob", 0.0))
+            current_values["top1_top2_gap"].append(d["predictions"].get("top1_top2_gap", 0.0))
+            current_values["labels"].append(label)
+
+            tk_idx = d["predictions"].get("topk_class_indices")
+            tk_prob = d["predictions"].get("topk_class_probs")
+            if tk_idx is not None and tk_prob is not None:
+                current_topk_indices.append(tk_idx)
+                current_topk_probs.append(tk_prob)
+
             current_values["indoor"].append(adv["indoor_outdoor"]["indoor"])
             current_values["outdoor"].append(adv["indoor_outdoor"]["outdoor"])
             current_values["nature"].append(adv["nature_urban"]["nature"])
@@ -1012,7 +1233,10 @@ class Places365SceneClassifier:
 
         # Final segment
         if current_label is not None:
-            segment = finalize_segment(current_label, current_indices, current_values)
+            segment = finalize_segment(
+                current_label, current_indices, current_values,
+                current_topk_indices, current_topk_probs,
+            )
             if segment:
                 aggregated[f"{current_label}_{current_indices[0]}"] = segment
 
@@ -1031,24 +1255,26 @@ class Places365SceneClassifier:
             }
         """
         
-        # Base predictions (already best-only)
+        # Base predictions (already best-only, but enriched with confidence stats)
         base_predictions = self.classify(frame_manager, frame_indices)
 
-        # If advanced features disabled — simple wrapper
+        # If advanced features disabled — simple scene aggregation with numeric stats
         if not self.enable_advanced_features:
-            return [
-                {
+            results = {
+                frame_idx: {
                     "predictions": pred,
                     "advanced_features": None
                 }
-                for pred in base_predictions
-            ]
+                for frame_idx, pred in zip(frame_indices, base_predictions)
+                if pred is not None
+            }
+            fps = getattr(frame_manager, "fps", 30.0)
+            return self.aggregate_scenes(results, fps=fps)
 
-        # Allocate output list (positional, not indexed by frame ID)
-        results = {}
+        # Allocate output dict indexed by frame ID
+        results: Dict[int, Dict[str, Any]] = {}
 
         for frame_idx, pred in zip(frame_indices, base_predictions):
-            
             frame = frame_manager.get(frame_idx)
 
             # No frame OR no prediction → no features
@@ -1059,14 +1285,20 @@ class Places365SceneClassifier:
                 }
                 continue
 
-            # Best scene prediction
+            # Best scene prediction and top‑K info
             top_scene = pred["label"]
+            topk_indices = pred.get("topk_class_indices") or []
+            topk_probs = pred.get("topk_class_probs") or []
+            topk_labels = [
+                self.categories[i] if 0 <= i < len(self.categories) else f"class_{i}"
+                for i in topk_indices
+            ]
 
             # Compute advanced features
-            advanced = {}
+            advanced: Dict[str, Any] = {}
 
-            advanced["indoor_outdoor"] = self._classify_indoor_outdoor(top_scene)
-            advanced["nature_urban"] = self._classify_nature_urban(top_scene)
+            advanced["indoor_outdoor"] = self._ontology_indoor_outdoor(topk_labels, topk_probs)
+            advanced["nature_urban"] = self._ontology_nature_urban(topk_labels, topk_probs)
             advanced["time_of_day"] = self._detect_time_of_day(frame)
             advanced["aesthetic_score"] = self._calculate_aesthetic_score(frame, top_scene)
             advanced["luxury_score"] = self._calculate_luxury_score(frame, top_scene)
@@ -1078,7 +1310,8 @@ class Places365SceneClassifier:
                 "advanced_features": advanced
             }
 
-        agg_result = self.aggregate_scenes(results, self.min_scene_length)
+        fps = getattr(frame_manager, "fps", 30.0)
+        agg_result = self.aggregate_scenes(results, fps=fps)
 
         return agg_result
 

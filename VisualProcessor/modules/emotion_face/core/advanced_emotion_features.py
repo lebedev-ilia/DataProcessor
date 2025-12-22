@@ -15,7 +15,8 @@ def detect_micro_expressions(
     fps: float = 30.0,
     min_duration_sec: float = 0.03,
     max_duration_sec: float = 0.5,
-    change_threshold: float = 0.4
+    change_threshold: Optional[float] = None,
+    min_frames: int = 2
 ) -> Dict[str, Any]:
     """
     Детектирует микроэмоции - резкие изменения эмоций длительностью 0.03-0.5 секунды.
@@ -25,7 +26,8 @@ def detect_micro_expressions(
         fps: Частота кадров
         min_duration_sec: Минимальная длительность микроэмоции (сек)
         max_duration_sec: Максимальная длительность микроэмоции (сек)
-        change_threshold: Порог изменения для детекции (0-1)
+        change_threshold: Порог изменения для детекции (0-1). Если None, используется adaptive threshold (85th percentile)
+        min_frames: Минимальное количество кадров для микроэмоции (рекомендуется >= 2)
     
     Returns:
         Словарь с информацией о микроэмоциях
@@ -74,15 +76,23 @@ def detect_micro_expressions(
         else:
             emotion_changes.append(0.0)
     
-    # Комбинированное изменение
+    # Комбинированное изменение: sqrt(Δv² + Δa²) + emotion_change
     combined_changes = [
-        (v + a + e) / 3.0 
+        np.sqrt(v**2 + a**2) + e * 0.5
         for v, a, e in zip(valence_changes, arousal_changes, emotion_changes)
     ]
     
+    # Adaptive threshold: use 85th percentile if threshold not provided
+    if change_threshold is None:
+        if len(combined_changes) > 0:
+            change_threshold = float(np.percentile(combined_changes, 85))
+        else:
+            change_threshold = 0.4
+    
     # Детекция резких изменений (микроэмоций)
-    min_duration_frames = max(1, int(min_duration_sec * fps))
-    max_duration_frames = int(max_duration_sec * fps)
+    # min_frames: require at least 2 frames (at 30fps, 0.03s ≈ 1 frame, which is too short)
+    min_duration_frames = max(min_frames, int(min_duration_sec * fps))
+    max_duration_frames = min(int(max_duration_sec * fps), 15)  # Cap at 15 frames
     
     microexpressions = []
     in_microexpression = False
@@ -139,7 +149,7 @@ def detect_micro_expressions(
     
     # Обрабатываем незавершенную микроэмоцию
     if in_microexpression and micro_start is not None:
-        duration_frames = len(combined_changes) - micro_start
+        duration_frames = len(combined_changes) - micro_start + 1  # +1 to include start frame
         if min_duration_frames <= duration_frames <= max_duration_frames:
             duration_sec = duration_frames / fps
             start_emotion = emotions[micro_start]
@@ -195,13 +205,17 @@ def compute_physiological_signals(
     """
     Вычисляет физиологические сигналы: стресс, уверенность, нервозность.
     
+    ⚠️ NOTE: These are heuristic-based scores. For production use, consider training
+    a learned meta-model (X -> label) with labeled data or weak supervision.
+    Current implementation uses rule-based heuristics as initial estimates.
+    
     Args:
         emotions: Список словарей с эмоциями
         microexpressions: Результат detect_micro_expressions (опционально)
         fps: Частота кадров
     
     Returns:
-        Словарь с физиологическими индексами
+        Словарь с физиологическими индексами (heuristic-based, not validated)
     """
     if not emotions:
         return {
@@ -496,9 +510,10 @@ def compute_face_asymmetry(
     overall_symmetry = 1.0 - asymmetry_score
     
     # Оценка искренности
-    # Высокая симметрия + умеренная асимметрия = более естественно
-    # Слишком высокая симметрия может быть подозрительной (идеальная симметрия редко встречается)
-    # Слишком высокая асимметрия может указывать на напряжение или неискренность
+    # ⚠️ WARNING: sincerity_score is a research/audit-only metric.
+    # It should NOT be used in production models without clinical validation and legal review.
+    # This is based on pseudoscientific assumptions about facial asymmetry and emotion.
+    # Use only for research purposes or as an initial heuristic, not as a final metric.
     ideal_symmetry_range = (0.7, 0.95)  # Идеальный диапазон
     if overall_symmetry < ideal_symmetry_range[0]:
         sincerity_score = overall_symmetry / ideal_symmetry_range[0] * 0.5
@@ -517,7 +532,8 @@ def compute_face_asymmetry(
         "mouth_asymmetry": float(mouth_asymmetry),
         "eye_asymmetry": float(eye_asymmetry),
         "overall_symmetry": float(overall_symmetry),
-        "sincerity_score": float(sincerity_score)
+        "sincerity_score": float(sincerity_score),  # ⚠️ AUDIT-ONLY / RESEARCH: Not validated for production use
+        "_sincerity_warning": "This metric is research-only and should not be used in production without clinical validation"
     }
 
 

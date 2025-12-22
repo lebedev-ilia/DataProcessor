@@ -19,20 +19,28 @@ class MotionEnergyImage:
     """Класс для вычисления Motion Energy Image (MEI) и Motion History Image (MHI)."""
     
     @staticmethod
-    def compute_mei(flow_magnitudes: List[np.ndarray], 
-                    decay_factor: float = 0.9) -> Tuple[np.ndarray, Dict[str, float]]:
+    def compute_mei(flow_magnitudes: List[np.ndarray],
+                   fps: float = 25.0,
+                   frame_skip: int = 1,
+                   tau_seconds: float = 1.0) -> Tuple[np.ndarray, Dict[str, float]]:
         """
         Вычисляет Motion Energy Image (MEI) - бинарное изображение движения.
         
         Args:
             flow_magnitudes: Список массивов величины движения [H, W] для каждого кадра
-            decay_factor: Фактор затухания для MHI (0-1)
+            fps: кадров в секунду
+            frame_skip: шаг между кадрами
+            tau_seconds: временная константа затухания MHI
             
         Returns:
             (mei, features_dict): MEI изображение и словарь фичей
         """
         if not flow_magnitudes:
             return np.zeros((1, 1)), {}
+        
+        frame_dt = frame_skip / max(fps, 1e-6)
+        decay_factor = float(np.exp(-frame_dt / max(tau_seconds, 1e-6)))
+        decay_factor = float(np.clip(decay_factor, 0.0, 1.0))
         
         # Нормализуем все к одному размеру
         h, w = flow_magnitudes[0].shape

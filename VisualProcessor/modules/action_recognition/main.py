@@ -15,7 +15,7 @@ from typing import Optional
 
 import numpy as np
 
-from action_recognition_videomae import VideoMAEActionRecognizer
+from action_recognition_slowfast import SlowFastActionRecognizer
 from utils.frame_manager import FrameManager
 from utils.results_store import ResultsStore
 
@@ -51,40 +51,29 @@ def process_video(
     if not model_dir:
         model_dir = f"{os.path.dirname(__file__)}/models"
             
-    recognizer = VideoMAEActionRecognizer(
+    recognizer = SlowFastActionRecognizer(
         frame_manager=frame_manager,
-        model_name=str(model_dir),
+        model_name=str(model_dir) if model_dir else None,
         clip_len=clip_len,
         batch_size=batch_size
     )
     
-    # Подготавливаем треки (для простоты используем равномерную выборку)
-    # В реальном сценарии треки должны приходить из модуля трекинга
-    logger.info(f"[INFO] Подготавливаю треки для обработки...")
+    # Подготавливаем треки.
+    # В реальном сценарии треки должны приходить из модуля трекинга (YOLO + ByteTrack и т.п.).
+    # CLI-обвязка по умолчанию обрабатывает всё видео как один трек (single-person).
+    logger.info(f"[INFO] Подготавливаю треки для обработки (single-track режим)...")
     
-    # Создаем треки на основе равномерной выборки кадров
-    # Для демонстрации создаем несколько треков
-    num_tracks = min(5, max_tracks or 5)  # По умолчанию 5 треков
-    track_length = total_frames // num_tracks
+    frame_indices_per_person = {
+        1: list(range(0, total_frames))
+    }
     
-    frame_indices_per_person = {}
-    for track_id in range(1, num_tracks + 1):
-        start_frame = (track_id - 1) * track_length
-        end_frame = min(track_id * track_length, total_frames - 1)
-        
-        # Выбираем кадры с учетом frame_skip
-        indices = list(range(start_frame, end_frame + 1))
-        if indices:
-            frame_indices_per_person[track_id] = indices
-    
-    logger.info(f"[INFO] Обрабатываю {len(frame_indices_per_person)} треков...")
+    logger.info(f"[INFO] Обрабатываю {len(frame_indices_per_person)} трек(ов)...")
     
     # Обрабатываем треки
     results = recognizer.process(frame_indices_per_person)
     
     # Добавляем метаданные
     output_data = {
-        "model_dir": str(model_dir),
         "total_frames": total_frames,
         "num_tracks": len(results),
         "processing_params": {
@@ -115,10 +104,12 @@ def process_video(
     # Выводим краткую статистику
     for track_id, track_results in results.items():
         logger.info(f"\n  Трек {track_id}:")
-        logger.info(f"    Доминирующее действие: {track_results.get('dominant_action_label', 'unknown')}")
-        logger.info(f"    Уверенность: {track_results.get('dominant_confidence', 0.0):.2f}")
-        logger.info(f"    Сложность действия: {track_results.get('complexity_score', 0.0):.2f}")
-        logger.info(f"    Тип активности сцены: {track_results.get('scene_activity_type', 'unknown')}")
+        logger.info(f"    Средняя норма embedding: {track_results.get('mean_embedding_norm', 0.0):.2f}")
+        logger.info(f"    Временная вариация: {track_results.get('temporal_variance', 0.0):.2f}")
+        logger.info(f"    Уникальных действий: {track_results.get('num_unique_actions', 0)}")
+        logger.info(f"    Стабильность: {track_results.get('stability', 0.0):.2f}")
+        logger.info(f"    Частота смены действий: {track_results.get('switch_rate_per_sec', 0.0):.2f} сек^-1")
+        logger.info(f"    Многолюдная сцена: {track_results.get('is_multi_person', False)}")
     
     return output_data
 
@@ -141,7 +132,7 @@ def _convert_to_json(obj):
 
 def main():
     parser = argparse.ArgumentParser(
-        description='Распознавание действий в видео с использованием VideoMAE',
+        description='Распознавание действий в видео с использованием SlowFast',
         formatter_class=argparse.ArgumentDefaultsHelpFormatter
     )
     

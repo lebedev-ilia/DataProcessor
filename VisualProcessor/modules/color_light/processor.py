@@ -36,192 +36,218 @@ class ColorLightProcessor:
         self.stride = stride
     
     def _compute_rgb_stats(self, frame: np.ndarray) -> Dict[str, float]:
-        """Вычисляет RGB статистики: mean/std/min/max/skew/kurt для каждого канала"""
-        features = {}
-        for i, channel in enumerate(['R', 'G', 'B']):
+        """
+        Базовые RGB‑статистики: только mean/std по каналам.
+        Мин/макс, skew и kurtosis убраны как слабоинформативные и сильно коррелирующие.
+        """
+        features: Dict[str, float] = {}
+        for i, channel in enumerate(["R", "G", "B"]):
             channel_data = frame[:, :, i].flatten().astype(np.float32)
-            features[f'color_mean_{channel.lower()}'] = float(np.mean(channel_data))
-            features[f'color_std_{channel.lower()}'] = float(np.std(channel_data))
-            features[f'color_min_{channel.lower()}'] = float(np.min(channel_data))
-            features[f'color_max_{channel.lower()}'] = float(np.max(channel_data))
-            features[f'color_skew_{channel.lower()}'] = float(stats.skew(channel_data))
-            features[f'color_kurt_{channel.lower()}'] = float(stats.kurtosis(channel_data))
+            features[f"color_mean_{channel.lower()}"] = float(np.mean(channel_data))
+            features[f"color_std_{channel.lower()}"] = float(np.std(channel_data))
         return features
     
     def _compute_hsv_features(self, frame: np.ndarray) -> Dict[str, float]:
-        """Вычисляет HSV фичи: hue_mean/std/entropy, saturation_mean/std, value_mean/std"""
+        """
+        HSV‑фичи:
+        - hue_mean / hue_std / hue_entropy
+        - saturation_mean/std, value_mean/std
+        - нормализованные варианты и взвешенная по saturation энтропия hue.
+        """
         hsv = cv2.cvtColor(frame, cv2.COLOR_RGB2HSV)
-        features = {}
-        
-        # Hue
-        hue = hsv[:, :, 0].flatten()
-        features['hue_mean'] = float(np.mean(hue))
-        features['hue_std'] = float(np.std(hue))
-        # Энтропия hue (дискретизация для вычисления энтропии)
+        features: Dict[str, float] = {}
+
+        hue = hsv[:, :, 0].flatten().astype(np.float32)  # [0, 180]
+        sat = hsv[:, :, 1].flatten().astype(np.float32)  # [0, 255]
+        val = hsv[:, :, 2].flatten().astype(np.float32)  # [0, 255]
+
+        # Базовые статистики
+        hue_mean = float(np.mean(hue))
+        hue_std = float(np.std(hue))
+        features["hue_mean"] = hue_mean
+        features["hue_std"] = hue_std
+
         hue_hist, _ = np.histogram(hue, bins=36, range=(0, 180))
         hue_probs = hue_hist / (hue_hist.sum() + 1e-10)
-        features['hue_entropy'] = float(entropy(hue_probs + 1e-10))
-        
+        features["hue_entropy"] = float(entropy(hue_probs + 1e-10))
+
+        # Взвешенная по насыщенности энтропия hue
+        sat_norm = sat / 255.0
+        hue_hist_w, _ = np.histogram(hue, bins=36, range=(0, 180), weights=sat_norm)
+        hue_probs_w = hue_hist_w / (hue_hist_w.sum() + 1e-10)
+        features["hue_entropy_weighted"] = float(entropy(hue_probs_w + 1e-10))
+
         # Saturation
-        sat = hsv[:, :, 1].flatten()
-        features['saturation_mean'] = float(np.mean(sat))
-        features['saturation_std'] = float(np.std(sat))
-        
+        sat_mean = float(np.mean(sat))
+        sat_std = float(np.std(sat))
+        features["saturation_mean"] = sat_mean
+        features["saturation_std"] = sat_std
+
         # Value (brightness)
-        val = hsv[:, :, 2].flatten()
-        features['value_mean'] = float(np.mean(val))
-        features['value_std'] = float(np.std(val))
-        
+        val_mean = float(np.mean(val))
+        val_std = float(np.std(val))
+        features["value_mean"] = val_mean
+        features["value_std"] = val_std
+
+        # Нормализованные фичи (0–1) для трансформера
+        features["hue_mean_norm"] = hue_mean / 180.0
+        features["hue_std_norm"] = hue_std / 180.0
+        features["sat_mean_norm"] = sat_mean / 255.0
+        features["val_mean_norm"] = val_mean / 255.0
+
         return features
     
     def _compute_lab_features(self, frame: np.ndarray) -> Dict[str, float]:
-        """Вычисляет LAB фичи: L_mean, L_contrast, ab_balance"""
+        """Вычисляет LAB‑фичи: L_mean, L_contrast, ab_balance + нормализованный L."""
         lab = cv2.cvtColor(frame, cv2.COLOR_RGB2LAB)
-        features = {}
-        
-        # L channel (lightness)
-        L = lab[:, :, 0].flatten()
-        features['L_mean'] = float(np.mean(L))
-        features['L_contrast'] = float(np.std(L))
-        
-        # ab balance (тепло/холод)
-        a = lab[:, :, 1].flatten() - 128  # центрируем
-        b = lab[:, :, 2].flatten() - 128
-        features['ab_balance'] = float(np.mean(a) - np.mean(b))  # положительное = тепло
-        
+        features: Dict[str, float] = {}
+
+        L = lab[:, :, 0].flatten().astype(np.float32)  # [0, 255]
+        L_mean = float(np.mean(L))
+        L_std = float(np.std(L))
+        features["L_mean"] = L_mean
+        features["L_contrast"] = L_std
+
+        a = lab[:, :, 1].flatten().astype(np.float32) - 128.0
+        b = lab[:, :, 2].flatten().astype(np.float32) - 128.0
+        features["ab_balance"] = float(np.mean(a) - np.mean(b))
+
+        # Нормализованная яркость
+        features["L_mean_norm"] = L_mean / 255.0
+
         return features
     
     def _compute_palette_features(self, frame: np.ndarray) -> Dict[str, float]:
-        """Вычисляет палитру и гармонии: dominant/secondary/tertiary colors, palette_size, etc."""
-        features = {}
-        
-        # Уменьшаем разрешение для кластеризации
+        """
+        Палитра и цветовые признаки.
+        - KMeans в Lab‑пространстве (a,b) для устойчивых доминантных цветов.
+        - Индекс цветности, warm/cold ratio, skin_tone_ratio, color_palette_entropy.
+        - Доминантный цвет возвращается как нормализованные Lab‑координаты a,b.
+        """
+        features: Dict[str, float] = {}
+
         h, w = frame.shape[:2]
         sample_size = min(10000, h * w)
-        if h * w > sample_size:
-            step = int(np.sqrt(h * w / sample_size))
-            sampled = frame[::step, ::step].reshape(-1, 3)
+        if h * w > sample_size and h > 0 and w > 0:
+            step = int(max(1, np.sqrt(h * w / sample_size)))
+            sampled_rgb = frame[::step, ::step].reshape(-1, 3)
         else:
-            sampled = frame.reshape(-1, 3)
-        
-        # K-means для доминирующих цветов
-        n_colors = min(5, len(sampled))
-        if n_colors > 1:
-            kmeans = KMeans(n_clusters=n_colors, random_state=42, n_init=10)
-            kmeans.fit(sampled)
-            colors = kmeans.cluster_centers_.astype(int)
-            counts = Counter(kmeans.labels_)
-            
-            # Сортируем по частоте
-            sorted_colors = sorted(zip(colors, [counts[i] for i in range(n_colors)]), 
-                                 key=lambda x: x[1], reverse=True)
-            
-            for i, (color, count) in enumerate(sorted_colors[:3]):
-                if i == 0:
-                    features['dominant_color'] = color.tolist()
-                elif i == 1:
-                    features['secondary_color'] = color.tolist()
-                elif i == 2:
-                    features['tertiary_color'] = color.tolist()
-            
-            features['palette_size'] = float(len(set(kmeans.labels_)))
-        else:
-            features['dominant_color'] = [int(c) for c in sampled[0]]
-            features['secondary_color'] = [0, 0, 0]
-            features['tertiary_color'] = [0, 0, 0]
-            features['palette_size'] = 1.0
-        
-        # Colorfulness index (стандартное отклонение в цветовом пространстве)
+            sampled_rgb = frame.reshape(-1, 3)
+
+        # --- KMeans в Lab для доминантного цвета ---
+        if len(sampled_rgb) > 0:
+            lab = cv2.cvtColor(sampled_rgb.reshape(-1, 1, 3).astype(np.uint8), cv2.COLOR_RGB2LAB)
+            lab_flat = lab.reshape(-1, 3).astype(np.float32)
+            ab = lab_flat[:, 1:3]  # только a,b
+
+            n_colors = int(min(3, len(ab)))
+            if n_colors >= 1:
+                if n_colors == 1:
+                    centers = ab[:1]
+                    labels = np.zeros(len(ab), dtype=int)
+                else:
+                    kmeans = KMeans(n_clusters=n_colors, random_state=42, n_init=10)
+                    kmeans.fit(ab)
+                    centers = kmeans.cluster_centers_
+                    labels = kmeans.labels_
+
+                counts = Counter(labels)
+                # выбираем самый частый кластер
+                dominant_label = max(counts.items(), key=lambda x: x[1])[0]
+                dom_a, dom_b = centers[int(dominant_label)]
+
+                # сохраняем ненормированные и нормализованные координаты
+                features["dominant_lab_a"] = float(dom_a)
+                features["dominant_lab_b"] = float(dom_b)
+                features["dominant_lab_a_norm"] = float((dom_a + 128.0) / 255.0)
+                features["dominant_lab_b_norm"] = float((dom_b + 128.0) / 255.0)
+
+        # Colorfulness index (как раньше, по RGB)
         rgb_reshaped = frame.reshape(-1, 3).astype(np.float32)
-        rg = rgb_reshaped[:, 0] - rgb_reshaped[:, 1]
-        yb = 0.5 * (rgb_reshaped[:, 0] + rgb_reshaped[:, 1]) - rgb_reshaped[:, 2]
-        std_rg = np.std(rg)
-        std_yb = np.std(yb)
-        mean_rgyb = np.sqrt(np.mean(rg**2) + np.mean(yb**2))
-        features['colorfulness_index'] = float(std_rg + std_yb + 0.3 * mean_rgyb)
-        
-        # Warm vs cold ratio
+        if rgb_reshaped.size > 0:
+            rg = rgb_reshaped[:, 0] - rgb_reshaped[:, 1]
+            yb = 0.5 * (rgb_reshaped[:, 0] + rgb_reshaped[:, 1]) - rgb_reshaped[:, 2]
+            std_rg = np.std(rg)
+            std_yb = np.std(yb)
+            mean_rgyb = np.sqrt(np.mean(rg ** 2) + np.mean(yb ** 2))
+            colorfulness = float(std_rg + std_yb + 0.3 * mean_rgyb)
+        else:
+            colorfulness = 0.0
+        features["colorfulness_index"] = colorfulness
+        # Нормализованный индекс цветности ~ [0,1] (ожидаем 0–100+)
+        features["colorfulness_norm"] = float(min(colorfulness / 100.0, 1.0))
+
+        # Warm vs cold ratio, skin_tone_ratio, color_palette_entropy
         hsv = cv2.cvtColor(frame, cv2.COLOR_RGB2HSV)
-        hue = hsv[:, :, 0].flatten()
-        # Теплые цвета: 0-30 и 150-180 (красный, оранжевый, желтый)
+        hue = hsv[:, :, 0].flatten().astype(np.float32)
+        sat = hsv[:, :, 1].flatten().astype(np.float32)
+        val = hsv[:, :, 2].flatten().astype(np.float32)
+
         warm_mask = ((hue >= 0) & (hue <= 30)) | ((hue >= 150) & (hue <= 180))
         warm_count = np.sum(warm_mask)
-        cold_count = len(hue) - warm_count
-        features['warm_vs_cold_ratio'] = float(warm_count / (cold_count + 1e-10))
-        
-        # Skin tone ratio (приблизительная оценка по цвету кожи)
-        # Типичный диапазон кожи в HSV: H: 0-25, S: 20-255, V: 50-255
-        sat = hsv[:, :, 1].flatten()
-        val = hsv[:, :, 2].flatten()
+        cold_count = max(1, len(hue) - warm_count)
+        features["warm_vs_cold_ratio"] = float(warm_count / float(cold_count))
+
         skin_mask = ((hue >= 0) & (hue <= 25)) & (sat >= 20) & (val >= 50)
-        features['skin_tone_ratio'] = float(np.sum(skin_mask) / len(hue))
-        
-        # Color palette entropy
+        features["skin_tone_ratio"] = float(np.sum(skin_mask) / (len(hue) + 1e-10))
+
         hue_hist, _ = np.histogram(hue, bins=36, range=(0, 180))
         hue_probs = hue_hist / (hue_hist.sum() + 1e-10)
-        features['color_palette_entropy'] = float(entropy(hue_probs + 1e-10))
-        
-        # Color harmonies (complementary, analogous, triadic, split-complementary)
+        features["color_palette_entropy"] = float(entropy(hue_probs + 1e-10))
+
+        # Цветовые гармонии: оставляем только complementary / analogous как компактные признаки
         harmony_features = self._compute_color_harmonies(hue, sat, val)
         features.update(harmony_features)
-        
+
         return features
     
-    def _compute_color_harmonies(self, hue: np.ndarray, sat: np.ndarray, val: np.ndarray) -> Dict[str, float]:
-        """Вычисляет цветовые гармонии: complementary, analogous, triadic, split-complementary"""
-        features = {}
-        
-        # Находим доминирующий hue (наиболее частый оттенок)
+    def _compute_color_harmonies(
+        self, hue: np.ndarray, sat: np.ndarray, val: np.ndarray
+    ) -> Dict[str, float]:
+        """
+        Компактные цветовые гармонии:
+        - color_harmony_complementary_prob
+        - color_harmony_analogous_prob
+        Триады и split‑complementary убраны для снижения размерности.
+        """
+        features: Dict[str, float] = {}
+
         hue_hist, hue_bins = np.histogram(hue, bins=36, range=(0, 180))
-        dominant_hue_bin = np.argmax(hue_hist)
-        dominant_hue = (hue_bins[dominant_hue_bin] + hue_bins[dominant_hue_bin + 1]) / 2
-        
-        # Нормализуем hue в диапазон 0-360 для работы с цветовым кругом
-        dominant_hue_360 = dominant_hue * 2  # HSV hue в OpenCV: 0-180, цветовой круг: 0-360
-        
-        # Complementary (дополнительные цвета) - противоположные на цветовом круге
-        comp_hue = (dominant_hue_360 + 180) % 360
-        comp_hue_180 = comp_hue / 2  # обратно в диапазон 0-180
-        # Проверяем наличие цветов в диапазоне ±15 градусов от complementary
-        comp_range = ((hue >= (comp_hue_180 - 15) % 180) & (hue <= (comp_hue_180 + 15) % 180)) | \
-                     ((hue >= 0) & (hue <= (comp_hue_180 + 15 - 180) % 180)) | \
-                     ((hue >= (comp_hue_180 - 15 + 180) % 180) & (hue <= 180))
-        comp_ratio = np.sum(comp_range) / len(hue)
-        features['color_harmony_complementary_prob'] = float(min(comp_ratio * 2, 1.0))  # нормализуем
-        
-        # Analogous (аналогичные цвета) - соседние цвета на цветовом круге (±30 градусов)
-        # Доминирующий цвет уже есть, проверяем соседние
-        anal_range1 = (hue >= (dominant_hue - 30) % 180) & (hue <= (dominant_hue + 30) % 180)
-        anal_range2 = ((hue >= 0) & (hue <= (dominant_hue + 30 - 180) % 180)) | \
-                      ((hue >= (dominant_hue - 30 + 180) % 180) & (hue <= 180))
+        if hue_hist.sum() == 0:
+            features["color_harmony_complementary_prob"] = 0.0
+            features["color_harmony_analogous_prob"] = 0.0
+            return features
+
+        dominant_hue_bin = int(np.argmax(hue_hist))
+        dominant_hue = (hue_bins[dominant_hue_bin] + hue_bins[dominant_hue_bin + 1]) / 2.0
+
+        dominant_hue_360 = dominant_hue * 2.0
+
+        # Complementary
+        comp_hue = (dominant_hue_360 + 180.0) % 360.0
+        comp_hue_180 = comp_hue / 2.0
+        comp_range = (
+            (hue >= (comp_hue_180 - 15) % 180)
+            & (hue <= (comp_hue_180 + 15) % 180)
+        ) | ((hue >= 0) & (hue <= (comp_hue_180 + 15 - 180) % 180)) | (
+            (hue >= (comp_hue_180 - 15 + 180) % 180) & (hue <= 180)
+        )
+        comp_ratio = float(np.sum(comp_range) / (len(hue) + 1e-10))
+        features["color_harmony_complementary_prob"] = float(min(comp_ratio * 2.0, 1.0))
+
+        # Analogous (±30 градусов вокруг доминирующего)
+        anal_range1 = (hue >= (dominant_hue - 30) % 180) & (
+            hue <= (dominant_hue + 30) % 180
+        )
+        anal_range2 = ((hue >= 0) & (hue <= (dominant_hue + 30 - 180) % 180)) | (
+            (hue >= (dominant_hue - 30 + 180) % 180) & (hue <= 180)
+        )
         anal_range = anal_range1 | anal_range2
-        anal_ratio = np.sum(anal_range) / len(hue)
-        features['color_harmony_analogous_prob'] = float(min(anal_ratio * 1.2, 1.0))
-        
-        # Triadic (триада) - три цвета, равномерно распределенные на круге (120 градусов друг от друга)
-        triadic_hue1 = (dominant_hue_360 + 120) % 360
-        triadic_hue2 = (dominant_hue_360 + 240) % 360
-        triadic_hue1_180 = triadic_hue1 / 2
-        triadic_hue2_180 = triadic_hue2 / 2
-        
-        triadic_range1 = (hue >= (triadic_hue1_180 - 15) % 180) & (hue <= (triadic_hue1_180 + 15) % 180)
-        triadic_range2 = (hue >= (triadic_hue2_180 - 15) % 180) & (hue <= (triadic_hue2_180 + 15) % 180)
-        triadic_range = triadic_range1 | triadic_range2
-        triadic_ratio = np.sum(triadic_range) / len(hue)
-        features['color_harmony_triadic_prob'] = float(min(triadic_ratio * 3, 1.0))
-        
-        # Split-complementary (расщепленная комплементарная) - основной цвет + два соседних к complementary
-        split_comp_hue1 = (comp_hue - 30) % 360
-        split_comp_hue2 = (comp_hue + 30) % 360
-        split_comp_hue1_180 = split_comp_hue1 / 2
-        split_comp_hue2_180 = split_comp_hue2 / 2
-        
-        split_range1 = (hue >= (split_comp_hue1_180 - 15) % 180) & (hue <= (split_comp_hue1_180 + 15) % 180)
-        split_range2 = (hue >= (split_comp_hue2_180 - 15) % 180) & (hue <= (split_comp_hue2_180 + 15) % 180)
-        split_range = split_range1 | split_range2
-        split_ratio = np.sum(split_range) / len(hue)
-        features['color_harmony_split_complementary_prob'] = float(min(split_ratio * 2.5, 1.0))
-        
+        anal_ratio = float(np.sum(anal_range) / (len(hue) + 1e-10))
+        features["color_harmony_analogous_prob"] = float(
+            min(anal_ratio * 1.2, 1.0)
+        )
+
         return features
     
     def _safe_entropy_from_hist(self, hist: np.ndarray, eps: float = 1e-12) -> float:
@@ -354,9 +380,12 @@ class ColorLightProcessor:
         total_pixels = gray_f.size
         eps = 1e-10
 
-        features["brightness_mean"] = float(np.mean(gray_f))
-        features["brightness_std"] = float(np.std(gray_f))
-        features["global_contrast"] = float(np.std(gray_f))  # RMS contrast = std
+        brightness_mean = float(np.mean(gray_f))
+        brightness_std = float(np.std(gray_f))
+        global_contrast = brightness_std  # RMS contrast = std
+        features["brightness_mean"] = brightness_mean
+        features["brightness_std"] = brightness_std
+        features["global_contrast"] = global_contrast
 
         # Brightness entropy (histogram over 256 bins)
         hist, _ = np.histogram(gray, bins=256, range=(0, 256))
@@ -365,8 +394,10 @@ class ColorLightProcessor:
         # Over/under exposed ratios (fractions)
         overexposed = int(np.sum(gray >= 250))
         underexposed = int(np.sum(gray <= 5))
-        features["overexposed_pixels"] = float(overexposed / (total_pixels + eps))
-        features["underexposed_pixels"] = float(underexposed / (total_pixels + eps))
+        over_ratio = float(overexposed / (total_pixels + eps))
+        under_ratio = float(underexposed / (total_pixels + eps))
+        features["overexposed_pixels"] = over_ratio
+        features["underexposed_pixels"] = under_ratio
 
         # Highlight & shadow clipping (same as above but slightly different thresholds)
         highlight_threshold = 250
@@ -403,15 +434,27 @@ class ColorLightProcessor:
                 if window.size:
                     local_stds.append(float(np.std(window)))
         if local_stds:
-            features["local_contrast"] = float(np.mean(local_stds))
-            features["local_contrast_std"] = float(np.std(local_stds))
+            local_contrast = float(np.mean(local_stds))
+            local_contrast_std = float(np.std(local_stds))
+            features["local_contrast"] = local_contrast
+            features["local_contrast_std"] = local_contrast_std
         else:
-            features["local_contrast"] = float(features["global_contrast"])
+            local_contrast = global_contrast
+            features["local_contrast"] = float(local_contrast)
             features["local_contrast_std"] = 0.0
 
         # Lighting uniformity (grid-based) and vignetting via helper
         uniformity_features = self._compute_lighting_uniformity(gray)
         features.update(uniformity_features)
+
+        # Нормализованные lighting‑фичи (0–1) для компактного вектора
+        features["global_contrast_norm"] = float(min(global_contrast / 255.0, 1.0))
+        features["local_contrast_mean_norm"] = float(min(local_contrast / 255.0, 1.0))
+        features["overexposed_ratio"] = over_ratio
+        features["underexposed_ratio"] = under_ratio
+        features["vignetting_score_norm"] = float(
+            uniformity_features.get("vignetting_score", 0.0)
+        )
 
         # Final safety: cast to native floats and ensure keys exist
         for k, v in list(features.items()):
@@ -445,15 +488,15 @@ class ColorLightProcessor:
         magnitudes = np.sqrt(grad_x**2 + grad_y**2)
         angles = np.arctan2(grad_y, grad_x)  # radians
 
-        # если нет текстуры — направление неопределено
+        # если нет текстуры — направление неопределено (угол не возвращаем, только источники света)
         if np.sum(magnitudes) < eps:
-            features["light_direction_angle"] = 0.0
+            pass
         else:
-            # circular mean
+            # оставляем расчёт для возможного дебага, но не сохраняем в фичи,
+            # чтобы не засорять финальный вектор сильно шумным признаком
             sin_sum = float(np.sum(np.sin(angles) * (magnitudes + eps)))
             cos_sum = float(np.sum(np.cos(angles) * (magnitudes + eps)))
-            mean_angle = np.arctan2(sin_sum, cos_sum)
-            features["light_direction_angle"] = float(np.degrees(mean_angle))
+            _ = np.arctan2(sin_sum, cos_sum)
 
         # === 2. LIGHT SOURCE COUNT (ROBUST 2D PEAK DETECTION) ===
         # Сглаживаем картинку и ищем bright blobs
@@ -488,6 +531,8 @@ class ColorLightProcessor:
 
         features["soft_light_probability"] = float(soft_prob)
         features["hard_light_probability"] = float(hard_prob)
+        # Дубликат с более коротким именем для компактного вектора
+        features["soft_light_prob"] = float(soft_prob)
 
         return features
 
@@ -508,35 +553,47 @@ class ColorLightProcessor:
         
         features = {}
         try:
-            # RGB статистики
+            # RGB статистики (только mean/std)
             features.update(self._compute_rgb_stats(frame))
         except Exception as e:
-            print(f"ColorLightProcessor | extract_frame_features | Ошибка вычисления RGB статистики: {e}")
+            print(
+                f"ColorLightProcessor | extract_frame_features | Ошибка вычисления RGB статистики: {e}"
+            )
         try:
-            # HSV фичи
+            # HSV фичи + нормализованные hue/sat/value
             features.update(self._compute_hsv_features(frame))
         except Exception as e:
-            print(f"ColorLightProcessor | extract_frame_features | Ошибка вычисления HSV фичи: {e}")
+            print(
+                f"ColorLightProcessor | extract_frame_features | Ошибка вычисления HSV фичи: {e}"
+            )
         try:
-            # LAB фичи
+            # LAB фичи (L_mean/L_contrast/ab_balance + L_mean_norm)
             features.update(self._compute_lab_features(frame))
         except Exception as e:
-            print(f"ColorLightProcessor | extract_frame_features | Ошибка вычисления LAB фичи: {e}")
+            print(
+                f"ColorLightProcessor | extract_frame_features | Ошибка вычисления LAB фичи: {e}"
+            )
         try:
-            # Палитра и гармонии
+            # Палитра, colorfulness, skin_tone_ratio, гармонии
             features.update(self._compute_palette_features(frame))
         except Exception as e:
-            print(f"ColorLightProcessor | extract_frame_features | Ошибка вычисления Палитра и гармонии: {e}")
+            print(
+                f"ColorLightProcessor | extract_frame_features | Ошибка вычисления Палитра и гармонии: {e}"
+            )
         try:
-            # Освещение
+            # Освещение и lighting‑фичи
             features.update(self._compute_lighting_features(frame))
         except Exception as e:
-            print(f"ColorLightProcessor | extract_frame_features | Ошибка вычисления Освещение: {e}")
+            print(
+                f"ColorLightProcessor | extract_frame_features | Ошибка вычисления Освещение: {e}"
+            )
         try:
-            # Направление света
+            # Источники света и soft/hard light
             features.update(self._compute_light_direction(frame))
         except Exception as e:
-            print(f"ColorLightProcessor | extract_frame_features | Ошибка вычисления Направление света: {e}")
+            print(
+                f"ColorLightProcessor | extract_frame_features | Ошибка вычисления Направление света: {e}"
+            )
 
         return {
             "frame_idx": frame_idx,
@@ -553,6 +610,10 @@ class ColorLightProcessor:
         # Базовые метрики сцены
         num_frames = len(frame_features)
         scene_features['num_frames'] = num_frames
+        if self.max_frames_per_scene > 0:
+            scene_features['num_frames_norm'] = float(
+                min(num_frames / float(self.max_frames_per_scene), 1.0)
+            )
         
         # Извлекаем значения фич из всех кадров
         feature_arrays = {}
@@ -570,7 +631,8 @@ class ColorLightProcessor:
                 scene_features[f'{key}_std'] = float(np.std(values))
         
         # Motion + Lighting features
-        brightness_values = [f['features'].get('brightness_mean', 0) for f in frame_features]
+        # Для скорости изменения освещенности используем Value из HSV
+        brightness_values = [f['features'].get('value_mean', 0) for f in frame_features]
         if len(brightness_values) > 1:
             brightness_diff = np.diff(brightness_values)
             scene_features['brightness_change_speed'] = float(np.mean(np.abs(brightness_diff)))
@@ -591,6 +653,10 @@ class ColorLightProcessor:
             flash_threshold = np.mean(brightness_values) + 2 * np.std(brightness_values)
             flash_events = np.sum(np.abs(brightness_diff) > flash_threshold)
             scene_features['flash_events_count'] = float(flash_events)
+            # Нормированное количество вспышек относительно длины сцены
+            scene_features['flash_events_count_norm'] = float(
+                flash_events / float(max(1, num_frames - 1))
+            )
         
         # Temporal Color Patterns
         if len(frame_features) > 1:
@@ -878,20 +944,35 @@ class ColorLightProcessor:
         # ============================================================
         # 1) FRAME SEQUENCE → [N_frames_total, D_frame_features]
         # ============================================================
-        frame_sequence = []
+        frame_sequence: List[List[float]] = []
+
+        # Компактный набор фич для VisualTransformer (нормализованные 0–1)
+        frame_keys = [
+            "hue_mean_norm",
+            "hue_std_norm",
+            "hue_entropy_weighted",
+            "sat_mean_norm",
+            "val_mean_norm",
+            "L_mean_norm",
+            "global_contrast_norm",
+            "local_contrast_mean_norm",
+            "colorfulness_norm",
+            "skin_tone_ratio",
+            "overexposed_ratio",
+            "underexposed_ratio",
+            "vignetting_score_norm",
+            "soft_light_prob",
+            "dominant_lab_a_norm",
+            "dominant_lab_b_norm",
+        ]
 
         # Собираем все кадры ПЛОСКО по всем сценам
         for scene_label, frames_dict in all_frame_features.items():
             for frame_idx, frame_feat in sorted(frames_dict.items(), key=lambda x: x[0]):
                 feat_dict = frame_feat["features"]
-
-                # только числовые фичи
-                numeric_keys = sorted([
-                    k for k, v in feat_dict.items()
-                    if isinstance(v, (int, float)) and not isinstance(v, bool)
-                ])
-
-                frame_vector = [float(feat_dict[k]) for k in numeric_keys]
+                frame_vector = [
+                    float(feat_dict.get(k, 0.0)) for k in frame_keys
+                ]
                 frame_sequence.append(frame_vector)
 
         sequences["frames"] = frame_sequence
@@ -1002,15 +1083,17 @@ class ColorLightProcessor:
 
         logger.info(f"Видео фичи извлечены")
         
-        # Sequence inputs
-        sequence_inputs = self._create_sequence_inputs(all_frame_features, all_scene_features, video_features)
-        
+        # Формируем последовательности для трансформера на основе компактных фич
+        sequence_inputs = self._create_sequence_inputs(
+            all_frame_features, all_scene_features, video_features
+        )
+
         # Формируем результат
         result = {
             "frames": all_frame_features,
             "scenes": all_scene_features,
             "video_features": video_features,
-            "sequence_inputs": sequence_inputs
+            "sequence_inputs": sequence_inputs,
         }
-        
+
         return result

@@ -83,30 +83,39 @@ class SimilarityMetrics:
             return {
                 'semantic_similarity_mean': 0.0,
                 'semantic_similarity_max': 0.0,
-                'semantic_similarity_min': 0.0,
+                'semantic_similarity_p10': 0.0,
                 'semantic_novelty_score': 1.0
             }
         
         # Нормализуем embeddings
         video_emb_norm = video_embedding / (np.linalg.norm(video_embedding) + 1e-10)
         
-        similarities = []
+        similarities: List[float] = []
         for ref_emb in reference_embeddings:
             ref_emb_norm = ref_emb / (np.linalg.norm(ref_emb) + 1e-10)
             # Cosine similarity
-            sim = np.dot(video_emb_norm, ref_emb_norm)
-            similarities.append(float(sim))
+            sim = float(np.dot(video_emb_norm, ref_emb_norm))
+            similarities.append(sim)
         
-        similarities = np.array(similarities)
+        similarities_arr = np.asarray(similarities, dtype=np.float32)
         
-        # Сортируем и берем топ-N
-        top_similarities = np.sort(similarities)[-self.top_n:] if len(similarities) > self.top_n else similarities
+        # Сортируем и берем топ-N для mean
+        if similarities_arr.size > self.top_n:
+            top_similarities = np.sort(similarities_arr)[-self.top_n:]
+        else:
+            top_similarities = similarities_arr
+        
+        max_sim = float(np.max(similarities_arr))
+        # 10‑й перцентиль как более робастная замена "min"
+        p10_sim = float(np.percentile(similarities_arr, 10)) if similarities_arr.size > 0 else 0.0
+        # Новизна: (1 - max_sim) нормированная в [0,1] с защитой от выхода за границы
+        novelty = float(np.clip((1.0 - max_sim) * 0.5 + 0.5, 0.0, 1.0))
         
         return {
             'semantic_similarity_mean': float(np.mean(top_similarities)),
-            'semantic_similarity_max': float(np.max(similarities)),
-            'semantic_similarity_min': float(np.min(similarities)),
-            'semantic_novelty_score': float(1.0 - np.max(similarities))
+            'semantic_similarity_max': max_sim,
+            'semantic_similarity_p10': p10_sim,
+            'semantic_novelty_score': novelty
         }
     
     # ==================== B. Topic / Concept Overlap ====================
@@ -133,48 +142,67 @@ class SimilarityMetrics:
                 'key_concept_match_ratio': 0.0
             }
         
-        # Преобразуем в множества ключевых слов, если нужно
-        def to_set(topics):
+        # Преобразуем в взвешенные множества ключевых слов
+        def to_weighted_dict(topics) -> Dict[str, float]:
             if isinstance(topics, dict):
-                # Берем топ-10 тем по вероятности
-                sorted_topics = sorted(topics.items(), key=lambda x: x[1], reverse=True)
-                return set([t[0] for t in sorted_topics[:10]])
+                return {str(k): float(v) for k, v in topics.items()}
             elif isinstance(topics, (list, np.ndarray)):
                 if len(topics) > 0 and isinstance(topics[0], str):
-                    return set(topics[:20])  # Берем первые 20
+                    # Простейший вес = 1.0 для присутствующих тем
+                    return {str(t): 1.0 for t in topics}
                 else:
-                    # Это вероятности, берем индексы с вероятностью > 0.1
-                    return set(np.where(np.array(topics) > 0.1)[0].astype(str))
-            return set()
+                    arr = np.asarray(topics, dtype=np.float32)
+                    idx = np.where(arr > 0.0)[0]
+                    return {str(i): float(arr[i]) for i in idx}
+            return {}
         
-        video_topics_set = to_set(video_topics)
+        video_topics_w = to_weighted_dict(video_topics)
+        video_keys = set(video_topics_w.keys())
         
-        overlap_scores = []
-        diversity_diffs = []
-        concept_matches = []
+        overlap_scores: List[float] = []
+        diversity_diffs: List[float] = []
+        concept_matches: List[float] = []
         
         for ref_topics in reference_topics_list:
-            ref_topics_set = to_set(ref_topics)
+            ref_topics_w = to_weighted_dict(ref_topics)
+            ref_keys = set(ref_topics_w.keys())
             
-            # Jaccard similarity
-            if len(video_topics_set) == 0 and len(ref_topics_set) == 0:
-                jaccard = 1.0
-            elif len(video_topics_set) == 0 or len(ref_topics_set) == 0:
-                jaccard = 0.0
+            # Взвешенный Jaccard (intersection / union с учетом весов)
+            if not video_keys and not ref_keys:
+                w_jaccard = 1.0
+            elif not video_keys or not ref_keys:
+                w_jaccard = 0.0
             else:
-                intersection = len(video_topics_set & ref_topics_set)
-                union = len(video_topics_set | ref_topics_set)
-                jaccard = intersection / union if union > 0 else 0.0
+                inter = 0.0
+                union = 0.0
+                for k in video_keys | ref_keys:
+                    w1 = video_topics_w.get(k, 0.0)
+                    w2 = ref_topics_w.get(k, 0.0)
+                    inter += min(w1, w2)
+                    union += max(w1, w2)
+                w_jaccard = inter / (union + 1e-10) if union > 0 else 0.0
             
-            overlap_scores.append(jaccard)
+            overlap_scores.append(w_jaccard)
             
-            # Разница в разнообразии тем
-            diversity_diff = abs(len(video_topics_set) - len(ref_topics_set)) / max(len(video_topics_set), len(ref_topics_set), 1)
+            # Diversity через энтропию весов
+            def entropy_from_weights(w: Dict[str, float]) -> float:
+                if not w:
+                    return 0.0
+                arr = np.asarray(list(w.values()), dtype=np.float32)
+                arr = arr / (arr.sum() + 1e-10)
+                return float(-np.sum(arr * np.log(arr + 1e-10)))
+            
+            div_video = entropy_from_weights(video_topics_w)
+            div_ref = entropy_from_weights(ref_topics_w)
+            max_div = max(div_video, div_ref, 1e-6)
+            diversity_diff = abs(div_video - div_ref) / max_div
             diversity_diffs.append(diversity_diff)
             
-            # Доля совпадающих ключевых концептов
-            if len(video_topics_set) > 0:
-                match_ratio = len(video_topics_set & ref_topics_set) / len(video_topics_set)
+            # Взвешенная доля совпадающих ключевых концептов
+            if video_keys:
+                inter_weight = sum(min(video_topics_w.get(k, 0.0), ref_topics_w.get(k, 0.0)) for k in video_keys)
+                total_weight = sum(video_topics_w.values()) + 1e-10
+                match_ratio = inter_weight / total_weight
             else:
                 match_ratio = 0.0
             concept_matches.append(match_ratio)
@@ -251,9 +279,9 @@ class SimilarityMetrics:
             
             # Cut rate similarity
             if 'cut_rate' in video_visual_features and 'cut_rate' in ref_features:
-                cut1 = video_visual_features['cut_rate']
-                cut2 = ref_features['cut_rate']
-                # Нормализуем разницу
+                cut1 = float(video_visual_features['cut_rate'])
+                cut2 = float(ref_features['cut_rate'])
+                # Нормализованная разница
                 max_cut = max(abs(cut1), abs(cut2), 1.0)
                 cut_sim = 1.0 - abs(cut1 - cut2) / max_cut
                 cut_rate_sims.append(max(0.0, cut_sim))
@@ -582,16 +610,17 @@ class SimilarityMetrics:
         Returns:
             Словарь с высокоуровневыми оценками
         """
-        # Overall similarity score = weighted sum
+        # Overall similarity score = взвешенная сумма базовых аспектов.
+        # Это эвристический скор, рекомендовано переобучать веса отдельно.
         weights = self.similarity_weights
         
         semantic_score = all_similarity_metrics.get('semantic_similarity_mean', 0.0)
         topics_score = all_similarity_metrics.get('topic_overlap_score', 0.0)
-        visual_score = np.mean([
+        visual_score = float(np.mean([
             all_similarity_metrics.get('color_histogram_similarity', 0.0),
             all_similarity_metrics.get('lighting_pattern_similarity', 0.0),
-            all_similarity_metrics.get('shot_type_distribution_similarity', 0.0)
-        ])
+            all_similarity_metrics.get('shot_type_distribution_similarity', 0.0),
+        ]))
         text_score = all_similarity_metrics.get('ocr_text_semantic_similarity', 0.0)
         audio_score = all_similarity_metrics.get('audio_embedding_similarity', 0.0)
         emotion_score = all_similarity_metrics.get('emotion_curve_similarity', 0.0)
@@ -606,32 +635,20 @@ class SimilarityMetrics:
             weights['emotion'] * emotion_score +
             weights['temporal'] * temporal_score
         )
+        overall_similarity = float(np.clip(overall_similarity, 0.0, 1.0))
         
-        uniqueness_score = 1.0 - overall_similarity
+        uniqueness_score = float(1.0 - overall_similarity)
         
-        # Trend alignment score (насколько похоже на топ видео в нише)
-        # Если есть метаданные с популярностью, используем их
-        trend_alignment = overall_similarity  # По умолчанию = overall_similarity
-        
-        if reference_videos_metadata:
-            # Можно взвесить по популярности референсных видео
-            popular_videos_similarity = overall_similarity  # Упрощенная версия
-            trend_alignment = popular_videos_similarity
-        
-        # Viral pattern score (схожесть с успешными видео)
-        viral_pattern = overall_similarity  # Упрощенная версия
-        
-        if reference_videos_metadata:
-            # Можно фильтровать только вирусные видео и считать схожесть с ними
-            viral_videos = [v for v in reference_videos_metadata if v.get('is_viral', False)]
-            if len(viral_videos) > 0:
-                viral_pattern = overall_similarity  # Упрощенная версия
+        # Trend alignment / viral pattern по умолчанию = overall_similarity;
+        # предполагается, что в продакшене будут обучены отдельные агрегаторы.
+        trend_alignment = overall_similarity
+        viral_pattern = overall_similarity
         
         return {
-            'overall_similarity_score': float(overall_similarity),
-            'uniqueness_score': float(uniqueness_score),
-            'trend_alignment_score': float(trend_alignment),
-            'viral_pattern_score': float(viral_pattern)
+            'overall_similarity_score': overall_similarity,
+            'uniqueness_score': uniqueness_score,
+            'trend_alignment_score': trend_alignment,
+            'viral_pattern_score': viral_pattern,
         }
     
     # ==================== I. Group / Batch Metrics ====================

@@ -205,6 +205,7 @@ python cut_detection.py --video path/to/video.mp4 --max-frames 3000
 - `hard_cuts_count` — количество резких катов
 - `hard_cuts_per_minute` — катов в минуту
 - `hard_cut_strength_mean` — средняя сила катов
+- `hard_cut_strength_p25`, `hard_cut_strength_p50`, `hard_cut_strength_p75` — перцентили распределения сил катов
 
 ### Soft Cuts
 
@@ -254,17 +255,20 @@ python cut_detection.py --video path/to/video.mp4 --max-frames 3000
 
 ### Timing & Rhythm
 
-- `cuts_per_second` — катов в секунду
-- `cuts_per_minute` — катов в минуту
+- `cuts_per_minute` — катов в минуту (cuts_per_second удален как дублирующая метрика)
 - `median_cut_interval` — медианный интервал между катами
+- `min_cut_interval`, `max_cut_interval` — минимальный и максимальный интервалы
 - `cut_interval_std` — стандартное отклонение интервалов
-- `cut_interval_entropy` — энтропия интервалов
-- `cut_rhythm_uniformity_score` — оценка равномерности ритма
+- `cut_interval_cv` — коэффициент вариации интервалов (std/mean)
+- `cut_interval_entropy` — нормализованная энтропия интервалов [0, 1]
+- `cut_rhythm_uniformity_score` — оценка равномерности ритма (1 - CV)
 
 ### Shot Statistics
 
 - `avg_shot_length` — средняя длительность shot
 - `median_shot_length` — медианная длительность shot
+- `shot_length_p10`, `shot_length_p25`, `shot_length_p75`, `shot_length_p90` — перцентили распределения длительностей
+- `shot_length_histogram` — нормализованная гистограмма длительностей (8 бинов)
 - `short_shots_ratio` — доля коротких shots (<1s)
 - `long_shots_ratio` — доля длинных shots (>4s)
 - `very_long_shots_count` — количество очень длинных shots (>10s)

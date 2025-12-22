@@ -152,16 +152,18 @@ def load_cbdnet(device="cuda"):
 # SHARPNESS METRICS
 # ---------------------------------------------------------------
 
-def sharpness_laplacian(frame):
-    return cv2.Laplacian(frame, cv2.CV_64F).var()
-
 def sharpness_tenengrad(frame):
     gx = cv2.Sobel(frame, cv2.CV_64F, 1, 0)
     gy = cv2.Sobel(frame, cv2.CV_64F, 0, 1)
     g = gx*gx + gy*gy
     return np.mean(g)
 
-def smd2(frame):
+def _sharpness_laplacian(frame):
+    """Вспомогательная Laplacian‑резкость (для secondary метрики)."""
+    return cv2.Laplacian(frame, cv2.CV_64F).var()
+
+def _sharpness_smd2(frame):
+    """Вспомогательный SMD2 (для secondary метрики)."""
     diff1 = np.abs(frame[:, 1:] - frame[:, :-1])
     diff2 = np.abs(frame[1:, :] - frame[:-1, :])
     return np.mean(diff1) + np.mean(diff2)
@@ -175,39 +177,52 @@ def motion_blur_probability(frame):
     return float(np.clip(blur, 0, 1))
 
 # Edge clarity
-def edge_clarity(frame):
+def _edge_clarity(frame):
     edges = cv2.Canny(frame, 100, 200)
     return np.mean(edges) / 255
 
-def blur_score(frame):
-    """Общий blur score на основе Laplacian variance"""
-    gray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY) if len(frame.shape) == 3 else frame
-    laplacian_var = cv2.Laplacian(gray, cv2.CV_64F).var()
-    # Нормализуем к [0, 1], где 1 = очень резко
-    return float(np.clip(laplacian_var / 1000.0, 0, 1))
-
-def focus_accuracy_score(frame):
-    """Оценка точности фокусировки"""
-    gray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY) if len(frame.shape) == 3 else frame
-    # Используем градиенты для оценки фокуса
+def _focus_gradient_score(gray):
+    """Градиент‑основанный proxy фокуса (для secondary метрики)."""
     gx = cv2.Sobel(gray, cv2.CV_64F, 1, 0, ksize=3)
     gy = cv2.Sobel(gray, cv2.CV_64F, 0, 1, ksize=3)
     gradient_magnitude = np.sqrt(gx**2 + gy**2)
-    return float(np.clip(np.mean(gradient_magnitude) / 50.0, 0, 1))
+    return float(np.mean(gradient_magnitude))
 
-def spatial_frequency_mean(frame):
-    """Средняя пространственная частота"""
+def _spatial_frequency_mean(frame):
+    """Нормализованная средняя пространственная частота (масштаб‑инвариантная)."""
     gray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY) if len(frame.shape) == 3 else frame
+    h, w = gray.shape
+    if h == 0 or w == 0:
+        return 0.0
     fft = np.fft.fft2(gray)
     fft_shift = np.fft.fftshift(fft)
     magnitude = np.abs(fft_shift)
-    # Средняя частота
-    h, w = gray.shape
     y, x = np.ogrid[:h, :w]
     center_y, center_x = h // 2, w // 2
     distances = np.sqrt((x - center_x)**2 + (y - center_y)**2)
-    weighted_freq = np.sum(magnitude * distances) / (np.sum(magnitude) + 1e-10)
-    return float(weighted_freq / max(h, w))
+    # Нормируем радиусы на диагональ, чтобы учесть разное разрешение
+    diag = np.sqrt(h ** 2 + w ** 2)
+    norm_dist = distances / (diag + 1e-8)
+    weighted_freq = np.sum(magnitude * norm_dist) / (np.sum(magnitude) + 1e-10)
+    return float(weighted_freq)
+
+def sharpness_secondary(gray, frame_bgr):
+    """
+    Компактная secondary‑резкость, агрегирующая несколько метрик:
+    Laplacian, SMD2, edge clarity и градиент‑фокус.
+    """
+    lap = _sharpness_laplacian(gray)
+    smd = _sharpness_smd2(gray)
+    edge = _edge_clarity(frame_bgr)
+    grad = _focus_gradient_score(gray)
+
+    # Простейшая нормализация/сжатие в один скор
+    # (лог‑scale для lap/smd, среднее по всем компонентам)
+    lap_n = np.log1p(lap)
+    smd_n = np.log1p(smd)
+    grad_n = np.log1p(grad)
+    sec = (lap_n + smd_n + grad_n + edge) / 4.0
+    return float(sec)
 
 # ---------------------------------------------------------------
 # NOISE METRICS (DnCNN, CBDNet)
@@ -327,12 +342,41 @@ def noise_spatial_entropy(gray):
 # ---------------------------------------------------------------
 
 def exposure_metrics(gray):
-    hist = cv2.calcHist([gray], [0], None, [256], [0, 256]).ravel()
-    hist /= hist.sum()
+    """
+    Робастные exposure‑метрики на основе percentiles, а не жёстких уровней 0–255.
 
-    under = hist[:30].sum()
-    over = hist[230:].sum()
-    mid = hist[80:170].sum()
+    Используем p5/p95 как динамический диапазон:
+    - underexposure_ratio: доля пикселей ниже p5
+    - overexposure_ratio: доля пикселей выше p95
+    - midtones_balance: доля пикселей в [p5, p95]
+    """
+    gray_f = gray.astype(np.float32)
+    flat = gray_f.flatten()
+    if flat.size == 0:
+        return {
+            "underexposure_ratio": 0.0,
+            "overexposure_ratio": 0.0,
+            "midtones_balance": 1.0,
+            "exposure_histogram_skewness": 0.0,
+            "highlight_recovery_potential": 1.0,
+            "shadow_recovery_potential": 1.0,
+        }
+
+    p5 = np.percentile(flat, 5)
+    p95 = np.percentile(flat, 95)
+
+    # Безопасность на вырожденных случаях
+    if p95 <= p5:
+        p5 = max(0.0, p5 - 1.0)
+        p95 = min(255.0, p95 + 1.0)
+
+    total = float(flat.size)
+    under = float(np.mean(flat < p5))
+    over = float(np.mean(flat > p95))
+    mid = float(1.0 - under - over)
+
+    hist = cv2.calcHist([gray.astype(np.uint8)], [0], None, [256], [0, 256]).ravel()
+    hist = hist / (hist.sum() + 1e-10)
     skew = entropy(hist)
 
     # Recovery potential: анализируем, можно ли восстановить детали
@@ -773,21 +817,26 @@ class ShotQualityPipeline:
         frame_rgb = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
         gray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
 
-        # Sharpness
-        sharp = sharpness_laplacian(gray)
+        # Sharpness (основная + secondary)
         tenengrad = sharpness_tenengrad(gray)
-        smd_val = smd2(gray)
         motion_blur = motion_blur_probability(frame)
-        edge_clar = edge_clarity(frame)
-        blur = blur_score(frame)
-        focus = focus_accuracy_score(frame)
-        spatial_freq = spatial_frequency_mean(frame)
+        sharp_sec = sharpness_secondary(gray, frame)
+        spatial_freq = _spatial_frequency_mean(frame)
 
-        # Noise
-        noise_level = noise_estimation_dncnn(self.dncnn, frame_rgb, self.device)
+        # Noise (сведённые фичи)
+        noise_dncnn = noise_estimation_dncnn(self.dncnn, frame_rgb, self.device)
         noise_cbdnet_stats = noise_estimation_cbdnet(self.cbdnet, frame_rgb, self.device)
+        noise_model_mean = float(noise_dncnn)
+        if isinstance(noise_cbdnet_stats, dict):
+            noise_model_mean = float(
+                0.5 * noise_model_mean + 0.5 * noise_cbdnet_stats.get("noise_mean", noise_model_mean)
+            )
+
         noise_luma = noise_level_luma(gray)
         noise_chroma = noise_level_chroma(frame)
+        noise_chroma_ratio = float(
+            noise_chroma / (noise_luma + 1e-6)
+        ) if noise_luma > 0 else float(noise_chroma)
         iso_est = iso_estimated_value(frame)
         grain = grain_strength(frame)
         noise_entropy = noise_spatial_entropy(gray)
@@ -834,7 +883,7 @@ class ShotQualityPipeline:
         rolling_shutter = rolling_shutter_artifacts_score(self.prev_frame, frame)
         
         # Сохраняем для temporal метрик
-        self.frame_history["sharpness"].append(sharp)
+        self.frame_history["sharpness"].append(tenengrad)
         self.frame_history["exposure"].append(exp.get("midtones_balance", 0.5))
         self.frame_history["noise"].append(noise_luma)
         
@@ -845,21 +894,18 @@ class ShotQualityPipeline:
         qc = self.classifier.predict(frame)
 
         return {
-            # Sharpness
-            "sharpness_laplacian": sharp,
+            # Sharpness (компактные признаки)
             "sharpness_tenengrad": tenengrad,
-            "sharpness_smd2": smd_val,
+            "sharpness_secondary": sharp_sec,
             "motion_blur_probability": motion_blur,
-            "edge_clarity_index": edge_clar,
-            "blur_score": blur,
-            "focus_accuracy_score": focus,
             "spatial_frequency_mean": spatial_freq,
 
-            # Noise
-            "noise_level": noise_level,
+            # Noise (сведённые)
+            "noise_model_mean": noise_model_mean,
             "noise_cbdnet_stats": noise_cbdnet_stats,
             "noise_level_luma": noise_luma,
             "noise_level_chroma": noise_chroma,
+            "noise_chroma_ratio": noise_chroma_ratio,
             "iso_estimated_value": iso_est,
             "grain_strength": grain,
             "noise_spatial_entropy": noise_entropy,
@@ -959,19 +1005,28 @@ class ShotQualityPipeline:
         # --- Temporal метрики ---
         temporal_features: Dict[str, float] = {}
 
-        def stability(x):
+        def robust_cv(x):
+            """
+            Робастный коэффициент вариации: IQR / median.
+            Менее чувствителен к выбросам, чем std/mean.
+            """
             x = np.array(x, dtype=np.float32)
-            return float(1.0 - np.std(x) / (np.mean(x) + 1e-8))
+            if x.size == 0:
+                return 0.0
+            med = np.median(x)
+            if med == 0:
+                return 0.0
+            q75, q25 = np.percentile(x, [75, 25])
+            iqr = q75 - q25
+            return float(iqr / (abs(med) + 1e-8))
 
         if len(self.frame_history["sharpness"]) > 1:
-            temporal_features["temporal_sharpness_stability"] = stability(
-                self.frame_history["sharpness"]
-            )
+            rc = robust_cv(self.frame_history["sharpness"])
+            temporal_features["temporal_sharpness_stability"] = float(1.0 - np.clip(rc, 0.0, 1.0))
 
         if len(self.frame_history["exposure"]) > 1:
-            temporal_features["temporal_exposure_stability"] = stability(
-                self.frame_history["exposure"]
-            )
+            rc_exp = robust_cv(self.frame_history["exposure"])
+            temporal_features["temporal_exposure_stability"] = float(1.0 - np.clip(rc_exp, 0.0, 1.0))
             temporal_features["exposure_consistency_over_time"] = float(
                 np.clip(1.0 - np.std(self.frame_history["exposure"]), 0.0, 1.0)
             )

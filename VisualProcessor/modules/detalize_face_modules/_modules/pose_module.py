@@ -24,8 +24,10 @@ class PoseModule(FaceModule):
 
     def __init__(self, config: Optional[Dict[str, Any]] = None):
         super().__init__(config)
+        self.history_size = self.config.get("history_size", 30)  # 30 кадров ≈ 1-1.5 сек
+        self.head_turn_threshold = self.config.get("head_turn_threshold", 7.0)  # Порог для head_turn_frequency
         self._pose_history: Dict[int, deque] = defaultdict(
-            lambda: deque(maxlen=30)
+            lambda: deque(maxlen=self.history_size)
         )
 
     def required_inputs(self) -> List[str]:
@@ -120,13 +122,13 @@ class PoseModule(FaceModule):
         else:
             variability = 0.0
 
-        # Head turn frequency
+        # Head turn frequency (используем порог из config)
         if len(hist) >= 3:
             yaw_diffs = [
                 abs(hist[i]["yaw"] - hist[i - 1]["yaw"])
                 for i in range(1, len(hist))
             ]
-            turns = [1.0 if diff > 7.0 else 0.0 for diff in yaw_diffs]
+            turns = [1.0 if diff > self.head_turn_threshold else 0.0 for diff in yaw_diffs]
             turn_frequency = float(np.mean(turns))
         else:
             turn_frequency = 0.0
@@ -134,21 +136,46 @@ class PoseModule(FaceModule):
         # Attention-to-camera
         attention = float(np.exp(-((yaw / 25.0) ** 2)))
 
+        # Нормализуем углы для компактного представления
+        yaw_norm = float(np.clip(yaw / 90.0, -1.0, 1.0))
+        pitch_norm = float(np.clip(pitch / 90.0, -1.0, 1.0))
+        roll_norm = float(np.clip(roll / 90.0, -1.0, 1.0))
+
+        # Нормализуем looking_direction_vector (unit vector)
+        looking_dir_raw = np.array([
+            right_eye[0] - left_eye[0],
+            right_eye[1] - left_eye[1],
+            right_eye[2] - left_eye[2],
+        ])
+        looking_dir_norm = looking_dir_raw / (np.linalg.norm(looking_dir_raw) + 1e-6)
+        looking_direction_vector = [
+            float(looking_dir_norm[0]),
+            float(looking_dir_norm[1]),
+            float(looking_dir_norm[2]),
+        ]
+
+        # Confidences (используем detection_confidence как proxy)
+        detection_confidence = data.get("detection_confidence", 1.0)
+        pose_conf = float(detection_confidence)  # Можно улучшить, анализируя стабильность позы
+        landmark_conf = float(detection_confidence)
+        tracking_conf = float(detection_confidence)
+
         return {
             "pose": {
                 "yaw": float(yaw),
                 "pitch": float(pitch),
                 "roll": float(roll),
-                "avg_pose_angle": float(np.mean([yaw, pitch, roll])),
+                "yaw_norm": yaw_norm,
+                "pitch_norm": pitch_norm,
+                "roll_norm": roll_norm,
                 "head_pose_variability": variability,
                 "pose_stability_score": float(np.clip(1 - abs(yaw) / 45.0, 0.0, 1.0)),
                 "head_turn_frequency": turn_frequency,
                 "attention_to_camera_ratio": attention,
-                "looking_direction_vector": [
-                    float(right_eye[0] - left_eye[0]),
-                    float(right_eye[1] - left_eye[1]),
-                    float(right_eye[2] - left_eye[2]),
-                ],
+                "looking_direction_vector": looking_direction_vector,
+                "pose_conf": pose_conf,
+                "landmark_conf": landmark_conf,
+                "tracking_conf": tracking_conf,
             }
         }
 

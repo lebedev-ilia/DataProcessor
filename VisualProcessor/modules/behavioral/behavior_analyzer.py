@@ -21,14 +21,20 @@ from utils.logger import get_logger
 logger = get_logger(name)
 
 class HandGestureClassifier:
-    """Детальная классификация жестов рук"""
+    """
+    Детальная классификация жестов рук.
+
+    ВАЖНО: Классификатор теперь используется только как источник
+    вероятностного распределения по жестам (soft representation),
+    без `unknown` класса. Для задач sequence-моделирования мы хотим
+    гладкий вектор вероятностей, а не жёсткий one-hot/label.
+    """
     
     def __init__(self):
+        # Базовое множество "осмысленных" жестов (без unknown)
         self.gesture_types = {
             'pointing': self._is_pointing,
             'open_palm': self._is_open_palm,
-            'hands_on_hips': self._is_hands_on_hips,
-            'self_touch': self._is_self_touch,
             'fist': self._is_fist,
             'thumbs_up': self._is_thumbs_up,
             'thumbs_down': self._is_thumbs_down,
@@ -157,15 +163,46 @@ class HandGestureClassifier:
             states.get('pinky', False)
         ])
     
-    def classify_gesture(self, hand_landmarks, pose_landmarks=None):
-        """Классифицирует жест"""
+    def classify_gesture_hard(self, hand_landmarks, pose_landmarks=None) -> str:
+        """Жёсткая классификация жеста (для обратной совместимости/отладки)."""
         for gesture_name, check_func in self.gesture_types.items():
             try:
                 if check_func(hand_landmarks, pose_landmarks):
                     return gesture_name
-            except:
+            except Exception:
                 continue
+        # В новой схеме стараемся не использовать unknown дальше по пайплайну,
+        # но для дебага всё ещё возвращаем его здесь.
         return 'unknown'
+
+    def classify_gesture_soft(self, hand_landmarks, pose_landmarks=None) -> Dict[str, float]:
+        """
+        Мягкое представление жеста: распределение вероятностей по предопределённым типам.
+
+        Т.к. базовые правила детектора дискретные, мы эмулируем "мягкость":
+        - все жесты получают небольшой базовый вес (epsilon),
+        - найденный по правилам жест получает повышенный вес,
+        - затем нормируем вектор до суммы 1.0.
+        """
+        epsilon = 1e-3
+        scores = {g: epsilon for g in self.gesture_types.keys()}
+
+        detected = None
+        for gesture_name, check_func in self.gesture_types.items():
+            try:
+                if check_func(hand_landmarks, pose_landmarks):
+                    detected = gesture_name
+                    break
+            except Exception:
+                continue
+
+        if detected is not None:
+            # усиливаем найденный класс
+            scores[detected] = 1.0
+
+        total = float(sum(scores.values())) or 1.0
+        probs = {k: float(v / total) for k, v in scores.items()}
+        return probs
 
 
 class BodyLanguageAnalyzer:
@@ -175,7 +212,20 @@ class BodyLanguageAnalyzer:
         pass
     
     def analyze_posture(self, pose_landmarks, image_shape):
-        """Анализирует позу тела"""
+        """
+        Анализирует язык тела.
+
+        В НОВОЙ СХЕМЕ:
+        - вместо дискретных поз/ярлыков возвращаем непрерывные физические сигналы:
+          * arm_openness
+          * pose_expansion
+          * body_lean_angle
+          * balance_offset
+          * shoulder_angle
+        Старые флаги (`open_posture`, `closed_posture`, `power_pose`, `rigidity`, ...),
+        а также posture='standing/sitting' используются только для обратной
+        совместимости и могут быть убраны на следующих шагах.
+        """
         if pose_landmarks is None:
             return {}
         
@@ -201,16 +251,24 @@ class BodyLanguageAnalyzer:
         
         results = {}
         
-        # Поза (стоя/сидя)
+        # Базовые геометрические величины
+        shoulder_width = np.linalg.norm(left_shoulder - right_shoulder)
+        pelvis_center = (left_hip + right_hip) / 2
+        shoulder_center = (left_shoulder + right_shoulder) / 2
+
+        # ---------
+        # Старые флаги (сохраняем временно для обратной совместимости)
+        # ---------
+
+        # Поза (стоя/сидя) – будет удалена из FEATURES_DESCRIPTION
         shoulder_hip_distance = np.mean([
             np.linalg.norm(left_shoulder - left_hip),
             np.linalg.norm(right_shoulder - right_hip)
         ])
         results['posture'] = 'standing' if shoulder_hip_distance > h * 0.2 else 'sitting'
         
-        # Открытая/закрытая поза
+        # Открытая/закрытая поза (будет удалено из внешнего API)
         if left_wrist is not None and right_wrist is not None:
-            shoulder_width = np.linalg.norm(left_shoulder - right_shoulder)
             wrist_distance = np.linalg.norm(left_wrist - right_wrist)
             results['open_posture'] = wrist_distance > shoulder_width * 1.2
             results['closed_posture'] = wrist_distance < shoulder_width * 0.8
@@ -218,63 +276,102 @@ class BodyLanguageAnalyzer:
             results['open_posture'] = False
             results['closed_posture'] = False
         
-        # Power pose (доминантность)
+        # Power pose (будет удалено из FEATURES_DESCRIPTION)
         if left_wrist is not None and right_wrist is not None:
-            # Руки на бедрах или широко расставлены
-            hip_center = (left_hip + right_hip) / 2
+            hip_center = pelvis_center
             wrist_center = (left_wrist + right_wrist) / 2
             vertical_distance = abs(wrist_center[1] - hip_center[1])
             horizontal_spread = np.linalg.norm(left_wrist - right_wrist)
             
             results['power_pose'] = (
-                vertical_distance < h * 0.1 and  # руки на уровне бедер
-                horizontal_spread > shoulder_width * 1.5  # широко расставлены
+                vertical_distance < h * 0.1 and
+                horizontal_spread > shoulder_width * 1.5
             )
         else:
             results['power_pose'] = False
         
         # Напряженность (rigidity)
-        if left_shoulder is not None and right_shoulder is not None:
-            shoulder_angle = np.degrees(np.arctan2(
-                right_shoulder[1] - left_shoulder[1],
-                right_shoulder[0] - left_shoulder[0]
-            ))
-            # Прямые плечи = напряжение
-            results['rigidity'] = abs(shoulder_angle) < 5.0
-        else:
-            results['rigidity'] = False
+        shoulder_angle_deg = np.degrees(np.arctan2(
+            right_shoulder[1] - left_shoulder[1],
+            right_shoulder[0] - left_shoulder[0]
+        ))
+        results['rigidity'] = abs(shoulder_angle_deg) < 5.0
         
         # Расслабленность
         results['relaxed'] = not results.get('rigidity', False) and not results.get('closed_posture', False)
         
-        # Наклон вперед/назад
+        # ---------
+        # Новые непрерывные признаки
+        # ---------
+
+        # 1) Arm openness: wrist_distance / shoulder_width
+        if left_wrist is not None and right_wrist is not None and shoulder_width > 1e-6:
+            wrist_distance = np.linalg.norm(left_wrist - right_wrist)
+            arm_openness = float(wrist_distance / shoulder_width)
+        else:
+            arm_openness = 0.0
+        results['arm_openness'] = arm_openness
+
+        # 2) Pose expansion: отношение площади bbox человека к площади кадра
+        keypoints = [left_shoulder, right_shoulder, left_hip, right_hip]
+        if left_wrist is not None:
+            keypoints.append(left_wrist)
+        if right_wrist is not None:
+            keypoints.append(right_wrist)
+
+        xs = [p[0] for p in keypoints]
+        ys = [p[1] for p in keypoints]
+        min_x, max_x = min(xs), max(xs)
+        min_y, max_y = min(ys), max(ys)
+        person_area = max(0.0, (max_x - min_x) * (max_y - min_y))
+        frame_area = float(w * h) if w > 0 and h > 0 else 1.0
+        pose_expansion = float(person_area / frame_area)
+        results['pose_expansion'] = pose_expansion
+
+        # 3) Body lean angle (backward → forward, нормировано в [-1, 1])
         if nose is not None:
-            shoulder_center = (left_shoulder + right_shoulder) / 2
-            hip_center = (left_hip + right_hip) / 2
-            forward_lean = nose[0] - shoulder_center[0]
-            results['forward_lean'] = forward_lean > w * 0.02
-            results['backward_lean'] = forward_lean < -w * 0.02
-        
-        # Баланс тела (center of mass)
-        if all(x is not None for x in [left_shoulder, right_shoulder, left_hip, right_hip]):
-            center_top = (left_shoulder + right_shoulder) / 2
-            center_bottom = (left_hip + right_hip) / 2
-            center_of_mass = (center_top + center_bottom) / 2
-            frame_center_x = w / 2
-            results['balance_offset'] = (center_of_mass[0] - frame_center_x) / w
+            # Вектор от центра таза к носу
+            body_vec = nose - pelvis_center
+            # Рассматриваем наклон вперёд/назад вдоль оси Y; нормируем на высоту кадра
+            lean_raw = -(body_vec[1]) / max(float(h), 1.0)
+            body_lean_angle = float(np.clip(lean_raw * 5.0, -1.0, 1.0))
+        else:
+            body_lean_angle = 0.0
+        results['body_lean_angle'] = body_lean_angle
+
+        # 4) Balance offset (как и раньше, [-1,1] влево/вправо)
+        center_top = shoulder_center
+        center_bottom = pelvis_center
+        center_of_mass = (center_top + center_bottom) / 2
+        frame_center_x = w / 2
+        results['balance_offset'] = float((center_of_mass[0] - frame_center_x) / max(float(w), 1.0))
+
+        # 5) Shoulder angle (абсолютный угол в градусах, и служебно храним исходное значение)
+        results['shoulder_angle'] = float(shoulder_angle_deg)
         
         return results
 
 
 class SpeechBehaviorAnalyzer:
-    """Анализ синхронности губ со звуком"""
+    """
+    Анализ динамики рта/речи.
+
+    В новой схеме храним только "сырые" непрерывные признаки и простую
+    прокси-метрику речи, пригодные для подачи в VisualTransformer:
+      - mouth_width_norm
+      - mouth_height_norm
+      - mouth_area_norm
+      - mouth_velocity
+      - mouth_open_ratio
+      - speech_activity_proxy
+    """
     
     def __init__(self, window_size=10):
         self.window_size = window_size
         self.mouth_history = deque(maxlen=window_size)
     
-    def analyze_lip_sync(self, face_landmarks, image_shape):
-        """Анализирует движение губ"""
+    def analyze_mouth_dynamics(self, face_landmarks, image_shape):
+        """Анализирует динамику рта и прокси-активность речи."""
         if face_landmarks is None:
             return {}
         
@@ -310,220 +407,82 @@ class SpeechBehaviorAnalyzer:
         mouth_area = mouth_width * mouth_height
         
         # Сохраняем в историю
+        last_area = self.mouth_history[-1]['area'] if len(self.mouth_history) > 0 else None
         self.mouth_history.append({
             'width': mouth_width,
             'height': mouth_height,
             'area': mouth_area
         })
         
-        # Анализ активности речи
-        if len(self.mouth_history) >= 2:
-            area_changes = [abs(self.mouth_history[i]['area'] - self.mouth_history[i-1]['area']) 
-                          for i in range(1, len(self.mouth_history))]
-            avg_change = np.mean(area_changes) if area_changes else 0
-            
-            # Вероятность активности речи
-            speech_activity = min(1.0, avg_change / (w * 0.01))
+        # Мгновенная скорость изменения площади рта (proxy mouth_velocity)
+        if last_area is not None:
+            mouth_velocity = abs(mouth_area - last_area)
         else:
-            speech_activity = 0.0
+            mouth_velocity = 0.0
+
+        # Нормировки
+        frame_diag = float(np.sqrt(w ** 2 + h ** 2)) or 1.0
+        mouth_width_norm = float(mouth_width / frame_diag)
+        mouth_height_norm = float(mouth_height / frame_diag)
+        mouth_area_norm = float(mouth_area / (w * h + 1e-6))
+
+        # Отношение открытия
+        mouth_open_ratio = float(mouth_height / max(mouth_width, 1.0))
+
+        # Прокси активности речи: sigmoid(z(mouth_velocity))
+        # Масштабируем скорость и прогоняем через сигмоиду
+        scaled = mouth_velocity / (w * 0.01 + 1e-6)
+        speech_activity_proxy = float(1.0 / (1.0 + np.exp(-scaled)))
         
         return {
-            'mouth_width': float(mouth_width),
-            'mouth_height': float(mouth_height),
-            'mouth_area': float(mouth_area),
-            'speech_activity': float(speech_activity),
-            'mouth_open_ratio': float(mouth_height / max(mouth_width, 1))
+            'mouth_width_norm': mouth_width_norm,
+            'mouth_height_norm': mouth_height_norm,
+            'mouth_area_norm': mouth_area_norm,
+            'mouth_velocity': float(mouth_velocity),
+            'mouth_open_ratio': mouth_open_ratio,
+            'speech_activity_proxy': speech_activity_proxy,
         }
 
 
 class EngagementAnalyzer:
-    """Индекс вовлеченности"""
+    """
+    Ранее: hand-crafted индекс вовлеченности на кадр.
+
+    Теперь: интерфейс-заглушка для обратной совместимости.
+    Высокоуровневые метрики вовлеченности должны вычисляться уже
+    на уровне финальной головы (MLP), а не внутри behavioral.
+
+    Этот класс оставлен, чтобы не ломать импорт, но не используется
+    в новой схеме sequence features.
+    """
     
     def __init__(self, window_size=30):
         self.window_size = window_size
         self.engagement_history = deque(maxlen=window_size)
     
-    def calculate_engagement(self, face_landmarks, pose_landmarks, hand_landmarks_list, image_shape):
-        """Вычисляет индекс вовлеченности"""
-        h, w = image_shape[:2]
-        engagement_factors = []
-        
-        # 1. Зрительный контакт с камерой
-        if face_landmarks is not None:
-            # Проверяем направление взгляда (упрощенно)
-            nose = face_landmarks.landmark[1]  # кончик носа
-            frame_center_x = 0.5
-            gaze_direction = abs(nose.x - frame_center_x)
-            eye_contact = 1.0 - min(1.0, gaze_direction * 2)  # ближе к центру = выше контакт
-            engagement_factors.append(('eye_contact', eye_contact))
-        
-        # 2. Движения головы
-        if face_landmarks is not None:
-            # Микродвижения головы (вариативность позиции)
-            if len(self.engagement_history) >= 2:
-                head_movements = len(self.engagement_history) - 1
-                head_activity = min(1.0, head_movements / self.window_size)
-            else:
-                head_activity = 0.5
-            engagement_factors.append(('head_movement', head_activity))
-        
-        # 3. Активность жестов
-        gesture_activity = len(hand_landmarks_list) > 0
-        if gesture_activity:
-            gesture_score = min(1.0, len(hand_landmarks_list) / 2.0)
-        else:
-            gesture_score = 0.3  # базовая активность без жестов
-        engagement_factors.append(('gesture_activity', gesture_score))
-        
-        # 4. Поза тела (открытая = вовлеченность)
-        if pose_landmarks is not None:
-            body_analyzer = BodyLanguageAnalyzer()
-            posture_analysis = body_analyzer.analyze_posture(pose_landmarks, image_shape)
-            open_posture_score = 1.0 if posture_analysis.get('open_posture', False) else 0.5
-            engagement_factors.append(('open_posture', open_posture_score))
-        
-        # Общий индекс вовлеченности
-        if engagement_factors:
-            engagement_score = np.mean([score for _, score in engagement_factors])
-        else:
-            engagement_score = 0.5
-        
-        # Сохраняем в историю
-        self.engagement_history.append(engagement_score)
-        
-        # Вариативность вовлеченности
-        if len(self.engagement_history) >= 2:
-            engagement_variation = np.std(list(self.engagement_history))
-        else:
-            engagement_variation = 0.0
-        
-        # Пики вовлеченности
-        if len(self.engagement_history) >= 3:
-            engagement_peaks = sum(1 for i in range(1, len(self.engagement_history)-1)
-                                 if self.engagement_history[i] > self.engagement_history[i-1] and
-                                    self.engagement_history[i] > self.engagement_history[i+1])
-        else:
-            engagement_peaks = 0
-        
-        # Консистентность
-        if len(self.engagement_history) >= 2:
-            engagement_consistency = 1.0 - engagement_variation
-        else:
-            engagement_consistency = 1.0
-        
-        return {
-            'engagement_score': float(engagement_score),
-            'engagement_variation': float(engagement_variation),
-            'engagement_peaks': int(engagement_peaks),
-            'engagement_consistency': float(engagement_consistency),
-            'factors': {name: float(score) for name, score in engagement_factors}
-        }
+    def calculate_engagement(self, *args, **kwargs):
+        """
+        Возвращает пустую структуру. Логика engagement перенесена
+        на уровень агрегированных фичей (post-hoc).
+        """
+        return {}
 
 
 class ConfidenceAnalyzer:
-    """Индекс уверенности/доминантности"""
+    """
+    Ранее: кадровый индекс уверенности/доминантности.
+
+    В новой схеме confidence/dominance считаются уже из латентных
+    представлений модели (MLP head), а не внутри MediaPipe-пайплайна.
+    """
     
     def __init__(self, window_size=30):
         self.window_size = window_size
         self.confidence_history = deque(maxlen=window_size)
     
-    def calculate_confidence(self, pose_landmarks, face_landmarks, hand_landmarks_list, image_shape):
-        """Вычисляет индекс уверенности"""
-        h, w = image_shape[:2]
-        confidence_factors = []
-        
-        # 1. Открытая поза
-        if pose_landmarks is not None:
-            body_analyzer = BodyLanguageAnalyzer()
-            posture_analysis = body_analyzer.analyze_posture(pose_landmarks, image_shape)
-            
-            open_posture = posture_analysis.get('open_posture', False)
-            power_pose = posture_analysis.get('power_pose', False)
-            
-            if power_pose:
-                posture_score = 1.0
-            elif open_posture:
-                posture_score = 0.7
-            else:
-                posture_score = 0.3
-            
-            confidence_factors.append(('open_posture', posture_score))
-        
-        # 2. Наклон головы (прямая голова = уверенность)
-        if face_landmarks is not None:
-            # Упрощенная проверка: симметрия лица
-            left_face = face_landmarks.landmark[33]  # левая сторона
-            right_face = face_landmarks.landmark[263]  # правая сторона
-            nose = face_landmarks.landmark[1]
-            
-            face_center_x = (left_face.x + right_face.x) / 2
-            head_tilt = abs(nose.x - face_center_x)
-            head_straight = 1.0 - min(1.0, head_tilt * 5)
-            confidence_factors.append(('head_straight', head_straight))
-        
-        # 3. Жесты (уверенные жесты)
-        if hand_landmarks_list:
-            # Открытые ладони = уверенность
-            gesture_classifier = HandGestureClassifier()
-            confident_gestures = ['open_palm', 'pointing', 'thumbs_up']
-            confident_count = 0
-            
-            for hand_landmarks in hand_landmarks_list:
-                gesture = gesture_classifier.classify_gesture(hand_landmarks, pose_landmarks)
-                if gesture in confident_gestures:
-                    confident_count += 1
-            
-            gesture_score = min(1.0, confident_count / len(hand_landmarks_list))
-            confidence_factors.append(('confident_gestures', gesture_score))
-        else:
-            confidence_factors.append(('confident_gestures', 0.5))
-        
-        # 4. Положение плеч (прямые плечи = уверенность)
-        if pose_landmarks is not None:
-            left_shoulder = pose_landmarks.landmark[11]
-            right_shoulder = pose_landmarks.landmark[12]
-            shoulder_level = 1.0 - abs(left_shoulder.y - right_shoulder.y) * 10
-            shoulder_score = max(0.0, min(1.0, shoulder_level))
-            confidence_factors.append(('shoulder_level', shoulder_score))
-        
-        # Общий индекс уверенности
-        if confidence_factors:
-            confidence_score = np.mean([score for _, score in confidence_factors])
-        else:
-            confidence_score = 0.5
-        
-        # Доминантность (на основе power pose и уверенности)
-        dominance_score = confidence_score
-        if pose_landmarks is not None:
-            body_analyzer = BodyLanguageAnalyzer()
-            posture_analysis = body_analyzer.analyze_posture(pose_landmarks, image_shape)
-            if posture_analysis.get('power_pose', False):
-                dominance_score = min(1.0, dominance_score * 1.2)
-        
-        # Сохраняем в историю
-        self.confidence_history.append(confidence_score)
-        
-        # Вариативность
-        if len(self.confidence_history) >= 2:
-            confidence_variability = np.std(list(self.confidence_history))
-        else:
-            confidence_variability = 0.0
-        
-        # Пики уверенности
-        if len(self.confidence_history) >= 3:
-            confidence_peaks = sum(1 for i in range(1, len(self.confidence_history)-1)
-                                 if self.confidence_history[i] > self.confidence_history[i-1] and
-                                    self.confidence_history[i] > self.confidence_history[i+1])
-        else:
-            confidence_peaks = 0
-        
-        return {
-            'confidence_score': float(confidence_score),
-            'dominance_score': float(dominance_score),
-            'confidence_variability': float(confidence_variability),
-            'confidence_peak_moments': int(confidence_peaks),
-            'factors': {name: float(score) for name, score in confidence_factors}
-        }
+    def calculate_confidence(self, *args, **kwargs):
+        """Возвращает пустую структуру, логика вынесена наружу."""
+        return {}
 
 
 class StressAnalyzer:
@@ -535,106 +494,58 @@ class StressAnalyzer:
         self.movement_history = deque(maxlen=window_size)
     
     def analyze_stress(self, face_landmarks, pose_landmarks, hand_landmarks_list, image_shape):
-        """Анализирует признаки стресса"""
+        """
+        Анализирует "сырые" признаки стресса без интерпретаций:
+          - blink_flag / blink_rate_short
+          - self_touch_flag
+          - fidgeting_energy
+        """
         h, w = image_shape[:2]
-        stress_indicators = []
+
+        blink_flag = 0
+        blink_rate_short = 0.0
+        self_touch_flag = 0
+        fidgeting_energy = 0.0
         
-        # 1. Частое моргание
+        # 1. Моргание (EAR)
         if face_landmarks is not None:
-            # Вычисляем EAR (Eye Aspect Ratio)
             left_ear = self._calculate_ear(face_landmarks, image_shape, 'left')
             right_ear = self._calculate_ear(face_landmarks, image_shape, 'right')
             avg_ear = (left_ear + right_ear) / 2
             
-            # Моргание (EAR < 0.2)
             is_blinking = avg_ear < 0.2
+            blink_flag = int(is_blinking)
             self.blink_history.append(is_blinking)
             
-            if len(self.blink_history) >= 5:
-                blink_rate = sum(self.blink_history) / len(self.blink_history)
-                # Высокая частота моргания (>0.3) = стресс
-                frequent_blinking = blink_rate > 0.3
-                stress_indicators.append(('frequent_blinking', frequent_blinking, blink_rate))
-        
-        # 2. Self-touch жесты
+            if len(self.blink_history) > 0:
+                blink_rate_short = float(sum(self.blink_history) / len(self.blink_history))
+
+        # 2. Self-touch (через классификацию жестов)
         if hand_landmarks_list:
             gesture_classifier = HandGestureClassifier()
-            self_touch_count = 0
-            
             for hand_landmarks in hand_landmarks_list:
-                gesture = gesture_classifier.classify_gesture(hand_landmarks, pose_landmarks)
+                gesture = gesture_classifier.classify_gesture_hard(hand_landmarks, pose_landmarks)
                 if gesture == 'self_touch':
-                    self_touch_count += 1
+                    self_touch_flag = 1
+                    break
+        
+        # 3. Fidgeting (вариативность позиции носа за последнее окно)
+        if pose_landmarks is not None and len(pose_landmarks.landmark) > 0:
+            nose = pose_landmarks.landmark[0]
+            current_pos = np.array([nose.x, nose.y])
+            self.movement_history.append(current_pos)
             
-            self_touch_score = min(1.0, self_touch_count / len(hand_landmarks_list))
-            stress_indicators.append(('self_touch', self_touch_score > 0.5, self_touch_score))
-        
-        # 3. Закрытая поза
-        if pose_landmarks is not None:
-            body_analyzer = BodyLanguageAnalyzer()
-            posture_analysis = body_analyzer.analyze_posture(pose_landmarks, image_shape)
-            closed_posture = posture_analysis.get('closed_posture', False)
-            stress_indicators.append(('closed_posture', closed_posture, 1.0 if closed_posture else 0.0))
-        
-        # 4. Напряженность (rigidity)
-        if pose_landmarks is not None:
-            body_analyzer = BodyLanguageAnalyzer()
-            posture_analysis = body_analyzer.analyze_posture(pose_landmarks, image_shape)
-            rigidity = posture_analysis.get('rigidity', False)
-            stress_indicators.append(('rigidity', rigidity, 1.0 if rigidity else 0.0))
-        
-        # 5. Fidgeting (ёрзание) - быстрые мелкие движения
-        if pose_landmarks is not None:
-            # Сохраняем позицию для анализа движения
-            nose = pose_landmarks.landmark[0] if len(pose_landmarks.landmark) > 0 else None
-            if nose is not None:
-                current_pos = np.array([nose.x, nose.y])
-                self.movement_history.append(current_pos)
-                
-                if len(self.movement_history) >= 5:
-                    # Вычисляем вариативность движения
-                    positions = list(self.movement_history)
-                    movement_variance = np.var([p[0] for p in positions]) + np.var([p[1] for p in positions])
-                    # Высокая вариативность = ёрзание
-                    fidgeting = movement_variance > 0.001
-                    stress_indicators.append(('fidgeting', fidgeting, min(1.0, movement_variance * 1000)))
-        
-        # 6. Несинхронные движения (если есть несколько рук)
-        if len(hand_landmarks_list) >= 2:
-            # Проверяем синхронность движений рук
-            hand_positions = []
-            for hand_landmarks in hand_landmarks_list:
-                wrist = hand_landmarks.landmark[0]
-                hand_positions.append(np.array([wrist.x, wrist.y]))
-            
-            if len(hand_positions) == 2:
-                # Расстояние между руками
-                hand_distance = np.linalg.norm(hand_positions[0] - hand_positions[1])
-                # Несинхронность = большая разница в движении
-                async_movement = hand_distance > 0.3
-                stress_indicators.append(('async_movement', async_movement, min(1.0, hand_distance)))
-        
-        # Общий индекс стресса
-        if stress_indicators:
-            stress_scores = [score for _, _, score in stress_indicators]
-            stress_level = np.mean(stress_scores)
-        else:
-            stress_level = 0.0
-        
-        # Детализация по категориям
-        stress_breakdown = {
-            name: {
-                'present': present,
-                'intensity': float(score)
-            }
-            for name, present, score in stress_indicators
-        }
-        
+            if len(self.movement_history) >= 2:
+                positions = np.stack(self.movement_history, axis=0)
+                var_x = float(np.var(positions[:, 0]))
+                var_y = float(np.var(positions[:, 1]))
+                fidgeting_energy = var_x + var_y
+
         return {
-            'stress_level': float(stress_level),
-            'anxiety_score': float(stress_level * 0.9),  # тревожность связана со стрессом
-            'stress_indicators': stress_breakdown,
-            'stress_count': sum(1 for _, present, _ in stress_indicators if present)
+            'blink_flag': int(blink_flag),
+            'blink_rate_short': float(blink_rate_short),
+            'self_touch_flag': int(self_touch_flag),
+            'fidgeting_energy': float(fidgeting_energy),
         }
     
     def _calculate_ear(self, face_landmarks, image_shape, eye_type='left'):
@@ -728,9 +639,19 @@ class BehaviorAnalyzer:
         self.engagement_analyzer = EngagementAnalyzer()
         self.confidence_analyzer = ConfidenceAnalyzer()
         self.stress_analyzer = StressAnalyzer()
+        # для динамики головы/плеч/рук
+        self._prev_head_center = None
+        self._prev_shoulder_angle = None
+        self._prev_hands_center = None
     
     def process_frame(self, frame: np.ndarray) -> Dict[str, Any]:
-        """Обрабатывает один кадр"""
+        """
+        Обрабатывает один кадр и возвращает "сырые" непрерывные поведенческие сигналы.
+
+        Результат содержит:
+          - sequence_features: числовые каналы для VisualTransformer
+          - вспомогательные поля (hand_gestures, body_language_raw, и т.п.) для отладки.
+        """
         rgb_frame = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
         rgb_frame.flags.writeable = False
         
@@ -741,61 +662,134 @@ class BehaviorAnalyzer:
         hands_results = self.hands.process(rgb_frame)
         face_results = self.face_mesh.process(rgb_frame)
         
-        results = {}
+        results: Dict[str, Any] = {}
+        sequence_features: Dict[str, Any] = {}
         
-        # Жесты рук
+        # -------------------------
+        # 1. РУКИ И ЖЕСТЫ
+        # -------------------------
         hand_gestures = []
         hand_landmarks_list = []
         if hands_results.multi_hand_landmarks:
             for hand_landmarks in hands_results.multi_hand_landmarks:
                 hand_landmarks_list.append(hand_landmarks)
-                gesture = self.gesture_classifier.classify_gesture(
+                gesture = self.gesture_classifier.classify_gesture_hard(
                     hand_landmarks,
                     pose_results.pose_landmarks
                 )
                 hand_gestures.append(gesture)
         
         results['hand_gestures'] = hand_gestures
-        results['num_hands'] = len(hand_landmarks_list)
+        num_hands = len(hand_landmarks_list)
+        results['num_hands'] = num_hands
+        sequence_features['num_hands'] = int(num_hands)
+        sequence_features['hands_visibility'] = 1 if num_hands > 0 else 0
+
+        # Мягкое представление жестов: усредняем по всем рукам
+        gesture_probs_accum = {g: 0.0 for g in self.gesture_classifier.gesture_types.keys()}
+        if hand_landmarks_list:
+            for hand_landmarks in hand_landmarks_list:
+                probs = self.gesture_classifier.classify_gesture_soft(
+                    hand_landmarks,
+                    pose_results.pose_landmarks
+                )
+                for g, p in probs.items():
+                    gesture_probs_accum[g] += float(p)
+            # усредняем по числу рук
+            for g in gesture_probs_accum.keys():
+                gesture_probs_accum[g] /= float(len(hand_landmarks_list))
+        # пишем как отдельные каналы
+        sequence_features['gesture_probs'] = gesture_probs_accum
+
+        # Hand motion energy: движение центра запястий между кадрами
+        current_hands_center = None
+        if hand_landmarks_list:
+            wrist_points = []
+            for hand_landmarks in hand_landmarks_list:
+                wrist = hand_landmarks.landmark[0]
+                wrist_points.append(np.array([wrist.x * w, wrist.y * h]))
+            current_hands_center = np.mean(wrist_points, axis=0)
+
+        if current_hands_center is not None and self._prev_hands_center is not None:
+            hand_motion_energy = float(np.linalg.norm(current_hands_center - self._prev_hands_center))
+        else:
+            hand_motion_energy = 0.0
+        sequence_features['hand_motion_energy'] = hand_motion_energy
+        self._prev_hands_center = current_hands_center
         
-        # Body language
+        # -------------------------
+        # 2. ТЕЛО / ПОЗА
+        # -------------------------
         if pose_results.pose_landmarks:
             body_language = self.body_analyzer.analyze_posture(
                 pose_results.pose_landmarks,
                 frame.shape
             )
-            results['body_language'] = body_language
+            results['body_language'] = body_language  # raw debug
+
+            sequence_features['arm_openness'] = float(body_language.get('arm_openness', 0.0))
+            sequence_features['pose_expansion'] = float(body_language.get('pose_expansion', 0.0))
+            sequence_features['body_lean_angle'] = float(body_language.get('body_lean_angle', 0.0))
+            sequence_features['balance_offset'] = float(body_language.get('balance_offset', 0.0))
+
+            shoulder_angle = float(body_language.get('shoulder_angle', 0.0))
+            sequence_features['shoulder_angle'] = shoulder_angle
+
+            if self._prev_shoulder_angle is not None:
+                shoulder_angle_velocity = abs(shoulder_angle - self._prev_shoulder_angle)
+            else:
+                shoulder_angle_velocity = 0.0
+            sequence_features['shoulder_angle_velocity'] = float(shoulder_angle_velocity)
+            self._prev_shoulder_angle = shoulder_angle
         
-        # Speech behavior
+        # -------------------------
+        # 3. ГОЛОВА / ВЗГЛЯД (proxy)
+        # -------------------------
+        head_position_x_norm = 0.0
+        head_position_y_norm = 0.0
+        head_motion_energy = 0.0
+        head_stability = 1.0
+
+        face_landmarks = None
         if face_results.multi_face_landmarks:
             face_landmarks = face_results.multi_face_landmarks[0]
-            speech_behavior = self.speech_analyzer.analyze_lip_sync(
+            # центр головы как центр bbox по всем точкам
+            xs = []
+            ys = []
+            for lm in face_landmarks.landmark:
+                xs.append(lm.x * w)
+                ys.append(lm.y * h)
+            if xs and ys:
+                cx = float(np.mean(xs))
+                cy = float(np.mean(ys))
+                head_position_x_norm = cx / max(float(w), 1.0)
+                head_position_y_norm = cy / max(float(h), 1.0)
+
+                current_head_center = np.array([cx, cy])
+                if self._prev_head_center is not None:
+                    head_motion_energy = float(np.linalg.norm(current_head_center - self._prev_head_center))
+                self._prev_head_center = current_head_center
+
+        sequence_features['head_position_x_norm'] = float(head_position_x_norm)
+        sequence_features['head_position_y_norm'] = float(head_position_y_norm)
+        sequence_features['head_motion_energy'] = float(head_motion_energy)
+        head_stability = float(1.0 / (head_motion_energy + 1e-6))
+        sequence_features['head_stability'] = head_stability
+
+        # -------------------------
+        # 4. РОТ / РЕЧЬ
+        # -------------------------
+        if face_landmarks is not None:
+            mouth_dynamics = self.speech_analyzer.analyze_mouth_dynamics(
                 face_landmarks,
                 frame.shape
             )
-            results['speech_behavior'] = speech_behavior
-        else:
-            face_landmarks = None
-        
-        # Engagement Index
-        engagement = self.engagement_analyzer.calculate_engagement(
-            face_landmarks,
-            pose_results.pose_landmarks,
-            hand_landmarks_list,
-            frame.shape
-        )
-        results['engagement'] = engagement
-        
-        # Confidence/Dominance Index
-        confidence = self.confidence_analyzer.calculate_confidence(
-            pose_results.pose_landmarks,
-            face_landmarks,
-            hand_landmarks_list,
-            frame.shape
-        )
-        results['confidence'] = confidence
-        
-        # Stress/Anxiety
+            results['speech_behavior'] = mouth_dynamics
+            sequence_features.update(mouth_dynamics)
+
+        # -------------------------
+        # 5. СТРЕСС: RAW СИГНАЛЫ
+        # -------------------------
         stress = self.stress_analyzer.analyze_stress(
             face_landmarks,
             pose_results.pose_landmarks,
@@ -803,6 +797,10 @@ class BehaviorAnalyzer:
             frame.shape
         )
         results['stress'] = stress
+        sequence_features.update(stress)
+
+        # Записываем sequence_features
+        results['sequence_features'] = sequence_features
         
         return results
     
@@ -812,7 +810,7 @@ class BehaviorAnalyzer:
 
         fps = frame_manager.fps
         
-        all_results = {}
+        all_results: Dict[int, Dict[str, Any]] = {}
         c = 0
         t = time.time()
         
@@ -820,7 +818,8 @@ class BehaviorAnalyzer:
             frame = frame_manager.get(frame_idx)
             
             result = self.process_frame(frame)
-            result['timestamp'] = frame_idx / fps
+            timestamp = frame_idx / fps
+            result['timestamp'] = float(timestamp)
             all_results[frame_idx] = result
 
             c += 1
@@ -830,6 +829,17 @@ class BehaviorAnalyzer:
                 d = round(l - t, 2)
                 t = l
                 logger.info(f"Behavioral | Обработано кадров: {c}/{len(frame_indices)} | Time: {d}")
+        
+        # Нормализованный timestamp (t / video_duration)
+        if all_results:
+            min_f = min(frame_indices)
+            max_f = max(frame_indices)
+            video_duration = max((max_f - min_f) / fps, 1e-6)
+            for idx, res in all_results.items():
+                t_abs = res.get('timestamp', 0.0)
+                t_rel = float(np.clip(t_abs / video_duration, 0.0, 1.0))
+                seq = res.setdefault('sequence_features', {})
+                seq['timestamp_norm'] = t_rel
         
         aggregated = self._aggregate_results(all_results)
         
@@ -867,46 +877,217 @@ class BehaviorAnalyzer:
         return obj
     
     def _aggregate_results(self, results: List[Dict[str, Any]]) -> Dict[str, Any]:
-        """Агрегирует результаты по всему видео"""
+        """
+        Агрегирует результаты по всему видео.
+
+        Важно: здесь допустима интерпретация и high-level метрики,
+        но они считаются из сырых sequence_features.
+        """
         if not results:
             return {}
         
-        aggregated = {}
-        
-        # Средние значения
-        engagement_scores = [r.get('engagement', {}).get('engagement_score', 0) for r in results.values()]
-        confidence_scores = [r.get('confidence', {}).get('confidence_score', 0) for r in results.values()]
-        stress_scores = [r.get('stress', {}).get('stress_level', 0) for r in results.values()]
-        
-        aggregated['avg_engagement'] = float(np.mean(engagement_scores))
-        aggregated['avg_confidence'] = float(np.mean(confidence_scores))
-        aggregated['avg_stress'] = float(np.mean(stress_scores))
-        
-        # Максимальные значения
-        aggregated['max_engagement'] = float(np.max(engagement_scores))
-        aggregated['max_confidence'] = float(np.max(confidence_scores))
-        aggregated['max_stress'] = float(np.max(stress_scores))
-        
-        # Статистика жестов
+        aggregated: Dict[str, Any] = {}
+
+        # Собираем последовательности по кадрам
+        seq_list = [r.get('sequence_features', {}) for r in results.values()]
+
+        def get_series(key: str):
+            return np.array([float(s.get(key, 0.0)) for s in seq_list], dtype=float) if seq_list else np.zeros(0)
+
+        # -----------------------------
+        # 1. ENGAGEMENT (high-level)
+        # -----------------------------
+        # Простая прокси: комбинация активности рта, жестов и наклона корпуса
+        speech_proxy = get_series('speech_activity_proxy')
+        arm_open = get_series('arm_openness')
+        body_lean = get_series('body_lean_angle')
+
+        # нормировка
+        def norm_sig(x):
+            return 1.0 / (1.0 + np.exp(-x)) if np.isscalar(x) else 1.0 / (1.0 + np.exp(-x))
+
+        engagement_signal = 0.5 * speech_proxy + 0.3 * norm_sig(arm_open) + 0.2 * norm_sig(body_lean)
+        if engagement_signal.size == 0:
+            engagement_signal = np.zeros(1)
+
+        aggregated['avg_engagement'] = float(np.mean(engagement_signal))
+        aggregated['max_engagement'] = float(np.max(engagement_signal))
+        aggregated['engagement_variance'] = float(np.var(engagement_signal))
+
+        # Пики вовлечённости (локальные максимумы)
+        engagement_peaks = 0
+        if engagement_signal.size >= 3:
+            for i in range(1, engagement_signal.size - 1):
+                if engagement_signal[i] > engagement_signal[i - 1] and engagement_signal[i] > engagement_signal[i + 1]:
+                    engagement_peaks += 1
+        aggregated['engagement_peaks'] = int(engagement_peaks)
+
+        n = engagement_signal.size
+        if n >= 5:
+            split = max(int(0.2 * n), 1)
+            early = engagement_signal[:split]
+            late = engagement_signal[-split:]
+            aggregated['early_engagement_mean'] = float(np.mean(early))
+            aggregated['late_engagement_mean'] = float(np.mean(late))
+        else:
+            aggregated['early_engagement_mean'] = float(np.mean(engagement_signal))
+            aggregated['late_engagement_mean'] = float(np.mean(engagement_signal))
+
+        # -----------------------------
+        # 2. CONFIDENCE / DOMINANCE
+        # -----------------------------
+        # Proxy: открытость рук + наклон корпуса вперёд
+        confidence_signal = 0.6 * norm_sig(arm_open) + 0.4 * norm_sig(body_lean)
+        if confidence_signal.size == 0:
+            confidence_signal = np.zeros(1)
+
+        aggregated['avg_confidence'] = float(np.mean(confidence_signal))
+        aggregated['max_confidence'] = float(np.max(confidence_signal))
+        aggregated['confidence_variance'] = float(np.var(confidence_signal))
+
+        confidence_peaks = 0
+        if confidence_signal.size >= 3:
+            for i in range(1, confidence_signal.size - 1):
+                if confidence_signal[i] > confidence_signal[i - 1] and confidence_signal[i] > confidence_signal[i + 1]:
+                    confidence_peaks += 1
+        aggregated['confidence_peak_count'] = int(confidence_peaks)
+
+        # -----------------------------
+        # 3. STRESS SUMMARY
+        # -----------------------------
+        blink_rate_short = get_series('blink_rate_short')
+        self_touch_flag = get_series('self_touch_flag')
+        fidgeting_energy = get_series('fidgeting_energy')
+
+        stress_proxy = 0.4 * blink_rate_short + 0.3 * self_touch_flag + 0.3 * norm_sig(fidgeting_energy * 10.0)
+        if stress_proxy.size == 0:
+            stress_proxy = np.zeros(1)
+
+        aggregated['avg_stress'] = float(np.mean(stress_proxy))
+        aggregated['max_stress'] = float(np.max(stress_proxy))
+        aggregated['stress_spike_count'] = int(np.sum(stress_proxy > (np.mean(stress_proxy) + np.std(stress_proxy))))
+        aggregated['stress_duration_ratio'] = float(np.mean(stress_proxy > 0.5))
+
+        # -----------------------------
+        # 4. GESTURE STATISTICS
+        # -----------------------------
+        # Используем как gesture_counts (по hard-ярлыкам) и soft-характеристики
         all_gestures = []
         for r in results.values():
             all_gestures.extend(r.get('hand_gestures', []))
-        
-        gesture_counts = {}
-        for gesture in all_gestures:
-            gesture_counts[gesture] = gesture_counts.get(gesture, 0) + 1
-        
-        aggregated['gesture_statistics'] = gesture_counts
-        
-        # Статистика поз
-        postures = [r.get('body_language', {}).get('posture', 'unknown') for r in results.values()]
-        posture_counts = {}
-        for posture in postures:
-            if posture != 'unknown':
-                posture_counts[posture] = posture_counts.get(posture, 0) + 1
-        
-        aggregated['posture_statistics'] = posture_counts
-        
+        gesture_counts: Dict[str, int] = {}
+        for g in all_gestures:
+            gesture_counts[g] = gesture_counts.get(g, 0) + 1
+        aggregated['gesture_counts'] = gesture_counts
+
+        total_frames = max(len(seq_list), 1)
+        aggregated['gesture_rate_per_sec'] = float(len(all_gestures) / total_frames)
+
+        # gesture entropy по soft распределениям
+        entropies = []
+        for s in seq_list:
+            probs = s.get('gesture_probs', {})
+            if not probs:
+                continue
+            p = np.array(list(probs.values()), dtype=float)
+            p = p / (p.sum() + 1e-8)
+            ent = float(-np.sum(p * np.log2(p + 1e-8)))
+            entropies.append(ent)
+        aggregated['gesture_entropy_mean'] = float(np.mean(entropies)) if entropies else 0.0
+
+        if gesture_counts:
+            dominant = max(gesture_counts.values())
+            aggregated['dominant_gesture_ratio'] = float(dominant / max(sum(gesture_counts.values()), 1))
+        else:
+            aggregated['dominant_gesture_ratio'] = 0.0
+
+        # Простая оценка скорости смены жестов
+        gesture_switches = 0
+        if all_gestures:
+            for i in range(1, len(all_gestures)):
+                if all_gestures[i] != all_gestures[i - 1]:
+                    gesture_switches += 1
+        aggregated['gesture_switching_rate'] = float(gesture_switches / max(total_frames - 1, 1))
+
+        # -----------------------------
+        # 5. BODY & MOTION SUMMARY
+        # -----------------------------
+        pose_expansion = get_series('pose_expansion')
+        balance_offset = get_series('balance_offset')
+
+        aggregated['avg_arm_openness'] = float(np.mean(arm_open)) if arm_open.size > 0 else 0.0
+        aggregated['avg_pose_expansion'] = float(np.mean(pose_expansion)) if pose_expansion.size > 0 else 0.0
+
+        # Энергия движения тела: используем head_motion_energy как прокси
+        body_motion_energy = get_series('head_motion_energy')
+        aggregated['body_motion_energy_mean'] = float(np.mean(body_motion_energy)) if body_motion_energy.size > 0 else 0.0
+        aggregated['body_motion_energy_var'] = float(np.var(body_motion_energy)) if body_motion_energy.size > 0 else 0.0
+
+        # -----------------------------
+        # 6. SPEECH / RHYTHM SUMMARY
+        # -----------------------------
+        speech_proxy = get_series('speech_activity_proxy')
+        aggregated['speech_activity_ratio'] = float(np.mean(speech_proxy > 0.5)) if speech_proxy.size > 0 else 0.0
+
+        # burstiness: насколько активность речи сконцентрирована
+        if speech_proxy.size > 0:
+            mean_s = float(np.mean(speech_proxy))
+            if mean_s > 0:
+                aggregated['speech_burstiness'] = float(np.var(speech_proxy) / (mean_s ** 2 + 1e-8))
+            else:
+                aggregated['speech_burstiness'] = 0.0
+        else:
+            aggregated['speech_burstiness'] = 0.0
+
+        aggregated['mouth_rhythm_score'] = float(np.std(speech_proxy)) if speech_proxy.size > 0 else 0.0
+
+        # -----------------------------
+        # 7. TEMPORAL CONTRAST
+        # -----------------------------
+        def temporal_contrast(sig):
+            if sig.size == 0:
+                return 0.0, 0.0, 0.0
+            mean_val = float(np.mean(sig))
+            max_val = float(np.max(sig))
+            contrast = max_val - mean_val
+            n_local = sig.size
+            if n_local >= 5:
+                split = max(int(0.2 * n_local), 1)
+                early = sig[:split]
+                late = sig[-split:]
+                early_mean = float(np.mean(early))
+                late_mean = float(np.mean(late))
+            else:
+                early_mean = late_mean = mean_val
+            return contrast, early_mean, late_mean
+
+        engagement_contrast, early_e, late_e = temporal_contrast(engagement_signal)
+        confidence_contrast, early_c, late_c = temporal_contrast(confidence_signal)
+        stress_contrast, early_s, late_s = temporal_contrast(stress_proxy)
+
+        aggregated['engagement_contrast'] = float(engagement_contrast)
+        aggregated['confidence_contrast'] = float(confidence_contrast)
+        aggregated['stress_contrast'] = float(stress_contrast)
+
+        aggregated['early_late_ratios'] = {
+            'engagement': float((late_e + 1e-6) / (early_e + 1e-6)),
+            'speech_activity': float((late_s + 1e-6) / (early_s + 1e-6)),
+            'gesture_rate': float(aggregated['gesture_rate_per_sec'])
+        }
+
+        # -----------------------------
+        # 8. PRESENCE & FRAMING
+        # -----------------------------
+        num_hands_series = get_series('num_hands')
+        hands_visibility_ratio = float(np.mean(num_hands_series > 0)) if num_hands_series.size > 0 else 0.0
+        aggregated['hands_visibility_ratio'] = hands_visibility_ratio
+
+        # face_visibility_ratio – по наличию head_position (ненулевой x_norm)
+        head_x = get_series('head_position_x_norm')
+        aggregated['face_visibility_ratio'] = float(np.mean(head_x > 0)) if head_x.size > 0 else 0.0
+
+        aggregated['center_bias_mean'] = float(np.mean(np.abs(balance_offset))) if balance_offset.size > 0 else 0.0
+
         return aggregated
     
     def __del__(self):

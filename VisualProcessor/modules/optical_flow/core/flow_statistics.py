@@ -14,7 +14,7 @@ from dataclasses import dataclass, asdict
 from datetime import datetime
 from pathlib import Path
 import warnings
-from scipy.signal import savgol_filter, find_peaks
+from scipy.signal import savgol_filter, find_peaks, detrend
 import logging
 from glob import glob
 
@@ -44,13 +44,19 @@ class FlowFrameStatistics:
     
     @staticmethod
     def calculate(flow_tensor: Union[torch.Tensor, str], 
-                  config = None) -> Dict[str, Any]:
+                  config = None,
+                  fps: float = 25.0,
+                  frame_step: int = 1,
+                  quality_features: Optional[Dict[str, Any]] = None) -> Dict[str, Any]:
         """
         Вычисляет статистики для одного кадра потока.
         
         Args:
             flow_tensor: Тензор [2, H, W] или путь к .pt файлу
             config: Конфигурация анализа
+            fps: кадров в секунду исходного видео
+            frame_step: шаг между кадрами, использованный при расчёте потока
+            quality_features: дополнительные предрасчитанные фичи качества (fb_error, confidence и т.п.)
             
         Returns:
             Словарь со статистиками
@@ -78,51 +84,67 @@ class FlowFrameStatistics:
         # Основные вычисления
         magnitude = np.sqrt(dx**2 + dy**2)
         direction = np.arctan2(dy, dx)
+        frame_dt = max(frame_step, 1) / max(fps, 1e-6)
+        px_per_sec_scale = 1.0 / max(frame_dt, 1e-6)
+        magnitude_px_sec = magnitude * px_per_sec_scale
         
         # Расчет всех статистик
         stats_dict = {
-            **FlowFrameStatistics._calculate_magnitude_stats(magnitude, config),
+            **FlowFrameStatistics._calculate_magnitude_stats(magnitude, magnitude_px_sec, config),
             **FlowFrameStatistics._calculate_direction_stats(direction, config),
             **FlowFrameStatistics._calculate_component_stats(dx, dy),
-            **FlowFrameStatistics._calculate_motion_stats(magnitude, config),
+            **FlowFrameStatistics._calculate_motion_stats(magnitude_px_sec, config),
             **FlowFrameStatistics._calculate_histogram_stats(magnitude),
-            **FlowFrameStatistics._calculate_spatial_stats(dx, dy, magnitude),
-            **FlowFrameStatistics._calculate_categorical_stats(magnitude, direction)
+            **FlowFrameStatistics._calculate_spatial_stats(dx, dy, magnitude)
         }
+
+        if quality_features:
+            stats_dict.update(quality_features)
         
         # Добавляем метаинформацию
         stats_dict.update({
             'frame_shape': f"{dx.shape}",
-            'pixel_count': int(magnitude.size)
+            'pixel_count': int(magnitude.size),
+            'frame_dt_seconds': float(frame_dt)
         })
         
         return stats_dict
     
     @staticmethod
-    def _calculate_magnitude_stats(magnitude: np.ndarray, config) -> Dict[str, float]:
+    def _calculate_magnitude_stats(magnitude: np.ndarray, magnitude_px_sec: np.ndarray, config) -> Dict[str, float]:
         """Статистики величины движения."""
         flat_mag = magnitude.flatten()
-        percentiles = np.percentile(flat_mag, [25, 50, 75, 90, 95])
+        percentiles = np.percentile(flat_mag, [25, 50, 75, 95])
+        noise_floor = getattr(config, 'noise_floor', 0.05)
         
         return {
             'magnitude_mean': float(np.mean(flat_mag)),
             'magnitude_std': float(np.std(flat_mag)),
             'magnitude_max': float(np.max(flat_mag)),
-            'magnitude_min': float(np.min(flat_mag)),
             'magnitude_median': float(percentiles[1]),
             'magnitude_iqr': float(percentiles[2] - percentiles[0]),
-            'magnitude_p90': float(percentiles[3]),
-            'magnitude_p95': float(percentiles[4])
+            'magnitude_p95': float(percentiles[3]),
+            'fraction_zero_motion': float(np.mean(flat_mag <= 1e-6)),
+            'fraction_below_noise_floor': float(np.mean(flat_mag <= noise_floor)),
+            'magnitude_mean_px_sec': float(np.mean(magnitude_px_sec)),
+            'magnitude_std_px_sec': float(np.std(magnitude_px_sec)),
+            'magnitude_p95_px_sec': float(np.percentile(magnitude_px_sec.flatten(), 95))
         }
     
     @staticmethod
     def _calculate_direction_stats(direction: np.ndarray, config) -> Dict[str, float]:
         """Статистики направления движения."""
         flat_dir = direction.flatten()
+        sin_mean = float(np.mean(np.sin(flat_dir)))
+        cos_mean = float(np.mean(np.cos(flat_dir)))
+        R = np.sqrt(sin_mean**2 + cos_mean**2)
         
         return {
-            'direction_mean': float(FlowFrameStatistics._circular_mean(flat_dir)),
-            'direction_std': float(FlowFrameStatistics._circular_std(flat_dir)),
+            'dir_sin_mean': sin_mean,
+            'dir_cos_mean': cos_mean,
+            'dir_resultant_length': float(R),
+            'dir_dispersion': float(1.0 - R),
+            'direction_std_circular': float(FlowFrameStatistics._circular_std(flat_dir)),
             'direction_entropy': float(FlowFrameStatistics._directional_entropy(flat_dir, config.direction_bins))
         }
     
@@ -144,9 +166,9 @@ class FlowFrameStatistics:
         """Энтропия распределения направлений."""
         try:
             hist, _ = np.histogram(angles, bins=bins, range=(-np.pi, np.pi))
+            hist = hist + 1.0  # Laplace сглаживание
             hist = hist / (hist.sum() + 1e-10)
-            hist = hist[hist > 0]
-            return float(-np.sum(hist * np.log2(hist + 1e-10)))
+            return float(-np.sum(hist * np.log(hist + 1e-10)))  # натуральный лог
         except:
             return 0.0
     
@@ -163,13 +185,23 @@ class FlowFrameStatistics:
         }
     
     @staticmethod
-    def _calculate_motion_stats(magnitude: np.ndarray, 
+    def _calculate_motion_stats(magnitude_px_sec: np.ndarray, 
                                 config) -> Dict[str, float]:
         """Статистики движущихся пикселей."""
         stats = {}
-        for threshold in config.motion_thresholds:
-            moving_pixels = np.sum(magnitude > threshold) / magnitude.size
+        thresholds = getattr(config, 'motion_thresholds', [1.0])
+        for threshold in thresholds:
+            moving_pixels = np.sum(magnitude_px_sec > threshold) / magnitude_px_sec.size
             stats[f'moving_pixels_{threshold}'] = float(moving_pixels)
+
+        # Адаптивный порог: median + k * MAD
+        flat = magnitude_px_sec.flatten()
+        median = np.median(flat)
+        mad = np.median(np.abs(flat - median)) + 1e-6
+        k = getattr(config, 'moving_threshold_k', 3.0)
+        adaptive_thresh = median + k * mad
+        stats['moving_pixels_rel'] = float(np.mean(flat > adaptive_thresh))
+
         return stats
     
     @staticmethod
@@ -212,47 +244,6 @@ class FlowFrameStatistics:
                 'flow_divergence_mean': 0.0
             }
     
-    @staticmethod
-    def _calculate_categorical_stats(magnitude: np.ndarray, 
-                                     direction: np.ndarray) -> Dict[str, str]:
-        """Категориальные признаки."""
-        return {
-            'motion_intensity': FlowFrameStatistics._categorize_intensity(magnitude),
-            'dominant_direction': FlowFrameStatistics._categorize_direction(direction)
-        }
-    
-    @staticmethod
-    def _categorize_intensity(magnitude: np.ndarray) -> str:
-        """Категоризация интенсивности движения."""
-        mean_mag = np.mean(magnitude)
-        if mean_mag < 0.5:
-            return 'very_low'
-        elif mean_mag < 1.0:
-            return 'low'
-        elif mean_mag < 2.0:
-            return 'medium'
-        elif mean_mag < 5.0:
-            return 'high'
-        else:
-            return 'very_high'
-    
-    @staticmethod
-    def _categorize_direction(direction: np.ndarray) -> str:
-        """Категоризация преобладающего направления."""
-        # Находим доминирующее направление через гистограмму
-        deg = np.degrees(direction) % 360
-        bins = np.arange(0, 361, 45)
-        hist, _ = np.histogram(deg, bins=bins)
-        
-        if np.sum(hist) == 0:
-            return 'undefined'
-        
-        dominant_bin = np.argmax(hist)
-        directions = ['right', 'up_right', 'up', 'up_left', 
-                     'left', 'down_left', 'down', 'down_right']
-        
-        return directions[dominant_bin % len(directions)]
-
 class SpatialAnalyzer:
     """Анализатор пространственных агрегатов."""
     
@@ -274,30 +265,34 @@ class SpatialAnalyzer:
         magnitude = np.sqrt(dx**2 + dy**2)
         
         H, W = magnitude.shape
-        rows, cols = config.grid_size
-        region_h, region_w = H // rows, W // cols
-        
+        grid_sizes = getattr(config, 'grid_sizes', None) or [getattr(config, 'grid_size', (4, 4))]
         regional_stats = []
-        
-        for i in range(rows):
-            for j in range(cols):
-                # Определяем границы региона
-                y_start = i * region_h
-                y_end = (i + 1) * region_h if i < rows - 1 else H
-                x_start = j * region_w
-                x_end = (j + 1) * region_w if j < cols - 1 else W
-                
-                # Извлекаем регион
-                region_mag = magnitude[y_start:y_end, x_start:x_end]
-                region_dx = dx[y_start:y_end, x_start:x_end]
-                region_dy = dy[y_start:y_end, x_start:x_end]
-                
-                # Вычисляем статистики региона
-                region_stats = SpatialAnalyzer._calculate_region_stats(
-                    region_mag, region_dx, region_dy, i, j,
-                    (y_start, y_end, x_start, x_end), magnitude
-                )
-                regional_stats.append(region_stats)
+
+        for grid_idx, grid in enumerate(grid_sizes):
+            rows, cols = grid
+            region_h, region_w = H // max(rows, 1), W // max(cols, 1)
+            
+            for i in range(rows):
+                for j in range(cols):
+                    # Определяем границы региона
+                    y_start = i * region_h
+                    y_end = (i + 1) * region_h if i < rows - 1 else H
+                    x_start = j * region_w
+                    x_end = (j + 1) * region_w if j < cols - 1 else W
+                    
+                    # Извлекаем регион
+                    region_mag = magnitude[y_start:y_end, x_start:x_end]
+                    region_dx = dx[y_start:y_end, x_start:x_end]
+                    region_dy = dy[y_start:y_end, x_start:x_end]
+                    
+                    # Вычисляем статистики региона
+                    region_stats = SpatialAnalyzer._calculate_region_stats(
+                        region_mag, region_dx, region_dy, i, j,
+                        (y_start, y_end, x_start, x_end), magnitude
+                    )
+                    region_stats['grid_id'] = f"{rows}x{cols}"
+                    region_stats['grid_level'] = grid_idx
+                    regional_stats.append(region_stats)
         
         return pd.DataFrame(regional_stats)
     
@@ -332,10 +327,7 @@ class SpatialAnalyzer:
             # Пространственные паттерны
             'region_gradient': float(SpatialAnalyzer._calculate_region_gradient(region_mag)),
             'flow_divergence': float(SpatialAnalyzer._calculate_region_divergence(region_dx, region_dy)),
-            
-            # Категории
-            'activity_level': SpatialAnalyzer._categorize_region_activity(region_mean, global_mean),
-            'direction_category': SpatialAnalyzer._categorize_region_direction(region_dx, region_dy)
+            'direction_histogram': SpatialAnalyzer._direction_histogram(region_dx, region_dy)
         }
     
     @staticmethod
@@ -361,39 +353,13 @@ class SpatialAnalyzer:
             return 0.0
     
     @staticmethod
-    def _categorize_region_activity(region_mean: float, global_mean: float) -> str:
-        """Категоризирует активность региона."""
-        ratio = region_mean / (global_mean + 1e-10)
-        if ratio < 0.3:
-            return 'very_low'
-        elif ratio < 0.7:
-            return 'low'
-        elif ratio < 1.3:
-            return 'average'
-        elif ratio < 2.0:
-            return 'high'
-        else:
-            return 'very_high'
-    
-    @staticmethod
-    def _categorize_region_direction(dx: np.ndarray, dy: np.ndarray) -> str:
-        """Категоризирует преобладающее направление в регионе."""
-        mean_dx = np.mean(dx)
-        mean_dy = np.mean(dy)
-        
-        if abs(mean_dx) > abs(mean_dy) * 1.5:
-            return 'horizontal_right' if mean_dx > 0 else 'horizontal_left'
-        elif abs(mean_dy) > abs(mean_dx) * 1.5:
-            return 'vertical_down' if mean_dy > 0 else 'vertical_up'
-        else:
-            if mean_dx > 0 and mean_dy > 0:
-                return 'diagonal_down_right'
-            elif mean_dx < 0 and mean_dy > 0:
-                return 'diagonal_down_left'
-            elif mean_dx > 0 and mean_dy < 0:
-                return 'diagonal_up_right'
-            else:
-                return 'diagonal_up_left'
+    def _direction_histogram(dx: np.ndarray, dy: np.ndarray, bins: int = 8) -> list:
+        """Гистограмма направлений региона в числовом виде."""
+        if dx.size == 0:
+            return []
+        direction = np.arctan2(dy, dx).flatten()
+        hist, _ = np.histogram(direction, bins=bins, range=(-np.pi, np.pi))
+        return hist.astype(int).tolist()
 
 class TemporalAnalyzer:
     """Анализатор временных трендов."""
@@ -420,12 +386,14 @@ class TemporalAnalyzer:
         
         try:
             df = pd.DataFrame(frame_stats_list)
+            moving_keys = [c for c in df.columns if c.startswith('moving_pixels_')]
+            moving_key = moving_keys[0] if moving_keys else None
             
             # Ключевые временные ряды
             time_series = {
                 'magnitude': df['magnitude_mean'].values,
-                'moving_pixels': df['moving_pixels_0.5'].values,
-                'direction_std': df['direction_std'].values,
+                'moving_pixels': df[moving_key].values if moving_key else df['magnitude_mean'].values * 0,
+                'direction_std': df['direction_std_circular'].values if 'direction_std_circular' in df else df['dir_dispersion'].values,
                 'spatial_gradient': df['spatial_gradient'].values
             }
             
@@ -501,9 +469,12 @@ class TemporalAnalyzer:
                 continue
             
             try:
-                # FFT анализ
+                # FFT анализ с детрендингом и окном Хэнна
                 n = len(values)
-                yf = np.fft.fft(values - np.mean(values))
+                values_detrended = detrend(values)
+                window = np.hanning(n)
+                windowed = values_detrended * window
+                yf = np.fft.fft(windowed)
                 xf = np.fft.fftfreq(n, d=(skip/fps))
                 
                 power = np.abs(yf[:n//2])**2
@@ -517,7 +488,8 @@ class TemporalAnalyzer:
                     
                     if dominant_freq > 0:
                         dominant_period = 1.0 / dominant_freq
-                        significance = power[mask][dominant_idx] / np.mean(power[mask])
+                        background = np.median(power[mask]) + 1e-10
+                        significance = power[mask][dominant_idx] / background
                         
                         if significance > 2.0:
                             results[metric_name] = {
@@ -740,9 +712,11 @@ class FlowStatisticsAnalyzer:
             return {'error': 'no_flow_files'}
         
         logger.info(f"Найдено {len(flow_files)} flow файлов")
+        fps = video_metadata.get('video_properties', {}).get('fps', 25.0)
+        frame_step = video_metadata.get('processing_parameters', {}).get('frame_skip', 1)
         
         # 2. Базовые статистики по кадрам
-        frame_stats_list = self._analyze_frames(flow_files)
+        frame_stats_list = self._analyze_frames(flow_files, fps=fps, frame_step=frame_step)
         
         # 2.1 Анализ движения камеры (опционально)
         camera_motion_results = None
@@ -779,22 +753,78 @@ class FlowStatisticsAnalyzer:
         logger.info(f"Анализ завершен для {flow_dir}")
         return results
     
-    def _analyze_frames(self, flow_files: List[Path]) -> List[Dict[str, Any]]:
+    def _analyze_frames(self, flow_files: List[Path], fps: float = 25.0, frame_step: int = 1) -> List[Dict[str, Any]]:
         """Анализ статистик каждого кадра."""
         frame_stats_list = []
         
         logger.info("Анализ статистик по кадрам...")
         for flow_file in flow_files:
             try:
-                stats = self.frame_analyzer.calculate(str(flow_file), self.config)
+                frame_idx_val = self._extract_frame_index(flow_file.name)
+                quality_path = flow_file.parent / "quality" / f"quality_{frame_idx_val:06d}.json"
+                quality_features = None
+                if quality_path.exists():
+                    try:
+                        with open(quality_path, 'r', encoding='utf-8') as f:
+                            quality_features = json.load(f)
+                    except Exception as e:
+                        logger.warning(f"Ошибка чтения quality {quality_path}: {e}")
+
+                stats = self.frame_analyzer.calculate(
+                    str(flow_file),
+                    self.config,
+                    fps=fps,
+                    frame_step=frame_step,
+                    quality_features=quality_features
+                )
                 stats['flow_filename'] = flow_file.name
-                stats['frame_index'] = self._extract_frame_index(flow_file.name)
+                stats['frame_index'] = frame_idx_val
                 frame_stats_list.append(stats)
             except Exception as e:
                 logger.warning(f"Ошибка анализа {flow_file}: {e}")
                 continue
         
         logger.info(f"Успешно проанализировано {len(frame_stats_list)} кадров")
+
+        # Нормализация по видео (z-score) ключевых покадровых фич
+        if frame_stats_list:
+            df = pd.DataFrame(frame_stats_list)
+            norm_keys = [
+                'magnitude_mean_px_sec', 'magnitude_std_px_sec', 'magnitude_p95_px_sec',
+                'dx_mean', 'dy_mean', 'flow_confidence_mean', 'fb_error_mean'
+            ]
+            for key in norm_keys:
+                if key in df.columns:
+                    mean_v = df[key].mean()
+                    std_v = df[key].std() + 1e-6
+                    for stats in frame_stats_list:
+                        stats[f"{key}_norm"] = float((stats.get(key, 0.0) - mean_v) / std_v)
+
+            motion_thresholds = getattr(self.config, 'motion_thresholds', [1.0])
+            motion_key = f"moving_pixels_{motion_thresholds[0]}"
+
+            sequence_keys = [
+                'magnitude_mean_px_sec_norm',
+                'magnitude_std_px_sec_norm',
+                'magnitude_p95_px_sec_norm',
+                'dir_sin_mean',
+                'dir_cos_mean',
+                'dir_dispersion',
+                'dx_mean_norm',
+                'dy_mean_norm',
+                motion_key,
+                'moving_pixels_rel',
+                'flow_confidence_mean_norm',
+                'occlusion_fraction',
+                'fb_error_mean_norm',
+                'flow_consistency'
+            ]
+
+            for stats in frame_stats_list:
+                stats['sequence_features'] = {
+                    k: stats[k] for k in sequence_keys if k in stats
+                }
+
         return frame_stats_list
     
     def _analyze_spatial(self, flow_files: List[Path]) -> Dict[str, Any]:
@@ -831,8 +861,13 @@ class FlowStatisticsAnalyzer:
         if len(spatial_df) == 0:
             return {}
         
+        # Выбираем сетку среднего разрешения (предпочтительно 4x4), иначе первую
+        candidate = spatial_df[spatial_df['grid_id'] == '4x4']
+        if candidate.empty:
+            candidate = spatial_df
+
         # Сортируем по активности
-        top_regions = spatial_df.nlargest(self.config.top_regions_count, 'region_magnitude_mean')
+        top_regions = candidate.nlargest(self.config.top_regions_count, 'region_magnitude_mean')
         
         return {
             'top_regions': top_regions['region_id'].tolist(),
@@ -841,7 +876,7 @@ class FlowStatisticsAnalyzer:
                 spatial_df['region_magnitude_mean'].sum()
             ),
             'spatial_distribution': self._analyze_spatial_distribution(top_regions),
-            'dominant_directions': top_regions['direction_category'].value_counts().to_dict()
+            'direction_hist_summed': SpatialAnalyzer._sum_direction_hists(top_regions)
         }
     
     def _analyze_spatial_distribution(self, top_regions: pd.DataFrame) -> str:
@@ -872,6 +907,17 @@ class FlowStatisticsAnalyzer:
             return 'scattered'
         else:
             return 'distributed'
+
+    @staticmethod
+    def _sum_direction_hists(top_regions: pd.DataFrame) -> list:
+        """Суммирует числовые гистограммы направлений."""
+        hist_list = []
+        for hist in top_regions.get('direction_histogram', []):
+            if isinstance(hist, (list, np.ndarray)) and len(hist) > 0:
+                hist_list.append(np.array(hist, dtype=np.int64))
+        if not hist_list:
+            return []
+        return np.sum(hist_list, axis=0).astype(int).tolist()
     
     def _analyze_temporal(self, frame_stats_list: List[Dict[str, Any]], 
                          video_metadata: Dict[str, Any]) -> Dict[str, Any]:
@@ -948,7 +994,13 @@ class FlowStatisticsAnalyzer:
             # 1. Motion Energy Image
             if getattr(self.config, 'enable_mei', True):
                 try:
-                    mei, mei_features = MotionEnergyImage.compute_mei(magnitudes)
+                    fps = video_metadata.get('video_properties', {}).get('fps', 25.0)
+                    skip = video_metadata.get('processing_parameters', {}).get('frame_skip', 1)
+                    mei, mei_features = MotionEnergyImage.compute_mei(
+                        magnitudes,
+                        fps=fps,
+                        frame_skip=skip
+                    )
                     results['motion_energy_image'] = {
                         'features': mei_features,
                         'mei_shape': list(mei.shape)
@@ -1070,13 +1122,13 @@ class FlowStatisticsAnalyzer:
             return {}
         
         df = pd.DataFrame(frame_stats_list)
+        moving_keys = [c for c in df.columns if c.startswith('moving_pixels_')]
+        moving_key = moving_keys[0] if moving_keys else None
         
         metrics = {
             'overall_magnitude_mean': float(df['magnitude_mean'].mean()),
             'overall_magnitude_std': float(df['magnitude_mean'].std()),
-            'activity_variability': float(df['moving_pixels_0.5'].std()),
-            'dominant_motion_intensity': df['motion_intensity'].mode()[0] if not df['motion_intensity'].mode().empty else 'unknown',
-            'dominant_direction': df['dominant_direction'].mode()[0] if not df['dominant_direction'].mode().empty else 'unknown'
+            'activity_variability': float(df[moving_key].std()) if moving_key else 0.0
         }
         
         # Добавляем временные метрики если они есть

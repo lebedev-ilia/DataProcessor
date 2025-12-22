@@ -15,14 +15,19 @@ class FlowPipelineConfig:
     save_flow_tensors: bool = True
     create_summary_video: bool = False
     device: str = "auto"  # "auto", "cuda", "cpu"
+    # Контроль качества потока
+    enable_forward_backward: bool = True
+    save_backward_flow: bool = False
+    fb_error_threshold: float = 1.0  # px
+    occlusion_error_threshold: float = 1.5  # px
     
     def __post_init__(self):
         if self.device == "auto":
             self.device = "cuda" if torch.cuda.is_available() else "cpu"
 
 # Константы
-DEFAULT_GRID_SIZE = (4, 4)
-DEFAULT_MOTION_THRESHOLDS = [0.5, 1.0, 2.0]
+DEFAULT_GRID_SIZES = [(1, 1), (4, 4), (8, 8)]
+DEFAULT_MOTION_THRESHOLDS = [1.0]  # в px/sec
 DIRECTION_BINS = 36
 MAX_SAVGOL_WINDOW = 11
 
@@ -36,8 +41,11 @@ CAMERA_MOTION_CONFIG = {
 @dataclass
 class FlowStatisticsConfig:
     """Конфигурация для статистического анализа."""
-    grid_size: List[int] = field(default_factory=tuple)
-    motion_thresholds: List[int] = field(default_factory=list)
+    grid_size: List[int] = field(default_factory=tuple)  # устаревшее поле для обратной совместимости
+    grid_sizes: List[tuple] = field(default_factory=lambda: DEFAULT_GRID_SIZES.copy())
+    motion_thresholds: List[float] = field(default_factory=lambda: DEFAULT_MOTION_THRESHOLDS.copy())  # px/sec
+    moving_threshold_k: float = 3.0  # median + k * MAD
+    noise_floor: float = 0.05  # px/frame
     direction_bins: int = DIRECTION_BINS
     spatial_sample_rate: int = 10
     top_regions_count: int = 3

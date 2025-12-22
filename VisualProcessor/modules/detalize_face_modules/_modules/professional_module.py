@@ -35,14 +35,21 @@ class ProfessionalModule(FaceModule):
         lip_reading = data.get("lip_reading", {})
         face_idx = data.get("face_idx", 0)
 
-        # Face quality
-        blur = quality.get("face_blur_score", 0.0)
-        sharpness = quality.get("sharpness_score", 0.0)
-        face_quality = float(np.clip((sharpness * 2.0) / (1.0 + np.log1p(blur)), 0.0, 1.0))
-
-        perceived_attractiveness = float(np.clip(
-            quality.get("face_contrast", 0.5), 0.0, 1.0
+        # Face quality (computed as downstream meta-feature from base features)
+        # Используем объединенные метрики из QualityModule
+        face_sharpness = quality.get("face_sharpness", quality.get("sharpness_score", 0.0))
+        face_noise = quality.get("face_noise_level", quality.get("noise_level", 0.0))
+        face_exposure = quality.get("face_exposure_score", 0.5)
+        
+        face_quality = float(np.clip(
+            0.4 * face_sharpness +
+            0.3 * (1.0 - face_noise) +
+            0.3 * face_exposure,
+            0.0, 1.0
         ))
+
+        # perceived_attractiveness_score удален - рискованная метрика, может быть дискриминационной
+        # Вместо этого используем технические метрики качества
 
         # Emotion intensity
         emotion_intensity = float(motion.get("mouth_motion_score", 0.0) + motion.get("eyebrows_motion_score", 0.0))
@@ -219,15 +226,19 @@ class ProfessionalModule(FaceModule):
 
         return {
             "professional": {
-                "face_quality_score": face_quality,
-                "perceived_attractiveness_score": perceived_attractiveness,
-                "emotion_intensity": emotion_intensity,
+                # High-level scores computed as downstream meta-features
+                # (prefer learned classifier/ensembling on top of base features)
+                "face_quality_score": face_quality,  # Computed from quality module features
+                "emotion_intensity": emotion_intensity,  # Computed from motion/expression features
+                "engagement_level": engagement_level,  # Computed from eyes/pose/motion features
+                "alertness_score": alertness_score,  # Computed from eyes/motion features
+                "expressiveness_score": expressiveness_score,  # Computed from motion/expression features
+                # Detailed breakdowns
                 "lip_reading_features": lip_reading_features,
                 "fatigue_score": fatigue_score,
                 "fatigue_breakdown": fatigue_breakdown,
-                "engagement_level": engagement_level,
-                "alertness_score": alertness_score,
-                "expressiveness_score": expressiveness_score,
+                # Удалено: perceived_attractiveness_score - рискованная метрика
+                # Рекомендация: compute high-level scores via learned model on module outputs
             }
         }
 

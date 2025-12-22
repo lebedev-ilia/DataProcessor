@@ -41,6 +41,8 @@ class Config:
     # Настройки YOLO
     yolo_model_path: str = 'yolo11n.pt'
     yolo_conf_threshold: float = 0.3
+    max_detections: int = 50  # Максимальное количество детекций
+    use_segmentation: bool = False  # Использовать сегментацию вместо bbox (если доступно)
     
     # Настройки MediaPipe
     max_num_faces: int = 5
@@ -48,15 +50,20 @@ class Config:
     
     # Настройки глубины
     use_midas: bool = True
+    min_resolution_for_depth: int = 256  # Минимальное разрешение для depth (H или W)
     num_depth_layers: int = 3
     
-    # Настройки SLIC
+    # Настройки SLIC (deprecated, используем local variance вместо)
     slic_n_segments: int = 100
     slic_compactness: int = 10
     
-    # Веса для баланса
+    # Веса для баланса (deprecated, используем saliency)
     brightness_weight: float = 0.65
     object_weight: float = 0.35
+    use_saliency: bool = True  # Использовать saliency map вместо brightness+object_mask
+    
+    # Настройки симметрии
+    fast_mode: bool = True  # Только horizontal/vertical симметрия
 
 class CompositionStyle(Enum):
     """Стили композиции"""
@@ -183,8 +190,10 @@ class FrameAnalyzer:
         self.models = ModelManager()
     
     def extract_objects(self, frame: np.ndarray) -> Dict:
-        """Детекция объектов с YOLOv8"""
+        """Детекция объектов с YOLOv8 (улучшенная версия с масками и дополнительными фичами)"""
         H, W = frame.shape[:2]
+        frame_area = H * W
+        
         results = self.models.yolo_model(
             frame, 
             conf=self.config.yolo_conf_threshold,
@@ -194,50 +203,99 @@ class FrameAnalyzer:
         objects = []
         object_mask = np.zeros((H, W), dtype=np.float32)
         object_centers = []
+        main_subject = None
+        main_subject_confidence = 0.0
         
         if results.boxes is not None:
-            for box in results.boxes:
-                x1, y1, x2, y2 = map(int, box.xyxy[0])
-                conf = float(box.conf[0])
-                cls = int(box.cls[0])
+            # Сортируем по confidence и ограничиваем количество
+            boxes_sorted = sorted(
+                zip(results.boxes.xyxy, results.boxes.conf, results.boxes.cls),
+                key=lambda x: x[1],
+                reverse=True
+            )[:self.config.max_detections]
+            
+            for box_xyxy, conf, cls in boxes_sorted:
+                x1, y1, x2, y2 = map(int, box_xyxy)
+                conf = float(conf)
+                cls = int(cls)
                 label = self.models.yolo_model.names[cls]
                 
-                cx, cy = (x1 + x2) / 2, (y1 + y2) / 2
+                # Вычисляем площадь bbox
+                bbox_area = (x2 - x1) * (y2 - y1)
+                bbox_area_ratio = bbox_area / frame_area
                 
-                objects.append({
+                cx, cy = (x1 + x2) / 2, (y1 + y2) / 2
+                center_x_norm = cx / W
+                center_y_norm = cy / H
+                
+                # Пытаемся получить маску (если доступна сегментация)
+                mask = None
+                if self.config.use_segmentation and hasattr(results, 'masks') and results.masks is not None:
+                    # YOLOv8-seg предоставляет маски
+                    mask_idx = len(objects)  # Упрощенная логика
+                    if mask_idx < len(results.masks.data):
+                        mask = results.masks.data[mask_idx].cpu().numpy()
+                        mask = cv2.resize(mask, (W, H))
+                        object_mask = np.maximum(object_mask, mask)
+                
+                # Если маски нет, используем bbox
+                if mask is None:
+                    object_mask[y1:y2, x1:x2] = np.maximum(
+                        object_mask[y1:y2, x1:x2],
+                        conf  # Вес по confidence
+                    )
+                
+                obj_data = {
                     'bbox': [x1, y1, x2, y2],
                     'center': (cx, cy),
+                    'center_x_norm': center_x_norm,
+                    'center_y_norm': center_y_norm,
                     'confidence': conf,
                     'class': label,
-                    'class_id': cls
-                })
+                    'class_id': cls,
+                    'bbox_area': bbox_area,
+                    'bbox_area_ratio': bbox_area_ratio
+                }
                 
+                objects.append(obj_data)
                 object_centers.append((cx, cy))
-                object_mask[y1:y2, x1:x2] = 1.0
+                
+                # Определяем главный субъект: приоритет лицам, иначе самый крупный объект с высокой уверенностью
+                if main_subject is None or (bbox_area_ratio * conf > main_subject_confidence):
+                    main_subject = (cx, cy)
+                    main_subject_confidence = bbox_area_ratio * conf
         
         return {
             'objects': objects,
             'object_mask': object_mask,
             'object_centers': object_centers,
-            'object_count': len(objects)
+            'object_count': len(objects),
+            'main_subject': main_subject,
+            'main_subject_confidence': main_subject_confidence,
+            'main_subject_criterion': 'largest_object' if main_subject else None
         }
     
     def extract_faces(self, frame: np.ndarray) -> Dict:
-        """Детекция лиц с MediaPipe"""
+        """Детекция лиц с MediaPipe (улучшенная версия с face_pose, eye_gaze, landmarks visibility)"""
         H, W = frame.shape[:2]
+        frame_area = H * W
         rgb_frame = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
         results = self.models.face_mesh.process(rgb_frame)
         
         faces = []
         face_landmarks_list = []
+        main_face = None
+        main_face_confidence = 0.0
         
         if results.multi_face_landmarks:
-            for face_landmarks in results.multi_face_landmarks:
+            for face_idx, face_landmarks in enumerate(results.multi_face_landmarks):
                 # Извлекаем ключевые точки
                 landmarks = []
+                landmark_3d = []
                 for landmark in face_landmarks.landmark:
                     x, y = int(landmark.x * W), int(landmark.y * H)
                     landmarks.append((x, y))
+                    landmark_3d.append((landmark.x, landmark.y, landmark.z))
                 
                 # Вычисляем bounding box лица
                 xs = [lm[0] for lm in landmarks]
@@ -245,71 +303,215 @@ class FrameAnalyzer:
                 x1, x2 = min(xs), max(xs)
                 y1, y2 = min(ys), max(ys)
                 
+                # Площадь и размер лица
+                face_width = x2 - x1
+                face_height = y2 - y1
+                face_area = face_width * face_height
+                face_size_ratio = face_area / frame_area
+                
                 # Центр лица
                 face_center = (np.mean(xs), np.mean(ys))
+                center_x_norm = face_center[0] / W
+                center_y_norm = face_center[1] / H
                 
-                faces.append({
+                # Face pose estimation (yaw, pitch, roll) - упрощенная версия
+                # Используем ключевые точки для оценки позы
+                # MediaPipe Face Mesh имеет специфические индексы для ключевых точек
+                # Упрощенная оценка на основе относительных позиций
+                face_pose = self._estimate_face_pose(landmark_3d, W, H)
+                
+                # Eye gaze estimation (упрощенная версия)
+                eye_gaze = self._estimate_eye_gaze(landmark_3d, W, H)
+                
+                # Landmarks visibility ratio (сколько ключевых точек видно)
+                # MediaPipe предоставляет visibility для каждой точки
+                visible_count = sum(1 for lm in face_landmarks.landmark if lm.visibility > 0.5)
+                total_landmarks = len(face_landmarks.landmark)
+                landmarks_visibility_ratio = visible_count / total_landmarks if total_landmarks > 0 else 0.0
+                
+                face_data = {
                     'bbox': [x1, y1, x2, y2],
                     'center': face_center,
-                    'landmarks': landmarks[:10]  # Сохраняем только первые 10 для экономии памяти
-                })
+                    'center_x_norm': center_x_norm,
+                    'center_y_norm': center_y_norm,
+                    'landmarks': landmarks[:10],  # Сохраняем только первые 10 для экономии памяти
+                    'face_width': face_width,
+                    'face_height': face_height,
+                    'face_area': face_area,
+                    'face_size_ratio': face_size_ratio,
+                    'face_pose': face_pose,  # {'yaw': float, 'pitch': float, 'roll': float}
+                    'eye_gaze': eye_gaze,  # {'x': float, 'y': float} normalized
+                    'landmarks_visibility_ratio': landmarks_visibility_ratio
+                }
                 
+                faces.append(face_data)
                 face_landmarks_list.append(face_landmarks.landmark)
+                
+                # Главное лицо: самое крупное с высокой видимостью
+                face_confidence = face_size_ratio * landmarks_visibility_ratio
+                if main_face is None or face_confidence > main_face_confidence:
+                    main_face = face_data
+                    main_face_confidence = face_confidence
         
         return {
             'faces': faces,
             'face_landmarks': face_landmarks_list[0] if face_landmarks_list else None,
-            'face_count': len(faces)
+            'face_count': len(faces),
+            'main_face': main_face,
+            'main_face_confidence': main_face_confidence
         }
     
-    def analyze_rule_of_thirds(self, frame: np.ndarray, 
-                              object_data: Dict, 
-                              face_data: Dict) -> Dict:
-        """Анализ правила третей"""
+    def _estimate_face_pose(self, landmarks_3d: List[Tuple[float, float, float]], W: int, H: int) -> Dict[str, float]:
+        """Упрощенная оценка позы лица (yaw, pitch, roll)"""
+        if len(landmarks_3d) < 10:
+            return {'yaw': 0.0, 'pitch': 0.0, 'roll': 0.0}
+        
+        # Упрощенная оценка на основе ключевых точек
+        # Нос (примерно индекс 4 в MediaPipe Face Mesh)
+        nose = landmarks_3d[4] if len(landmarks_3d) > 4 else landmarks_3d[0]
+        
+        # Глаза (примерно индексы 33, 263)
+        left_eye_idx = min(33, len(landmarks_3d) - 1)
+        right_eye_idx = min(263, len(landmarks_3d) - 1)
+        left_eye = landmarks_3d[left_eye_idx]
+        right_eye = landmarks_3d[right_eye_idx]
+        
+        # Yaw (поворот влево/вправо) - на основе разницы в глубине глаз
+        yaw = (left_eye[2] - right_eye[2]) * 10.0  # Упрощенная нормализация
+        yaw = np.clip(yaw, -1.0, 1.0)
+        
+        # Pitch (наклон вверх/вниз) - на основе позиции носа относительно глаз
+        eye_center_y = (left_eye[1] + right_eye[1]) / 2
+        pitch = (nose[1] - eye_center_y) * 5.0
+        pitch = np.clip(pitch, -1.0, 1.0)
+        
+        # Roll (наклон головы) - на основе угла между глазами
+        eye_angle = np.arctan2(right_eye[1] - left_eye[1], right_eye[0] - left_eye[0])
+        roll = np.sin(eye_angle) * 2.0
+        roll = np.clip(roll, -1.0, 1.0)
+        
+        return {'yaw': float(yaw), 'pitch': float(pitch), 'roll': float(roll)}
+    
+    def _estimate_eye_gaze(self, landmarks_3d: List[Tuple[float, float, float]], W: int, H: int) -> Dict[str, float]:
+        """Упрощенная оценка направления взгляда"""
+        if len(landmarks_3d) < 10:
+            return {'x': 0.0, 'y': 0.0}
+        
+        # Упрощенная оценка на основе позиции зрачков относительно центра лица
+        # В реальности нужны более точные индексы для зрачков
+        left_eye_idx = min(33, len(landmarks_3d) - 1)
+        right_eye_idx = min(263, len(landmarks_3d) - 1)
+        left_eye = landmarks_3d[left_eye_idx]
+        right_eye = landmarks_3d[right_eye_idx]
+        
+        # Центр между глазами
+        eye_center_x = (left_eye[0] + right_eye[0]) / 2
+        eye_center_y = (left_eye[1] + right_eye[1]) / 2
+        
+        # Нормализованное смещение от центра кадра
+        gaze_x = (eye_center_x - 0.5) * 2.0  # [-1, 1]
+        gaze_y = (eye_center_y - 0.5) * 2.0  # [-1, 1]
+        
+        return {'x': float(np.clip(gaze_x, -1.0, 1.0)), 'y': float(np.clip(gaze_y, -1.0, 1.0))}
+    
+    def analyze_composition_anchors(self, frame: np.ndarray, object_data: Dict, face_data: Dict) -> Dict:
+        """
+        Объединенный анализ композиционных якорей (Rule of Thirds + Golden Ratio + Center).
+        Возвращает минимальное расстояние до любого эстетического якоря и тип ближайшего.
+        """
         H, W = frame.shape[:2]
         
-        # Сетка третей
-        third_x = [W / 3, 2 * W / 3]
-        third_y = [H / 3, 2 * H / 3]
-        
-        # Находим главный субъект (лицо или самый крупный объект)
+        # Определяем главный субъект (приоритет лицу)
         main_subject = None
+        main_subject_x_norm = 0.5
+        main_subject_y_norm = 0.5
         
-        if face_data['faces']:
-            # Используем первое лицо как главный субъект
-            main_subject = face_data['faces'][0]['center']
-        elif object_data['objects']:
-            # Используем самый большой объект
+        if face_data.get('main_face'):
+            main_face = face_data['main_face']
+            main_subject_x_norm = main_face['center_x_norm']
+            main_subject_y_norm = main_face['center_y_norm']
+            main_subject = (main_face['center'][0], main_face['center'][1])
+        elif object_data.get('main_subject'):
+            main_subject = object_data['main_subject']
+            main_subject_x_norm = main_subject[0] / W
+            main_subject_y_norm = main_subject[1] / H
+        elif object_data.get('objects'):
+            # Используем самый крупный объект
             objects = object_data['objects']
-            areas = [(obj['bbox'][2] - obj['bbox'][0]) * 
-                    (obj['bbox'][3] - obj['bbox'][1]) 
-                    for obj in objects]
-            main_idx = np.argmax(areas)
-            main_subject = objects[main_idx]['center']
+            main_obj = max(objects, key=lambda o: o.get('bbox_area_ratio', 0))
+            main_subject_x_norm = main_obj['center_x_norm']
+            main_subject_y_norm = main_obj['center_y_norm']
+            main_subject = main_obj['center']
         else:
             main_subject = (W / 2, H / 2)
+            main_subject_x_norm = 0.5
+            main_subject_y_norm = 0.5
         
+        # Эстетические якоря: Rule of Thirds, Golden Ratio, Center
+        aesthetic_points = []
+        
+        # Rule of Thirds (4 точки пересечения)
+        third_x = [W / 3, 2 * W / 3]
+        third_y = [H / 3, 2 * H / 3]
+        for tx in third_x:
+            for ty in third_y:
+                aesthetic_points.append({
+                    'point': (tx, ty),
+                    'type': 'rule_of_thirds',
+                    'normalized': (tx / W, ty / H)
+                })
+        
+        # Golden Ratio (4 точки)
+        phi = 1.618033988749895
+        golden_points = [
+            (W / phi, H / phi),
+            (W * (phi - 1), H / phi),
+            (W / phi, H * (phi - 1)),
+            (W * (phi - 1), H * (phi - 1))
+        ]
+        for gx, gy in golden_points:
+            aesthetic_points.append({
+                'point': (gx, gy),
+                'type': 'golden_ratio',
+                'normalized': (gx / W, gy / H)
+            })
+        
+        # Center
+        aesthetic_points.append({
+            'point': (W / 2, H / 2),
+            'type': 'center',
+            'normalized': (0.5, 0.5)
+        })
+        
+        # Находим ближайший якорь
         mx, my = main_subject
+        min_distance = float('inf')
+        closest_anchor = None
+        closest_type = None
         
-        # Расстояние до ближайшей точки пересечения третей
-        min_dist = float('inf')
-        best_point = None
+        for anchor in aesthetic_points:
+            ax, ay = anchor['point']
+            dist = np.sqrt((mx - ax)**2 + (my - ay)**2)
+            if dist < min_distance:
+                min_distance = dist
+                closest_anchor = anchor['normalized']
+                closest_type = anchor['type']
         
+        # Нормализованное расстояние
+        max_possible = np.sqrt((W/2)**2 + (H/2)**2)
+        anchor_distance_norm = min_distance / max_possible if max_possible > 0 else 0.0
+        
+        # Alignment score (обратная метрика расстояния)
+        alignment_score = max(0.0, 1.0 - anchor_distance_norm)
+        
+        # Rule of Thirds score (отдельно для обратной совместимости)
+        rot_min_dist = float('inf')
         for tx in third_x:
             for ty in third_y:
                 dist = np.sqrt((mx - tx)**2 + (my - ty)**2)
-                if dist < min_dist:
-                    min_dist = dist
-                    best_point = (tx, ty)
-        
-        # Нормализованная метрика выравнивания
-        max_dist = np.sqrt((W/2)**2 + (H/2)**2)
-        alignment_score = max(0, 1.0 - (min_dist / max_dist))
-        
-        # Позиция субъекта в сетке
-        grid_x = 1 if mx < third_x[0] else 2 if mx < third_x[1] else 3
-        grid_y = 1 if my < third_y[0] else 2 if my < third_y[1] else 3
-        grid_position = f"{grid_x}-{grid_y}"
+                if dist < rot_min_dist:
+                    rot_min_dist = dist
+        rot_alignment_score = max(0.0, 1.0 - (rot_min_dist / max_possible))
         
         # Баланс объектов по квадрантам
         quadrants = {
@@ -317,106 +519,84 @@ class FrameAnalyzer:
             'bottom_left': 0, 'bottom_right': 0
         }
         
-        for obj in object_data['objects']:
-            cx, cy = obj['center']
-            if cy < H/2:
-                if cx < W/2:
+        for obj in object_data.get('objects', []):
+            cx_norm = obj.get('center_x_norm', obj['center'][0] / W)
+            cy_norm = obj.get('center_y_norm', obj['center'][1] / H)
+            if cy_norm < 0.5:
+                if cx_norm < 0.5:
                     quadrants['top_left'] += 1
                 else:
                     quadrants['top_right'] += 1
             else:
-                if cx < W/2:
+                if cx_norm < 0.5:
                     quadrants['bottom_left'] += 1
                 else:
                     quadrants['bottom_right'] += 1
         
-        # Вычисляем баланс
-        total_objs = sum(quadrants.values())
-        balance_score = 1.0
-        if total_objs > 0:
-            quadrant_balance = [quadrants['top_left'] + quadrants['bottom_right'],
-                              quadrants['top_right'] + quadrants['bottom_left']]
-            balance_score = 1.0 - abs(quadrant_balance[0] - quadrant_balance[1]) / total_objs
-        
         return {
-            'alignment_score': float(alignment_score),
-            'main_subject_position': grid_position,
-            'main_subject_x': float(mx / W),
-            'main_subject_y': float(my / H),
-            'balance_score': float(balance_score),
-            'quadrant_distribution': quadrants,
-            'distance_to_thirds': float(min_dist / max_dist)
-        }
-    
-    def analyze_golden_ratio(self, frame: np.ndarray,
-                           main_subject_pos: Tuple[float, float]) -> Dict:
-        """Анализ золотого сечения"""
-        H, W = frame.shape[:2]
-        phi = 1.618033988749895
-        
-        # Точки золотого сечения
-        golden_points = [
-            (W / phi, H / phi),          # Верхний левый
-            (W * (phi - 1), H / phi),    # Верхний правый
-            (W / phi, H * (phi - 1)),    # Нижний левый
-            (W * (phi - 1), H * (phi - 1))  # Нижний правый
-        ]
-        
-        # Расстояние от субъекта до ближайшей точки золотого сечения
-        mx, my = main_subject_pos
-        mx, my = mx * W, my * H
-        
-        distances = []
-        for gx, gy in golden_points:
-            dist = np.sqrt((mx - gx)**2 + (my - gy)**2)
-            distances.append(dist)
-        
-        min_dist = min(distances)
-        max_possible = np.sqrt(W**2 + H**2)
-        golden_score = max(0, 1.0 - (min_dist / max_possible))
-        
-        # Определяем ближайшую спираль (ориентацию)
-        orientations = ['top_left', 'top_right', 'bottom_left', 'bottom_right']
-        closest_idx = np.argmin(distances)
-        
-        return {
-            'golden_ratio_score': float(golden_score),
-            'closest_orientation': orientations[closest_idx],
-            'min_distance_normalized': float(min_dist / max_possible)
+            'alignment_score': float(alignment_score),  # Для обратной совместимости
+            'rule_of_thirds_score': float(rot_alignment_score),  # Для обратной совместимости
+            'composition_anchor_distance': float(anchor_distance_norm),  # Новое: минимальное расстояние до любого якоря
+            'closest_anchor_type': closest_type,  # 'rule_of_thirds', 'golden_ratio', или 'center'
+            'closest_anchor_x': float(closest_anchor[0]) if closest_anchor else 0.5,
+            'closest_anchor_y': float(closest_anchor[1]) if closest_anchor else 0.5,
+            'main_subject_x': float(main_subject_x_norm),
+            'main_subject_y': float(main_subject_y_norm),
+            'distance_to_thirds': float(rot_min_dist / max_possible),  # Для обратной совместимости
+            'quadrant_distribution': quadrants
         }
     
     def analyze_balance(self, frame: np.ndarray, 
                        object_mask: np.ndarray) -> Dict:
-        """Анализ визуального баланса"""
+        """
+        Анализ визуального баланса с использованием saliency map (если доступно) или fallback на brightness+object_mask.
+        """
         H, W = frame.shape[:2]
         
-        # Карта яркости
-        gray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY).astype(np.float32) / 255.0
+        # Пытаемся использовать saliency map
+        if self.config.use_saliency:
+            try:
+                # Упрощенная saliency через градиенты и контраст (lightweight proxy)
+                # В продакшн можно использовать DeepGaze/UNISAL/ViT-attention
+                saliency_map = self._compute_saliency_proxy(frame)
+            except:
+                saliency_map = None
+        else:
+            saliency_map = None
         
-        # Нормализованная карта объектов
-        obj_norm = object_mask / (object_mask.max() + 1e-6)
-        
-        # Комбинированная карта значимости
-        weight_map = (self.config.brightness_weight * gray + 
-                     self.config.object_weight * obj_norm)
+        # Fallback: brightness + object_mask
+        if saliency_map is None:
+            gray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY).astype(np.float32) / 255.0
+            obj_norm = object_mask / (object_mask.max() + 1e-6)
+            weight_map = (self.config.brightness_weight * gray + 
+                         self.config.object_weight * obj_norm)
+        else:
+            weight_map = saliency_map
         
         # Центр масс
         y_coords, x_coords = np.meshgrid(np.arange(H), np.arange(W), indexing='ij')
-        mass_x = np.sum(x_coords * weight_map) / (np.sum(weight_map) + 1e-6)
-        mass_y = np.sum(y_coords * weight_map) / (np.sum(weight_map) + 1e-6)
+        total_weight = np.sum(weight_map)
+        if total_weight > 1e-6:
+            mass_x = np.sum(x_coords * weight_map) / total_weight
+            mass_y = np.sum(y_coords * weight_map) / total_weight
+        else:
+            mass_x, mass_y = W / 2, H / 2
         
         # Смещение от центра
         center_x, center_y = W / 2, H / 2
         offset_distance = np.sqrt((mass_x - center_x)**2 + (mass_y - center_y)**2)
         max_offset = np.sqrt((W/2)**2 + (H/2)**2)
-        normalized_offset = offset_distance / max_offset
+        normalized_offset = offset_distance / max_offset if max_offset > 0 else 0.0
+        
+        # Saliency center offset (расстояние между saliency CM и center)
+        saliency_center_offset = normalized_offset
         
         # Баланс по квадрантам
         quadrants = {
-            'top_left': weight_map[:H//2, :W//2].sum(),
-            'top_right': weight_map[:H//2, W//2:].sum(),
-            'bottom_left': weight_map[H//2:, :W//2].sum(),
-            'bottom_right': weight_map[H//2:, W//2:].sum()
+            'top_left': float(weight_map[:H//2, :W//2].sum()),
+            'top_right': float(weight_map[:H//2, W//2:].sum()),
+            'bottom_left': float(weight_map[H//2:, :W//2].sum()),
+            'bottom_right': float(weight_map[H//2:, W//2:].sum())
         }
         
         total_weight = sum(quadrants.values())
@@ -425,54 +605,121 @@ class FrameAnalyzer:
                 quadrants[key] = float(quadrants[key] / total_weight)
         
         # Баланс лево-право, верх-низ
-        left_right_balance = abs(quadrants['top_left'] + quadrants['bottom_left'] - 
-                               quadrants['top_right'] - quadrants['bottom_right'])
-        top_bottom_balance = abs(quadrants['top_left'] + quadrants['top_right'] - 
-                               quadrants['bottom_left'] - quadrants['bottom_right'])
+        left_weight = quadrants['top_left'] + quadrants['bottom_left']
+        right_weight = quadrants['top_right'] + quadrants['bottom_right']
+        top_weight = quadrants['top_left'] + quadrants['top_right']
+        bottom_weight = quadrants['bottom_left'] + quadrants['bottom_right']
         
-        overall_balance_score = 1.0 - (left_right_balance + top_bottom_balance) / 2.0
+        left_right_balance = 1.0 - abs(left_weight - right_weight)
+        top_bottom_balance = 1.0 - abs(top_weight - bottom_weight)
+        
+        overall_balance_score = (left_right_balance + top_bottom_balance) / 2.0
         
         return {
             'mass_center_x': float(mass_x / W),
             'mass_center_y': float(mass_y / H),
             'center_offset': float(normalized_offset),
+            'center_offset_norm': float(normalized_offset),  # Алиас для совместимости
+            'saliency_center_offset': float(saliency_center_offset),  # Новое
             'quadrant_weights': quadrants,
-            'left_right_balance': float(1.0 - left_right_balance),
-            'top_bottom_balance': float(1.0 - top_bottom_balance),
+            'left_right_balance': float(left_right_balance),
+            'top_bottom_balance': float(top_bottom_balance),
             'overall_balance_score': float(overall_balance_score)
         }
     
+    def _compute_saliency_proxy(self, frame: np.ndarray) -> np.ndarray:
+        """
+        Упрощенный saliency proxy через градиенты и контраст.
+        В продакшн можно заменить на DeepGaze/UNISAL/ViT-attention.
+        """
+        H, W = frame.shape[:2]
+        gray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY).astype(np.float32) / 255.0
+        
+        # Градиенты (Sobel)
+        grad_x = cv2.Sobel(gray, cv2.CV_64F, 1, 0, ksize=3)
+        grad_y = cv2.Sobel(gray, cv2.CV_64F, 0, 1, ksize=3)
+        gradient_magnitude = np.sqrt(grad_x**2 + grad_y**2)
+        
+        # Локальный контраст (разница с соседями)
+        kernel = np.array([[-1, -1, -1], [-1, 8, -1], [-1, -1, -1]]) / 8.0
+        contrast = cv2.filter2D(gray, -1, kernel)
+        contrast = np.abs(contrast)
+        
+        # Комбинируем градиенты и контраст
+        saliency = (gradient_magnitude + contrast) / 2.0
+        
+        # Нормализуем
+        saliency = (saliency - saliency.min()) / (saliency.max() - saliency.min() + 1e-6)
+        
+        return saliency.astype(np.float32)
+    
     def analyze_depth(self, frame: np.ndarray) -> Dict[str, float]:
         """
-        MiDaS-based depth analysis (relative depth only)
+        MiDaS-based depth analysis (relative depth only).
+        Вычисляется только если use_midas=True и разрешение >= min_resolution_for_depth.
         """
-
         H, W = frame.shape[:2]
+        
+        # Проверяем условия для depth analysis
+        depth_reliable = False
+        if not self.config.use_midas:
+            return {
+                'depth_mean': 0.5,
+                'depth_std': 0.0,
+                'depth_reliable': False,
+                'foreground_ratio': 0.0,
+                'bokeh_potential': 0.0
+            }
+        
+        # Проверяем разрешение
+        min_res = min(H, W)
+        if min_res < self.config.min_resolution_for_depth:
+            return {
+                'depth_mean': 0.5,
+                'depth_std': 0.0,
+                'depth_reliable': False,
+                'foreground_ratio': 0.0,
+                'bokeh_potential': 0.0
+            }
+        
+        try:
+            mm = ModelManager()
+            model, transform = mm.midas
 
-        mm = ModelManager()
+            # --- Preprocess ---
+            rgb = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
+            input_tensor = transform(rgb).to(self.config.device)
 
-        model, transform = mm.midas
+            # --- Inference ---
+            with torch.no_grad():
+                depth = model(input_tensor)          # [1, h, w]
+                depth = depth.unsqueeze(1)           # [1, 1, h, w]
+                depth = F.interpolate(
+                    depth,
+                    size=(H, W),
+                    mode="bicubic",
+                    align_corners=False
+                ).squeeze()
 
-        # --- Preprocess ---
-        rgb = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
-        input_tensor = transform(rgb).to(self.config.device)
+            depth = depth.cpu().numpy()
 
-        # --- Inference ---
-        with torch.no_grad():
-            depth = model(input_tensor)          # [1, h, w]
-            depth = depth.unsqueeze(1)           # [1, 1, h, w]
-            depth = F.interpolate(
-                depth,
-                size=(H, W),
-                mode="bicubic",
-                align_corners=False
-            ).squeeze()
-
-        depth = depth.cpu().numpy()
-
-        # --- Normalize (relative depth only) ---
-        d_min, d_max = depth.min(), depth.max()
-        depth = (depth - d_min) / (d_max - d_min + 1e-6)
+            # --- Normalize (relative depth only) ---
+            d_min, d_max = depth.min(), depth.max()
+            if d_max > d_min:
+                depth = (depth - d_min) / (d_max - d_min + 1e-6)
+                depth_reliable = True
+            else:
+                depth_reliable = False
+                depth = np.ones_like(depth) * 0.5
+        except Exception as e:
+            logger.warning(f"Depth analysis failed: {e}")
+            return {
+                'depth_mean': 0.5,
+                'depth_std': 0.0,
+                'depth_reliable': False,
+                'foreground_ratio': 0.0,
+                'bokeh_potential': 0.0
+            }
 
         # =========================
         # STATISTICS
@@ -513,147 +760,176 @@ class FrameAnalyzer:
         # =========================
         bokeh_potential = float(np.clip(std * 2.0, 0.0, 1.0))
 
-        return {
+        # Компактный возврат: только основные метрики для трансформера
+        result = {
             "depth_mean": mean,
             "depth_std": std,
+            "depth_reliable": depth_reliable,
+            "foreground_ratio": foreground_ratio,
+            "bokeh_potential": bokeh_potential,
             "depth_p10": float(p10),
-            "depth_p50": float(p50),
             "depth_p90": float(p90),
             "depth_dynamic_range": dynamic_range,
-            "depth_entropy": entropy,
-            "depth_edge_density": depth_edge_density,
-            "foreground_ratio": fg_ratio,
-            "midground_ratio": mg_ratio,
-            "background_ratio": bg_ratio,
-            "bokeh_potential": bokeh_potential,
             "depth_method": "midas_small"
         }
+        
+        # Опциональные метрики (для агрегатов, не для трансформера)
+        if depth_reliable:
+            result["depth_p50"] = float(p50)
+            result["midground_ratio"] = float(mg_ratio)
+            result["background_ratio"] = float(bg_ratio)
+            result["depth_entropy"] = entropy
+            result["depth_edge_density"] = depth_edge_density
+        
+        return result
 
     def analyze_symmetry(self, frame: np.ndarray) -> Dict:
-        """Анализ симметрии"""
+        """
+        Анализ симметрии (упрощенная версия).
+        В fast_mode вычисляет только horizontal/vertical симметрию.
+        Diagonal и radial симметрия опциональны (если fast_mode=False).
+        """
         gray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY).astype(np.float32) / 255.0
         H, W = gray.shape
         
-        # Горизонтальная симметрия
+        # Горизонтальная симметрия (всегда вычисляется)
         h_flip = cv2.flip(gray, 1)
         horizontal_corr = np.corrcoef(gray.flatten(), h_flip.flatten())[0, 1]
         horizontal_score = float(np.nan_to_num(horizontal_corr, nan=0.0))
         
-        # Вертикальная симметрия
+        # Вертикальная симметрия (всегда вычисляется)
         v_flip = cv2.flip(gray, 0)
         vertical_corr = np.corrcoef(gray.flatten(), v_flip.flatten())[0, 1]
         vertical_score = float(np.nan_to_num(vertical_corr, nan=0.0))
         
-        # Диагональная симметрия
-        diag_flip = cv2.flip(cv2.flip(gray, -1), -1)
-        diag_corr = np.corrcoef(gray.flatten(), diag_flip.flatten())[0, 1]
-        diag_score = float(np.nan_to_num(diag_corr, nan=0.0))
+        # Комбинированный показатель симметрии (только horizontal/vertical)
+        symmetry_score = float(np.mean([horizontal_score, vertical_score]))
         
-        # Радиальная симметрия
-        center = (W // 2, H // 2)
-        max_radius = min(W, H) // 2
-        
-        # Создаем полярные координаты
-        polar = cv2.linearPolar(gray, center, max_radius, cv2.WARP_FILL_OUTLIERS)
-        radial_flip = cv2.flip(polar, 1)
-        radial_corr = np.corrcoef(polar.flatten(), radial_flip.flatten())[0, 1]
-        radial_score = float(np.nan_to_num(radial_corr, nan=0.0))
-        
-        # Определяем тип симметрии
         scores = {
             'horizontal': horizontal_score,
-            'vertical': vertical_score,
-            'diagonal': diag_score,
-            'radial': radial_score
+            'vertical': vertical_score
         }
         
         best_symmetry = max(scores.items(), key=lambda x: x[1])
         
-        # Комбинированный показатель симметрии
-        symmetry_score = float(np.mean([horizontal_score, vertical_score, 
-                                       diag_score, radial_score]))
-        
-        return {
+        result = {
             'symmetry_score': symmetry_score,
             'dominant_symmetry_type': best_symmetry[0],
             'horizontal_symmetry': horizontal_score,
-            'vertical_symmetry': vertical_score,
-            'diagonal_symmetry': diag_score,
-            'radial_symmetry': radial_score,
-            'symmetry_details': scores
+            'vertical_symmetry': vertical_score
         }
+        
+        # Диагональная и радиальная симметрия (опционально, если fast_mode=False)
+        if not self.config.fast_mode:
+            # Диагональная симметрия
+            diag_flip = cv2.flip(cv2.flip(gray, -1), -1)
+            diag_corr = np.corrcoef(gray.flatten(), diag_flip.flatten())[0, 1]
+            diag_score = float(np.nan_to_num(diag_corr, nan=0.0))
+            
+            # Радиальная симметрия
+            center = (W // 2, H // 2)
+            max_radius = min(W, H) // 2
+            try:
+                polar = cv2.linearPolar(gray, center, max_radius, cv2.WARP_FILL_OUTLIERS)
+                radial_flip = cv2.flip(polar, 1)
+                radial_corr = np.corrcoef(polar.flatten(), radial_flip.flatten())[0, 1]
+                radial_score = float(np.nan_to_num(radial_corr, nan=0.0))
+            except:
+                radial_score = 0.0
+            
+            scores['diagonal'] = diag_score
+            scores['radial'] = radial_score
+            
+            # Обновляем best_symmetry с учетом всех типов
+            best_symmetry = max(scores.items(), key=lambda x: x[1])
+            symmetry_score = float(np.mean(list(scores.values())))
+            
+            result.update({
+                'symmetry_score': symmetry_score,
+                'dominant_symmetry_type': best_symmetry[0],
+                'diagonal_symmetry': diag_score,
+                'radial_symmetry': radial_score,
+                'symmetry_details': scores
+            })
+        
+        return result
     
     def analyze_negative_space(self, frame: np.ndarray, 
                              object_mask: np.ndarray) -> Dict:
-        """Анализ негативного пространства"""
+        """
+        Анализ негативного пространства.
+        Использует object_mask (из сегментации, если доступно, иначе из bbox).
+        """
         H, W = frame.shape[:2]
         
-        # Маска негативного пространства
-        negative_space_mask = 1.0 - object_mask
+        # Маска негативного пространства (1 - object_mask)
+        # Если используется сегментация, object_mask уже точный
+        negative_space_mask = 1.0 - np.clip(object_mask, 0.0, 1.0)
         
         # Общее негативное пространство
         negative_space_ratio = float(negative_space_mask.mean())
         
-        # Распределение по квадрантам
-        quadrants = {
-            'top_left': negative_space_mask[:H//2, :W//2].mean(),
-            'top_right': negative_space_mask[:H//2, W//2:].mean(),
-            'bottom_left': negative_space_mask[H//2:, :W//2].mean(),
-            'bottom_right': negative_space_mask[H//2:, W//2:].mean()
-        }
+        # Баланс негативного пространства (лево-право)
+        left_neg_space = float(negative_space_mask[:, :W//2].mean())
+        right_neg_space = float(negative_space_mask[:, W//2:].mean())
+        neg_space_balance_lr = 1.0 - abs(left_neg_space - right_neg_space)
         
-        # Баланс негативного пространства
-        left_balance = abs(quadrants['top_left'] + quadrants['bottom_left'] - 
-                          quadrants['top_right'] - quadrants['bottom_right'])
-        negative_space_balance = 1.0 - left_balance
-        
-        # Энтропия негативного пространства
-        hist, _ = np.histogram(negative_space_mask, bins=256, range=(0, 1))
+        # Энтропия негативного пространства (опционально, для агрегатов)
+        hist, _ = np.histogram(negative_space_mask, bins=64, range=(0, 1))
         hist_norm = hist / (hist.sum() + 1e-6)
         entropy = float(-np.sum(hist_norm * np.log2(hist_norm + 1e-6)))
         
-        # Соотношение объект/фон
-        object_background_ratio = 1.0 - negative_space_ratio
+        # Распределение по квадрантам (для агрегатов)
+        quadrants = {
+            'top_left': float(negative_space_mask[:H//2, :W//2].mean()),
+            'top_right': float(negative_space_mask[:H//2, W//2:].mean()),
+            'bottom_left': float(negative_space_mask[H//2:, :W//2].mean()),
+            'bottom_right': float(negative_space_mask[H//2:, W//2:].mean())
+        }
         
         return {
             'negative_space_ratio': negative_space_ratio,
-            'negative_space_balance': float(negative_space_balance),
-            'negative_space_entropy': entropy,
-            'object_background_ratio': float(object_background_ratio),
-            'quadrant_distribution': {k: float(v) for k, v in quadrants.items()}
+            'neg_space_balance_lr': neg_space_balance_lr,  # Новое: компактная метрика
+            'negative_space_balance': neg_space_balance_lr,  # Алиас для обратной совместимости
+            'negative_space_entropy': entropy,  # Опционально, для агрегатов
+            'object_background_ratio': 1.0 - negative_space_ratio,
+            'quadrant_distribution': quadrants  # Для агрегатов
         }
     
     def analyze_complexity(self, frame: np.ndarray) -> Dict:
-        """Анализ сложности сцены"""
-        # Границы
+        """
+        Анализ визуальной сложности (упрощенная версия).
+        Использует edge_density, local variance (вместо SLIC), color_complexity.
+        overall_complexity - learnable weighted sum (не фиксированные веса).
+        """
+        # Границы (Canny)
         gray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
         edges = cv2.Canny(gray, 50, 150)
         edge_density = float(edges.mean() / 255.0)
         
-        # Текстура (сегментация SLIC)
-        try:
-            segments = slic(frame, n_segments=self.config.slic_n_segments,
-                          compactness=self.config.slic_compactness,
-                          start_label=1)
-            texture_entropy = float(shannon_entropy(segments))
-        except:
-            texture_entropy = 0.0
+        # Текстура: local variance (вместо SLIC - быстрее и дешевле)
+        # Вычисляем локальную дисперсию с downsampling для скорости
+        gray_float = gray.astype(np.float32) / 255.0
+        kernel = np.ones((5, 5), np.float32) / 25.0
+        local_mean = cv2.filter2D(gray_float, -1, kernel)
+        local_variance = cv2.filter2D((gray_float - local_mean)**2, -1, kernel)
+        texture_entropy = float(np.mean(local_variance))  # Упрощенная метрика текстуры
         
-        # Цветовая сложность
+        # Цветовая сложность (hue std)
         hsv = cv2.cvtColor(frame, cv2.COLOR_BGR2HSV)
-        hue_std = float(hsv[:, :, 0].std())
+        hue_std = float(hsv[:, :, 0].std() / 180.0)  # Нормализовано [0, 1]
         saturation_mean = float(hsv[:, :, 1].mean() / 255.0)
         
-        # Общая оценка сложности
-        complexity_score = (edge_density + texture_entropy / 10.0 + 
-                          hue_std / 180.0) / 3.0
+        # Общая оценка сложности (learnable weighted sum - здесь простая версия)
+        # В продакшн можно обучить веса на целевой метрике
+        complexity_score = (edge_density * 0.4 + texture_entropy * 0.3 + hue_std * 0.3)
         
         return {
             'edge_density': edge_density,
-            'texture_entropy': texture_entropy,
-            'color_complexity': hue_std,
-            'saturation_level': saturation_mean,
-            'overall_complexity': float(complexity_score)
+            'texture_entropy': texture_entropy,  # Теперь local variance вместо SLIC
+            'color_complexity': hue_std,  # Нормализованный hue_std
+            'saturation_mean': saturation_mean,
+            'overall_complexity': float(np.clip(complexity_score, 0.0, 1.0))
         }
     
     def analyze_composition_style(self, frame: np.ndarray, analysis: Dict) -> Dict[str, Any]:
@@ -763,12 +1039,29 @@ class FrameAnalyzer:
         }
 
     def analyze_leading_lines(self, frame: np.ndarray) -> Dict:
-        """Анализ ведущих линий"""
+        """
+        Анализ ведущих линий (упрощенная версия).
+        Использует edge thinning и saliency mask для фильтрации линий от фона.
+        """
         gray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
         edges = cv2.Canny(gray, 50, 150)
         
-        # Детекция линий
-        lines = cv2.HoughLinesP(edges, 1, np.pi/180, 
+        # Edge thinning (морфологическая операция для более точных линий)
+        kernel = np.ones((3, 3), np.uint8)
+        edges_thinned = cv2.morphologyEx(edges, cv2.MORPH_CLOSE, kernel)
+        
+        # Применяем saliency mask (если доступно) для фильтрации линий от фона
+        if self.config.use_saliency:
+            try:
+                saliency_map = self._compute_saliency_proxy(frame)
+                saliency_threshold = np.percentile(saliency_map, 30)  # Нижние 30% - фон
+                saliency_mask = (saliency_map > saliency_threshold).astype(np.uint8) * 255
+                edges_thinned = cv2.bitwise_and(edges_thinned, saliency_mask)
+            except:
+                pass
+        
+        # Детекция линий (используем thinned edges)
+        lines = cv2.HoughLinesP(edges_thinned, 1, np.pi/180, 
                                threshold=80, 
                                minLineLength=50, 
                                maxLineGap=10)
@@ -806,14 +1099,28 @@ class FrameAnalyzer:
             line_features['total_length'] = float(sum(lengths))
             line_features['avg_length'] = float(np.mean(lengths))
             
-            # Классификация линий
+            # Классификация линий и определение доминирующей ориентации
+            orientation_counts = {'horizontal': 0, 'vertical': 0, 'diagonal': 0}
             for angle in angles:
                 if angle < 30 or angle > 150:
                     line_features['vertical_lines'] += 1
+                    orientation_counts['vertical'] += 1
                 elif 60 < angle < 120:
                     line_features['horizontal_lines'] += 1
+                    orientation_counts['horizontal'] += 1
                 else:
                     line_features['diagonal_lines'] += 1
+                    orientation_counts['diagonal'] += 1
+            
+            # Доминирующая ориентация
+            if orientation_counts['horizontal'] > orientation_counts['vertical'] and orientation_counts['horizontal'] > orientation_counts['diagonal']:
+                line_features['dominant_line_orientation'] = 'horizontal'
+            elif orientation_counts['vertical'] > orientation_counts['diagonal']:
+                line_features['dominant_line_orientation'] = 'vertical'
+            elif orientation_counts['diagonal'] > 0:
+                line_features['dominant_line_orientation'] = 'diagonal'
+            else:
+                line_features['dominant_line_orientation'] = 'none'
             
             # Оценка схождения линий
             if len(endpoints) > 1:
@@ -867,11 +1174,20 @@ class FrameAnalyzer:
             main_subject_norm = (main_subject[0] / W, main_subject[1] / H)
         
         # Анализ различных аспектов
+        composition_anchors = self.analyze_composition_anchors(frame, object_data, face_data)
+        
         analysis = {
             'frame_dimensions': {'height': H, 'width': W},
             'object_data': object_data,
             'face_data': face_data,
-            'rule_of_thirds': self.analyze_rule_of_thirds(frame, object_data, face_data),
+            'rule_of_thirds': {  # Для обратной совместимости
+                'alignment_score': composition_anchors['alignment_score'],
+                'main_subject_x': composition_anchors['main_subject_x'],
+                'main_subject_y': composition_anchors['main_subject_y'],
+                'distance_to_thirds': composition_anchors['distance_to_thirds'],
+                'quadrant_distribution': composition_anchors['quadrant_distribution']
+            },
+            'composition_anchors': composition_anchors,  # Новое: объединенный анализ
             'balance': self.analyze_balance(frame, object_data['object_mask']),
             'depth': self.analyze_depth(frame),
             'symmetry': self.analyze_symmetry(frame),
@@ -879,10 +1195,6 @@ class FrameAnalyzer:
             'complexity': self.analyze_complexity(frame),
             'leading_lines': self.analyze_leading_lines(frame),
         }
-        
-        # Анализ золотого сечения (если есть главный субъект)
-        if main_subject_norm:
-            analysis['golden_ratio'] = self.analyze_golden_ratio(frame, main_subject_norm)
         
         # Определение стиля композиции
         analysis['composition_style'] = self.analyze_composition_style(frame, analysis)
@@ -1047,18 +1359,13 @@ class VideoCompositionAnalyzer:
         qualitative = self._analyze_qualitative_features(frame_analyses)
         
         # Общая оценка видео
-        video_score = float(np.mean([a.get('overall_composition_score', 0) 
-                                   for a in frame_analyses]))
-        
-        # Рекомендации
-        recommendations = self._generate_recommendations(frame_analyses)
+        video_score = float(np.mean([a.get('overall_composition_score', 0) for a in frame_analyses]))
         
         return {
             'frame_count': len(frame_analyses),
             'video_composition_score': video_score,
             'numeric_features': numeric_features,
             'qualitative_features': qualitative,
-            'recommendations': recommendations,
             'frame_analysis_summary': self._summarize_frame_analyses(frame_analyses)
         }
     
@@ -1181,130 +1488,3 @@ class VideoCompositionAnalyzer:
                 'mean': np.mean([s[1] for s in scores]) if scores else 0
             }
         }
-    
-    def _generate_recommendations(self, frame_analyses: List[Dict]) -> List[str]:
-        """Генерация рекомендаций по улучшению композиции"""
-        recommendations = []
-        
-        # Анализ средних показателей
-        avg_scores = {}
-        for key in ['rule_of_thirds.alignment_score',
-                   'balance.overall_balance_score',
-                   'symmetry.symmetry_score',
-                   'depth.depth_contrast']:
-            values = []
-            for analysis in frame_analyses:
-                val = self._get_nested_value(analysis, key)
-                if val is not None:
-                    values.append(val)
-            
-            if values:
-                avg_scores[key] = np.mean(values)
-        
-        # Генерация рекомендаций на основе анализа
-        if avg_scores.get('rule_of_thirds.alignment_score', 0) < 0.5:
-            recommendations.append("Улучшите выравнивание по правилу третей. Размещайте главные объекты на пересечениях линий третей.")
-        
-        if avg_scores.get('balance.overall_balance_score', 0) < 0.6:
-            recommendations.append("Обратите внимание на баланс кадра. Распределите визуальный вес равномернее.")
-        
-        if avg_scores.get('depth.depth_contrast', 0) < 0.3:
-            recommendations.append("Добавьте глубины в кадр. Используйте передний, средний и задний планы.")
-        
-        # Анализ негативного пространства
-        negative_space_vals = []
-        for analysis in frame_analyses:
-            if 'negative_space' in analysis:
-                negative_space_vals.append(analysis['negative_space']['negative_space_ratio'])
-        
-        if negative_space_vals:
-            avg_negative_space = np.mean(negative_space_vals)
-            if avg_negative_space > 0.7:
-                recommendations.append("Слишком много негативного пространства. Рассмотрите возможность кадрирования или добавления объектов.")
-            elif avg_negative_space < 0.2:
-                recommendations.append("Мало негативного пространства. Кадр может казаться перегруженным.")
-        
-        return recommendations
-    
-    def export_analysis(self, analysis: Dict, format: str = 'json', 
-                       filepath: str = None) -> Optional[str]:
-        """Экспорт анализа в указанный формат"""
-        try:
-            # Удаляем несериализуемые объекты
-            serializable_analysis = self._make_serializable(analysis)
-            
-            if format.lower() == 'json':
-                result = json.dumps(serializable_analysis, indent=2, ensure_ascii=False)
-                if filepath:
-                    with open(filepath, 'w', encoding='utf-8') as f:
-                        f.write(result)
-                return result
-                
-            elif format.lower() == 'dict':
-                return serializable_analysis
-                
-            else:
-                logger.info(f"Формат {format} не поддерживается")
-                return None
-                
-        except Exception as e:
-            logger.info(f"Ошибка при экспорте: {e}")
-            return None
-    
-    def _make_serializable(self, obj):
-        """Рекурсивное преобразование объекта в сериализуемый формат"""
-        if isinstance(obj, dict):
-            return {k: self._make_serializable(v) for k, v in obj.items()}
-        elif isinstance(obj, list):
-            return [self._make_serializable(item) for item in obj]
-        elif isinstance(obj, (np.integer, np.int32, np.int64)):
-            return int(obj)
-        elif isinstance(obj, (np.floating, np.float32, np.float64)):
-            return float(obj)
-        elif isinstance(obj, np.ndarray):
-            return obj.tolist()
-        elif isinstance(obj, (str, int, float, bool, type(None))):
-            return obj
-        else:
-            return str(obj)
-
-# =========================
-# ИНТЕРФЕЙС ДЛЯ РАБОТЫ С ВИДЕО
-# =========================
-class VideoProcessor:
-    """Обработчик видео для извлечения кадров"""
-    
-    @staticmethod
-    def extract_frames(video_path: str, max_frames: int = 100, 
-                      sample_rate: int = 10) -> List[np.ndarray]:
-        """Извлечение кадров из видео"""
-        frames = []
-        cap = cv2.VideoCapture(video_path)
-        
-        if not cap.isOpened():
-            raise ValueError(f"Не удалось открыть видео: {video_path}")
-        
-        total_frames = int(cap.get(cv2.CAP_PROP_FRAME_COUNT))
-        fps = cap.get(cv2.CAP_PROP_FPS)
-        
-        logger.info(f"Видео: {video_path}")
-        logger.info(f"Всего кадров: {total_frames}, FPS: {fps}")
-        
-        frame_count = 0
-        extracted_count = 0
-        
-        while extracted_count < max_frames:
-            ret, frame = cap.read()
-            
-            if not ret:
-                break
-            
-            if frame_count % sample_rate == 0:
-                frames.append(cv2.cvtColor(frame, cv2.COLOR_BGR2RGB))
-                extracted_count += 1
-            
-            frame_count += 1
-        
-        cap.release()
-        logger.info(f"Извлечено {len(frames)} кадров")
-        return frames

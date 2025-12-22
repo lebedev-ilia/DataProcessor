@@ -6,8 +6,9 @@
 from __future__ import annotations
 
 import logging
-from typing import Any, Dict, List, Optional, Sequence
+from typing import Any, Dict, List, Optional, Sequence, Tuple
 from pathlib import Path
+from collections import defaultdict, deque
 
 import cv2
 import mediapipe as mp
@@ -125,6 +126,11 @@ class DetalizeFaceExtractorRefactored():
             except Exception as e:
                 logger.error(f"DetalizeFaceExtractorRefactored | init | Ошибка при инициализации модуля '{module.module_name}': {e}")
 
+        # Tracking для мульти-лица (tracking_id для каждого лица)
+        self._face_tracking: Dict[int, Dict[str, Any]] = defaultdict(dict)  # frame_idx -> {face_idx -> tracking_id}
+        self._tracking_counter = 0
+        self._track_history: Dict[int, deque] = defaultdict(lambda: deque(maxlen=30))  # tracking_id -> history
+
     def frames_with_face_load(self, filename):
         import os, json
         p = f"{os.path.dirname(os.path.dirname(os.path.dirname(__file__)))}/result_store/face_detection"
@@ -159,6 +165,56 @@ class DetalizeFaceExtractorRefactored():
 
     __call__ = extract
 
+    def _compute_iou(self, bbox1: np.ndarray, bbox2: np.ndarray) -> float:
+        """Вычисляет IoU между двумя bbox."""
+        x1_min, y1_min, x1_max, y1_max = bbox1
+        x2_min, y2_min, x2_max, y2_max = bbox2
+        
+        inter_x_min = max(x1_min, x2_min)
+        inter_y_min = max(y1_min, y2_min)
+        inter_x_max = min(x1_max, x2_max)
+        inter_y_max = min(y1_max, y2_max)
+        
+        if inter_x_max <= inter_x_min or inter_y_max <= inter_y_min:
+            return 0.0
+        
+        inter_area = (inter_x_max - inter_x_min) * (inter_y_max - inter_y_min)
+        area1 = (x1_max - x1_min) * (y1_max - y1_min)
+        area2 = (x2_max - x2_min) * (y2_max - y2_min)
+        union_area = area1 + area2 - inter_area
+        
+        return inter_area / max(union_area, 1e-6)
+
+    def _assign_tracking_id(self, frame_idx: int, face_idx: int, bbox: np.ndarray, 
+                           detection_confidence: float) -> int:
+        """
+        Назначает tracking_id для лица на основе IoU с предыдущими кадрами.
+        """
+        # Ищем совпадения в предыдущих кадрах (последние 3 кадра)
+        best_match_id = None
+        best_iou = 0.3  # Порог IoU для совпадения
+        
+        for prev_frame_idx in range(max(0, frame_idx - 3), frame_idx):
+            if prev_frame_idx in self._face_tracking:
+                for prev_face_idx, prev_tracking_id in self._face_tracking[prev_frame_idx].items():
+                    # Получаем bbox из истории
+                    if prev_tracking_id in self._track_history:
+                        hist = list(self._track_history[prev_tracking_id])
+                        if len(hist) > 0:
+                            prev_bbox = hist[-1].get("bbox")
+                            if prev_bbox is not None:
+                                iou = self._compute_iou(bbox, np.array(prev_bbox))
+                                if iou > best_iou:
+                                    best_iou = iou
+                                    best_match_id = prev_tracking_id
+        
+        if best_match_id is not None:
+            return best_match_id
+        else:
+            # Новый track
+            self._tracking_counter += 1
+            return self._tracking_counter
+
     def _process_frame(self, frame: np.ndarray, frame_idx: int) -> List[Dict[str, Any]]:
         """
         Обрабатывает один кадр, используя модульную архитектуру.
@@ -170,15 +226,13 @@ class DetalizeFaceExtractorRefactored():
         if not results.multi_face_landmarks:
             return []
 
-        frame_features: List[Dict[str, Any]] = []
+        # Собираем все лица с их bbox для определения primary face
+        faces_with_bbox = []
         for face_idx, landmark_list in enumerate(results.multi_face_landmarks):
-            # 1. Извлекаем landmarks
             coords = landmarks_to_ndarray(landmark_list, width, height)
-
-            # 2. Вычисляем bbox
             bbox = compute_bbox(coords, width, height)
-
-            # 3. Валидация лица
+            
+            # Валидация
             if not validate_face_landmarks(
                 bbox, coords, width, height,
                 min_face_size=self.min_face_size,
@@ -187,10 +241,37 @@ class DetalizeFaceExtractorRefactored():
                 max_aspect_ratio=self.max_aspect_ratio,
                 validate_landmarks=self.validate_landmarks,
             ):
-                logger.debug(
-                    f"Frame {frame_idx}: Skipping invalid face detection (face_idx={face_idx})"
-                )
                 continue
+            
+            # Вычисляем площадь для определения primary face
+            bbox_area = (bbox[2] - bbox[0]) * (bbox[3] - bbox[1])
+            faces_with_bbox.append((face_idx, landmark_list, coords, bbox, bbox_area))
+        
+        # Сортируем по площади (primary face = наибольшая площадь)
+        faces_with_bbox.sort(key=lambda x: x[4], reverse=True)
+        
+        # Определяем primary face (индекс 0) и secondary faces
+        frame_features: List[Dict[str, Any]] = []
+        self._face_tracking[frame_idx] = {}
+        
+        for idx, (face_idx, landmark_list, coords, bbox, bbox_area) in enumerate(faces_with_bbox):
+            # Detection confidence (MediaPipe не предоставляет напрямую, используем эвристику)
+            # Можно использовать стабильность landmarks или другие метрики
+            detection_confidence = 0.9  # По умолчанию, можно улучшить
+            
+            # Назначаем tracking_id
+            tracking_id = self._assign_tracking_id(frame_idx, face_idx, bbox, detection_confidence)
+            self._face_tracking[frame_idx][face_idx] = tracking_id
+            
+            # Обновляем историю трека
+            if tracking_id not in self._track_history:
+                self._track_history[tracking_id] = deque(maxlen=30)
+            
+            self._track_history[tracking_id].append({
+                "bbox": bbox.tolist(),
+                "frame_idx": frame_idx,
+                "detection_confidence": detection_confidence,
+            })
 
             # 4. Извлекаем ROI
             roi = extract_roi(frame, bbox)
@@ -209,6 +290,9 @@ class DetalizeFaceExtractorRefactored():
                 "roi": roi,
                 "frame_shape": frame.shape,
                 "face_idx": face_idx,
+                "tracking_id": tracking_id,
+                "detection_confidence": detection_confidence,
+                "is_primary_face": (idx == 0),  # Первое лицо = primary
             }
 
             # 7. Обрабатываем через модули
@@ -216,6 +300,9 @@ class DetalizeFaceExtractorRefactored():
                 "frame_index": frame_idx,
                 "face_index": face_idx,
                 "bbox": bbox.tolist(),
+                "detection_confidence": detection_confidence,
+                "tracking_id": tracking_id,
+                "is_primary_face": (idx == 0),
             }
 
             # Обрабатываем модули в порядке загрузки

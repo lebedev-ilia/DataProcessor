@@ -254,8 +254,7 @@ def compute_frame_motion_features(flow: np.ndarray,
 
 
 # --- aggregation over video ---
-def aggregate_video_camera_features(flow_paths: Sequence[str],
-                                    config: Optional[dict] = None) -> Dict[str, float]:
+def aggregate_video_camera_features(flow_paths: Sequence[str], config: Optional[dict] = None) -> Dict[str, float]:
     """
     Given ordered list of flow file paths (frame t -> t+skip), compute aggregated camera motion features.
     Returns single dict of aggregated features (means, stds, counts).

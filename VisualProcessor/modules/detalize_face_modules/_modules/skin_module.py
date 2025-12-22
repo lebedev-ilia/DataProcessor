@@ -59,13 +59,13 @@ class SkinModule(FaceModule):
         makeup_prob = lipstick_intensity
         eye_shadow_prob = float(lipstick_intensity * 0.4)
 
-        # Skin smoothness
+        # Skin smoothness (техническая метрика, не связанная с привлекательностью)
         gray = cv2.cvtColor(roi, cv2.COLOR_BGR2GRAY)
         blur = cv2.GaussianBlur(gray, (5, 5), 0)
         laplacian_var = cv2.Laplacian(blur, cv2.CV_64F).var()
 
         skin_smoothness = float(1 / (1 + laplacian_var * 0.1))
-        skin_defect_score = float(min(max(laplacian_var * 10, 0), 100))
+        # skin_defect_score удален - рискованная метрика, может быть дискриминационной
 
         # Beard/mustache detection
         chin_idx = LANDMARKS["chin"]
@@ -94,16 +94,19 @@ class SkinModule(FaceModule):
 
         return {
             "skin": {
-                "makeup_presence_prob": makeup_prob,
-                "lipstick_intensity": lipstick_intensity,
-                "eye_shadow_prob": eye_shadow_prob,
-                "skin_smoothness": skin_smoothness,
-                "skin_defect_score": skin_defect_score,
-                "beard_prob": beard_prob,
-                "mustache_prob": mustache_prob,
-                "face_hair_density": face_hair_density,
+                # Безопасные фичи (non-sensitive)
+                "skin_smoothness": skin_smoothness,  # Техническая метрика
+                "face_hair_density": face_hair_density,  # Бинарная/плотность растительности
+                "beard_prob": beard_prob,  # Вероятность наличия бороды
+                "mustache_prob": mustache_prob,  # Вероятность наличия усов
+                # Аккуратно с макияжем (может быть чувствительным, но полезным для классификации формата)
+                "makeup_presence_prob": makeup_prob,  # С осторожностью и аудитом
+                "lipstick_intensity": lipstick_intensity,  # С осторожностью
+                "eye_shadow_prob": eye_shadow_prob,  # С осторожностью
+                # Структурные фичи (не связанные с привлекательностью)
                 "eyebrow_shape_vector": eyebrow_shape_vector,
                 "eyelid_openness": eyelid_openness,
+                # Удалено: skin_defect_score - рискованная метрика
             }
         }
 

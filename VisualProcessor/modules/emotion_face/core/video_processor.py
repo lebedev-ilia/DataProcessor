@@ -443,9 +443,14 @@ class VideoEmotionProcessor:
             change_analysis = analyze_emotion_changes(emo_results)
             logger.info(f"Тип изменений: {change_analysis['change_type']}")
             
-            # Расширенные фичи: микроэмоции
+            # Расширенные фичи: микроэмоции (с улучшенными параметрами)
             logger.info("Вычисление микроэмоций...")
-            microexpressions = detect_micro_expressions(emo_results, fps=fps)
+            microexpressions = detect_micro_expressions(
+                emo_results, 
+                fps=fps,
+                min_frames=2,  # Require at least 2 frames (0.03s at 30fps ≈ 1 frame is too short)
+                change_threshold=None  # Use adaptive threshold (85th percentile)
+            )
             logger.info(f"Найдено микроэмоций: {microexpressions['microexpressions_count']}")
             
             # Расширенные фичи: физиологические сигналы
@@ -513,11 +518,13 @@ class VideoEmotionProcessor:
             # Построение кривой эмоций
             emotion_curve = build_emotion_curve(emo_results)
             
-            # Детекция ключевых кадров
+            # Детекция ключевых кадров с улучшенными параметрами
             keyframes_indices = detect_keyframes(
                 emotion_curve,
                 EMOTION_CLASSES,
-                threshold=params.keyframe_threshold
+                threshold=params.keyframe_threshold,
+                prominence=0.1,  # Normalized prominence threshold
+                min_distance=8  # Minimum distance between peaks (8-12 frames recommended)
             )
             
             # Нормализация до target_length

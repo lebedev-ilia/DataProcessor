@@ -145,6 +145,62 @@ class OpticalFlowProcessor:
                                    cv2.NORM_MINMAX)
         
         return cv2.cvtColor(hsv, cv2.COLOR_HSV2RGB)
+
+    @staticmethod
+    def _compute_fb_metrics(flow_fwd: torch.Tensor,
+                            flow_bwd: torch.Tensor,
+                            fb_thresh: float = 1.0,
+                            occlusion_thresh: float = 1.5) -> Dict[str, float]:
+        """Оценивает forward-backward согласованность и доверие."""
+        if flow_fwd.dim() == 4:
+            flow_fwd = flow_fwd.squeeze(0)
+        if flow_bwd.dim() == 4:
+            flow_bwd = flow_bwd.squeeze(0)
+
+        device = flow_fwd.device
+        _, h, w = flow_fwd.shape
+
+        # Координатная сетка
+        y, x = torch.meshgrid(
+            torch.arange(h, device=device, dtype=flow_fwd.dtype),
+            torch.arange(w, device=device, dtype=flow_fwd.dtype),
+            indexing='ij'
+        )
+        x2 = x + flow_fwd[0]
+        y2 = y + flow_fwd[1]
+
+        # Нормализация координат для grid_sample
+        x2_norm = 2.0 * (x2 / max(w - 1, 1)) - 1.0
+        y2_norm = 2.0 * (y2 / max(h - 1, 1)) - 1.0
+        grid = torch.stack((x2_norm, y2_norm), dim=-1).unsqueeze(0)
+
+        flow_bwd_warp = torch.nn.functional.grid_sample(
+            flow_bwd.unsqueeze(0),
+            grid,
+            mode='bilinear',
+            align_corners=True,
+            padding_mode='border'
+        ).squeeze(0)
+
+        fb_sum = flow_fwd + flow_bwd_warp
+        fb_error = torch.sqrt(torch.sum(fb_sum ** 2, dim=0))
+
+        valid_mask = (x2 >= 0) & (x2 <= w - 1) & (y2 >= 0) & (y2 <= h - 1)
+        valid_ratio = float(valid_mask.float().mean().item())
+        fb_error_valid = fb_error[valid_mask] if valid_mask.any() else fb_error
+
+        fb_error_mean = float(fb_error_valid.mean().item())
+        fb_error_fraction = float((fb_error > fb_thresh).float().mean().item())
+        occlusion_fraction = float((fb_error > occlusion_thresh).float().mean().item())
+        flow_confidence_mean = float((1.0 / (1.0 + fb_error_valid)).mean().item())
+
+        return {
+            'fb_error_mean': fb_error_mean,
+            'fb_error_fraction': fb_error_fraction,
+            'occlusion_fraction': occlusion_fraction,
+            'flow_confidence_mean': flow_confidence_mean,
+            'valid_ratio': valid_ratio
+        }
     
     def process_video(self, frame_manager, frame_indices) -> Dict[str, Any]:
         """
@@ -164,10 +220,12 @@ class OpticalFlowProcessor:
 
         flow_dir = f"{self.config.output_dir}/flow"
         overlay_dir = f"{self.config.output_dir}/overlay" if self.config.save_overlay else None
+        quality_dir = f"{self.config.output_dir}/flow/quality"
         
         os.makedirs(flow_dir, exist_ok=True)
         if overlay_dir:
             os.makedirs(overlay_dir, exist_ok=True)
+        os.makedirs(quality_dir, exist_ok=True)
         
         # Получение свойств видео
         fps = frame_manager.fps
@@ -179,6 +237,8 @@ class OpticalFlowProcessor:
         frame_buffer = []
         processed_pairs = 0
         flow_data = []
+
+        frame_step_est = frame_indices[1] - frame_indices[0] if len(frame_indices) > 1 else 1
 
         for frame_idx in frame_indices:
             frame = frame_manager.get(frame_idx)
@@ -212,15 +272,27 @@ class OpticalFlowProcessor:
                         frame2_processed.unsqueeze(0)
                     )
                     flow_tensor = list_of_flows[-1].squeeze(0)
+
+                    flow_tensor_bwd = None
+                    if self.config.enable_forward_backward:
+                        list_of_flows_bwd = self.model(
+                            frame2_processed.unsqueeze(0),
+                            frame1_processed.unsqueeze(0)
+                        )
+                        flow_tensor_bwd = list_of_flows_bwd[-1].squeeze(0)
                 
                 # Масштабирование к оригинальному размеру
                 flow_resized = self.resize_flow(flow_tensor, frame1['orig_size'])
+                flow_resized_bwd = self.resize_flow(flow_tensor_bwd, frame1['orig_size']) if flow_tensor_bwd is not None else None
                 
                 # Сохранение тензора потока
                 if self.config.save_flow_tensors:
                     flow_filename = f"flow_{frame1['original_idx']:06d}.pt"
                     flow_path = f"{flow_dir}/{flow_filename}"
                     torch.save(flow_resized.cpu(), flow_path)
+                    if self.config.save_backward_flow and flow_resized_bwd is not None:
+                        bwd_filename = f"flow_bwd_{frame1['original_idx']:06d}.pt"
+                        torch.save(flow_resized_bwd.cpu(), f"{flow_dir}/{bwd_filename}")
                 
                 # Визуализация
                 if self.config.save_overlay:
@@ -245,6 +317,18 @@ class OpticalFlowProcessor:
                     'flow_tensor': flow_resized.cpu(),
                     'orig_size': frame1['orig_size']
                 })
+
+                # Качество/консистентность
+                if flow_resized_bwd is not None:
+                    quality = self._compute_fb_metrics(
+                        flow_resized,
+                        flow_resized_bwd,
+                        fb_thresh=self.config.fb_error_threshold,
+                        occlusion_thresh=self.config.occlusion_error_threshold
+                    )
+                    quality_path = f"{quality_dir}/quality_{frame1['original_idx']:06d}.json"
+                    with open(quality_path, 'w', encoding='utf-8') as f:
+                        json.dump(quality, f, ensure_ascii=False, indent=2)
                 
                 # Обновление буфера
                 frame_buffer = [frame_buffer[-1]]
@@ -263,7 +347,8 @@ class OpticalFlowProcessor:
             total_frames=total_frames,
             processed_frames=processed_pairs,
             original_resolution=(width, height),
-            processed_resolution=self._get_processed_size(height, width)
+            processed_resolution=self._get_processed_size(height, width),
+            frame_skip=frame_step_est
         )
         
         logger.info(f"Обработка завершена. Обработано пар: {processed_pairs}")
@@ -278,7 +363,8 @@ class OpticalFlowProcessor:
     
     def _create_metadata(self, output_dir, fps: float, total_frames: int, processed_frames: int,
                         original_resolution: Tuple[int, int],
-                        processed_resolution: Tuple[int, int]) -> Dict[str, Any]:
+                        processed_resolution: Tuple[int, int],
+                        frame_skip: int = 1) -> Dict[str, Any]:
         """Создание метаданных видео."""
         
         metadata = {
@@ -288,7 +374,8 @@ class OpticalFlowProcessor:
                 'model': self.config.model_type,
                 'max_dimension': self.config.max_dimension,
                 'device': self.config.device,
-                'pipeline_version': '2.0.0'
+                'pipeline_version': '2.0.0',
+                'frame_skip': frame_skip
             },
             
             'video_properties': {

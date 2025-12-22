@@ -9,7 +9,12 @@ if _path not in sys.path:
 
 from core.flow_statistics import FlowStatisticsAnalyzer
 from core.optical_flow import OpticalFlowProcessor
-from core.config import FlowPipelineConfig, FlowStatisticsConfig
+from core.config import (
+    FlowPipelineConfig,
+    FlowStatisticsConfig,
+    DEFAULT_GRID_SIZES,
+    DEFAULT_MOTION_THRESHOLDS
+)
 
 from utils.frame_manager import FrameManager
 from utils.results_store import ResultsStore
@@ -68,11 +73,12 @@ if __name__ == "__main__":
 
     flow_config.output_dir = p
 
-    grid_size = tuple([int(i) for i in args.grid_size.split(",")])
-    motion_thresholds = tuple([float(i) for i in args.motion_thresholds.split(",")])
+    grid_size = tuple([int(i) for i in args.grid_size.split(",")]) if args.grid_size else DEFAULT_GRID_SIZES[1]
+    motion_thresholds = tuple([float(i) for i in args.motion_thresholds.split(",")]) if args.motion_thresholds else DEFAULT_MOTION_THRESHOLDS
     
     stats_config = FlowStatisticsConfig(
         grid_size = grid_size,
+        grid_sizes = DEFAULT_GRID_SIZES,
         motion_thresholds = motion_thresholds,
         direction_bins = args.direction_bins,
         spatial_sample_rate = args.spatial_sample_rate,

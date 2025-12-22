@@ -2867,7 +2867,7 @@ story_coherence_score
 
 abrupt_semantic_changes
 
-# 🔤 6. Текст в кадре text scoring      🟩🟥🟥🟥 🟪🟪
+# 🔤 6. Текст в кадре text scoring      🟩🟩🟥🟥 🟪🟪
 
 📚 A. Основные извлекаемые данные
 1. Raw OCR text dataset
@@ -3122,7 +3122,7 @@ cta_strength (эмоционально + визуально)
 - `emphasis_score`
 - CTA timestamps
 
-# 🧠 7. Высокоуровневая семантика видео 🟩🟥🟥🟥 🟪🟪
+# 🧠 7. Высокоуровневая семантика видео 🟩🟩🟥🟥 🟪🟪
 
 🔹 A. Scene-level semantic embeddings
 
@@ -3276,7 +3276,7 @@ cta_strength (эмоционально + визуально)
 | Multimodal | multimodal_attention, event_alignment, cross_modal_novelty |
 | High-level labels | genre_probabilities, style_probability, content_type_probabilities |
 
-# 📊 8. Метрики сравнений               🟩🟥🟥🟥 🟪🟪
+# 📊 8. Метрики сравнений               🟩🟩🟥🟥 🟪🟪
 
 🔹 A. Semantic similarity
 
@@ -3403,7 +3403,7 @@ Cut rate, shot duration, scene length. Плавность повествован
 | Temporal / Pacing | pacing_curve_similarity, shot_duration_distribution_similarity |
 | High-level | overall_similarity_score, uniqueness_score, trend_alignment_score |
 
-# ⭐ 9. Степень уникальности видео      🟥🟥🟥🟥 🟪🟪
+# ⭐ 9. Степень уникальности видео      🟩🟩🟥🟥 🟪🟪
 
 🔹 A. Semantic / Content Novelty
 

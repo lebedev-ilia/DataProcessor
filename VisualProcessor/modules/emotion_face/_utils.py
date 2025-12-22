@@ -204,70 +204,100 @@ def build_emotion_curve(emo_results):
         'combined_diff': [abs(v) + abs(a) for v, a in zip(valence_diff, arousal_diff)]
     }
 
-def detect_keyframes(emotion_curve, EMOTION_CLASSES, threshold=0.3, smooth_window=5):
+def detect_keyframes(emotion_curve, EMOTION_CLASSES, threshold=0.3, smooth_window=5, 
+                    prominence=0.1, min_distance=8):
     """
-    Находит ключевые кадры с предварительным сглаживанием.
+    Находит ключевые кадры с предварительным сглаживанием и использованием scipy.signal.find_peaks.
+    
+    Args:
+        emotion_curve: dict with 'valence', 'arousal', 'intensity', etc.
+        EMOTION_CLASSES: dict mapping emotion indices to names
+        threshold: minimum change threshold for transitions
+        smooth_window: window size for Gaussian smoothing
+        prominence: minimum prominence for peak detection (normalized scale, default 0.1)
+        min_distance: minimum distance between peaks in frames (default 8-12 frames)
     """
-    # Сначала сглаживаем кривые для удаления шума
-    valence_smooth = np.convolve(
-        emotion_curve['valence'], 
-        np.ones(smooth_window)/smooth_window, 
-        mode='same'
+    from scipy import signal
+    from scipy.ndimage import gaussian_filter1d
+    
+    # Gaussian smoothing instead of simple moving average (sigma = 1-3 frames)
+    sigma = min(3.0, smooth_window / 3.0)
+    valence_smooth = gaussian_filter1d(
+        np.array(emotion_curve['valence']), 
+        sigma=sigma, 
+        mode='nearest'
     )
-    arousal_smooth = np.convolve(
-        emotion_curve['arousal'], 
-        np.ones(smooth_window)/smooth_window, 
-        mode='same'
+    arousal_smooth = gaussian_filter1d(
+        np.array(emotion_curve['arousal']), 
+        sigma=sigma, 
+        mode='nearest'
     )
     
-    # Вычисляем изменения на сглаженных кривых
-    valence_diff = np.abs(np.diff(valence_smooth))
-    arousal_diff = np.abs(np.diff(arousal_smooth))
-    combined_diff = (valence_diff + arousal_diff) / 2
+    # Compute intensity = sqrt(valence² + arousal²)
+    intensity = np.sqrt(valence_smooth**2 + arousal_smooth**2)
     
-    # Ищем пики изменений
+    # Normalize intensity to [0, 1] for prominence calculation
+    intensity_min = np.min(intensity)
+    intensity_max = np.max(intensity)
+    if intensity_max > intensity_min:
+        intensity_norm = (intensity - intensity_min) / (intensity_max - intensity_min)
+    else:
+        intensity_norm = intensity
+    
+    # Detect peaks in intensity using scipy.signal.find_peaks
+    peaks, peak_properties = signal.find_peaks(
+        intensity_norm,
+        prominence=prominence,
+        distance=max(1, min_distance)
+    )
+    
     keyframes = {}
     
-    # Более чувствительный алгоритм для плавных изменений
-    for i in range(1, len(combined_diff) - 1):
-        # Проверяем локальные максимумы
-        is_local_max = (
-            combined_diff[i] > combined_diff[i-1] and 
-            combined_diff[i] > combined_diff[i+1]
-        )
-        
-        # Адаптивный порог: 30% от максимального изменения
-        adaptive_threshold = max(threshold, np.max(combined_diff) * 0.3)
-        
-        if is_local_max and combined_diff[i] > adaptive_threshold:
-            keyframes[i] = {
-                'type': 'transition',
-                'score': float(combined_diff[i]),
-                'valence_change': float(valence_diff[i]),
-                'arousal_change': float(arousal_diff[i])
+    # Add emotion peaks
+    for peak_idx in peaks:
+        if peak_idx < len(intensity):
+            keyframes[peak_idx] = {
+                'type': 'emotion_peak',
+                'score': float(intensity_norm[peak_idx]),
+                'intensity': float(intensity[peak_idx]),
+                'valence': float(valence_smooth[peak_idx]),
+                'arousal': float(arousal_smooth[peak_idx])
             }
     
-    # Также ищем абсолютные максимумы каждой эмоции
-    emotion_vectors = np.array(emotion_curve['emotion_vectors'])
-    for emotion_idx in range(emotion_vectors.shape[1]):
-        emotion_curve_smooth = np.convolve(
-            emotion_vectors[:, emotion_idx],
-            np.ones(3)/3,
-            mode='same'
+    # Detect transitions: significant changes in valence/arousal
+    valence_diff = np.abs(np.diff(valence_smooth))
+    arousal_diff = np.abs(np.diff(arousal_smooth))
+    combined_diff = np.sqrt(valence_diff**2 + arousal_diff**2)
+    
+    # Normalize combined_diff for prominence
+    if len(combined_diff) > 0:
+        diff_min = np.min(combined_diff)
+        diff_max = np.max(combined_diff)
+        if diff_max > diff_min:
+            combined_diff_norm = (combined_diff - diff_min) / (diff_max - diff_min)
+        else:
+            combined_diff_norm = combined_diff
+        
+        # Find peaks in change signal (transitions)
+        transition_peaks, _ = signal.find_peaks(
+            combined_diff_norm,
+            prominence=prominence,
+            distance=max(1, min_distance)
         )
         
-        # Ищем локальные максимумы для каждой эмоции
-        for i in range(1, len(emotion_curve_smooth) - 1):
-            if (emotion_curve_smooth[i] > emotion_curve_smooth[i-1] and 
-                emotion_curve_smooth[i] > emotion_curve_smooth[i+1] and
-                emotion_curve_smooth[i] > 0.5):  # Порог уверенности
-                
-                if i not in keyframes or keyframes[i]['score'] < emotion_curve_smooth[i]:
-                    keyframes[i] = {
-                        'type': 'emotion_peak',
-                        'score': float(emotion_curve_smooth[i]),
-                        'emotion_idx': emotion_idx,
-                        'emotion_name': list(EMOTION_CLASSES.values())[emotion_idx]
+        # Add transitions (shift by 1 since diff reduces length by 1)
+        for trans_idx in transition_peaks:
+            frame_idx = trans_idx + 1  # diff shifts indices
+            if frame_idx < len(valence_smooth):
+                # Only add if not already a peak, or if transition score is higher
+                if frame_idx not in keyframes or combined_diff_norm[trans_idx] > keyframes[frame_idx].get('score', 0):
+                    keyframes[frame_idx] = {
+                        'type': 'transition',
+                        'score': float(combined_diff_norm[trans_idx]),
+                        'valence_change': float(valence_diff[trans_idx]),
+                        'arousal_change': float(arousal_diff[trans_idx]),
+                        'valence': float(valence_smooth[frame_idx]),
+                        'arousal': float(arousal_smooth[frame_idx])
                     }
     
     return dict(sorted(keyframes.items(), key=lambda x: x[1]['score'], reverse=True))
@@ -825,36 +855,59 @@ def adaptive_params(current_params, retry_count, diversity_score, transition_cou
     
     return current_params
 
-def analyze_emotion_profile(emo_results):
-    """Анализирует, какие эмоции преобладают."""
+def analyze_emotion_profile(emo_results, use_weighted_means=True):
+    """
+    Анализирует, какие эмоции преобладают.
+    
+    Args:
+        emo_results: список результатов эмоций
+        use_weighted_means: использовать weighted means по confidence (рекомендуется True)
+    """
     emotion_totals = {}
-    valence_avg = 0
-    arousal_avg = 0
+    valence_sum = 0
+    arousal_sum = 0
+    confidence_sum = 0
     
     for result in emo_results:
-        valence_avg += result.get('valence', 0)
-        arousal_avg += result.get('arousal', 0)
+        # Get confidence (emotion_confidence or face_confidence, fallback to 1.0)
+        conf = result.get('emotion_confidence', result.get('face_confidence', 1.0))
+        if not use_weighted_means:
+            conf = 1.0  # Unweighted
+        
+        valence_sum += result.get('valence', 0) * conf
+        arousal_sum += result.get('arousal', 0) * conf
+        confidence_sum += conf
         
         emotions = result.get('emotions', {})
         if emotions:
             dominant = max(emotions.items(), key=lambda x: x[1])[0]
-            emotion_totals[dominant] = emotion_totals.get(dominant, 0) + 1
+            # Weight by confidence
+            emotion_totals[dominant] = emotion_totals.get(dominant, 0) + conf
     
-    valence_avg /= len(emo_results)
-    arousal_avg /= len(emo_results)
+    if confidence_sum > 0:
+        valence_avg = valence_sum / confidence_sum
+        arousal_avg = arousal_sum / confidence_sum
+    else:
+        valence_avg = 0
+        arousal_avg = 0
     
     # Определяем доминантную эмоцию
     dominant_emotion = None
     if emotion_totals:
         dominant_emotion = max(emotion_totals.items(), key=lambda x: x[1])[0]
     
+    total_weighted_frames = sum(emotion_totals.values())
+    neutral_percentage = emotion_totals.get('Neutral', 0) / total_weighted_frames if total_weighted_frames > 0 else 0
+    
     return {
         'dominant_emotion': dominant_emotion,
         'emotion_distribution': emotion_totals,
         'valence_avg': valence_avg,
         'arousal_avg': arousal_avg,
+        'valence_std': float(np.std([r.get('valence', 0) for r in emo_results])),
+        'arousal_std': float(np.std([r.get('arousal', 0) for r in emo_results])),
         'is_neutral_dominant': dominant_emotion == 'Neutral',
-        'neutral_percentage': emotion_totals.get('Neutral', 0) / len(emo_results) if len(emo_results) > 0 else 0
+        'neutral_percentage': neutral_percentage
     }
 
 def sample_for_static_face(segments, total_frames, fps, target_samples=100):
@@ -1047,19 +1100,28 @@ def choose_batch_size_by_vram():
         return 4
     return 1
 
-def predict_emonet_batch(frames: List[np.ndarray], model, batch_size: Optional[int] = None, use_amp: bool = True):
+def predict_emonet_batch(frames: List[np.ndarray], model, batch_size: Optional[int] = None, use_amp: bool = True, 
+                         temperature: float = 1.0, face_confidence: Optional[List[float]] = None):
     """
     frames: list of RGB ndarrays (H,W,3)
-    returns list of dicts {valence, arousal, emotions: {label:prob,...}}
+    returns list of dicts {valence, arousal, emotions: {label:prob,...}, emotion_confidence, is_valid}
+    
+    Args:
+        temperature: Temperature scaling factor for calibration (default 1.0, can be tuned on validation)
+        face_confidence: Optional list of face detection confidence scores (0-1) for each frame
     """
     if batch_size is None:
         batch_size = choose_batch_size_by_vram()
     results = []
     model_device = DEVICE
+    
+    if face_confidence is None:
+        face_confidence = [1.0] * len(frames)
 
     # move model already loaded to DEVICE
     for i in range(0, len(frames), batch_size):
         chunk = frames[i:i + batch_size]
+        chunk_confidence = face_confidence[i:i + batch_size]
         tensors = [preprocess(f) for f in chunk]
         batch_tensor = torch.stack(tensors).to(model_device)
 
@@ -1075,20 +1137,37 @@ def predict_emonet_batch(frames: List[np.ndarray], model, batch_size: Optional[i
             torch.cuda.empty_cache()
             if batch_size > 1:
                 # recursively try with smaller batch
-                return predict_emonet_batch(frames, model, batch_size=max(1, batch_size // 2), use_amp=use_amp)
+                return predict_emonet_batch(frames, model, batch_size=max(1, batch_size // 2), 
+                                          use_amp=use_amp, temperature=temperature, face_confidence=face_confidence)
             else:
                 raise e
 
         vals = out["valence"].detach().cpu().numpy()
         arous = out["arousal"].detach().cpu().numpy()
         logits = out["expression"].detach()
+        
+        # Temperature scaling for calibration
+        if temperature != 1.0:
+            logits = logits / temperature
+        
         probs = F.softmax(logits, dim=1).cpu().numpy()
 
         for j in range(len(chunk)):
+            # Compute emotion confidence: max softmax probability * face detection confidence
+            max_prob = float(np.max(probs[j]))
+            detection_conf = chunk_confidence[j] if j < len(chunk_confidence) else 1.0
+            emotion_confidence = max_prob * detection_conf
+            
+            # Mark as invalid if face confidence is too low
+            is_valid = detection_conf >= 0.3  # Threshold for valid face detection
+            
             results.append({
                 "valence": float(vals[j]),
                 "arousal": float(arous[j]),
-                "emotions": {EMOTION_CLASSES[k]: float(probs[j][k]) for k in range(len(EMOTION_CLASSES))}
+                "emotions": {EMOTION_CLASSES[k]: float(probs[j][k]) for k in range(len(EMOTION_CLASSES))},
+                "emotion_confidence": float(emotion_confidence),
+                "face_confidence": float(detection_conf),
+                "is_valid": bool(is_valid)
             })
         # free
         del batch_tensor, out, logits

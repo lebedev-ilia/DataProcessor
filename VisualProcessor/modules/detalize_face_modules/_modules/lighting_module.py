@@ -79,19 +79,24 @@ class LightingModule(FaceModule):
         shading_score = float(np.clip(1.0 - p5 / 255.0, 0.0, 1.0))
 
         # --- Skin tone classification (Fitzpatrick approx) ---
+        # ВНИМАНИЕ: Эта метрика чувствительна и может быть использована только для аудита
+        # Не использовать в рабочей модели без юридической проверки и bias-анализа
         mean_L = float(np.mean(L_channel))
-        if mean_L > 80:
-            skin_tone_index = 1
-        elif mean_L > 70:
-            skin_tone_index = 2
-        elif mean_L > 60:
-            skin_tone_index = 3
-        elif mean_L > 50:
-            skin_tone_index = 4
-        elif mean_L > 40:
-            skin_tone_index = 5
-        else:
-            skin_tone_index = 6
+        # Помечаем как audit-only (не включать в основные фичи)
+        skin_tone_index_audit_only = None  # По умолчанию не вычисляем
+        # Раскомментировать только для аудита:
+        # if mean_L > 80:
+        #     skin_tone_index_audit_only = 1
+        # elif mean_L > 70:
+        #     skin_tone_index_audit_only = 2
+        # elif mean_L > 60:
+        #     skin_tone_index_audit_only = 3
+        # elif mean_L > 50:
+        #     skin_tone_index_audit_only = 4
+        # elif mean_L > 40:
+        #     skin_tone_index_audit_only = 5
+        # else:
+        #     skin_tone_index_audit_only = 6
 
         # --- Zone lighting analysis ---
         zone_lighting = {}
@@ -138,17 +143,21 @@ class LightingModule(FaceModule):
             "light_uniformity_score": uniformity,
             "face_contrast": contrast,
             "white_balance_shift": white_balance_shift,
-            "skin_color_vector": skin_vector,
             "highlight_intensity": highlight,
             "shadow_depth": shadow,
             "glare_score": glare_score,
             "shading_score": shading_score,
-            "skin_tone_index": skin_tone_index,
             "lighting_proxy_score": lighting_proxy,
         }
 
         if zone_lighting:
             result["zone_lighting"] = zone_lighting
+
+        # skin_tone_index и skin_color_vector - только для аудита (не включать в основные фичи)
+        # Раскомментировать только если требуется для bias-анализа:
+        # if skin_tone_index_audit_only is not None:
+        #     result["skin_tone_index_audit_only"] = skin_tone_index_audit_only
+        # result["skin_color_vector_audit_only"] = skin_vector
 
         return {"lighting": result}
 

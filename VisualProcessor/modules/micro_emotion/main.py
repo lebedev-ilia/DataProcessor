@@ -1,261 +1,210 @@
+if __name__ == "__main__":
+    import argparse
+    import json
 import os
 import sys
-import subprocess
-import json
-import pandas as pd
 import numpy as np
+    import cv2
 from pathlib import Path
-import cv2
-from datetime import datetime
-
-class OpenFaceAnalyzer:
-    def __init__(self, docker_image="openface/openface:latest"):
-        """
-        Инициализация анализатора OpenFace.
-        
-        Args:
-            docker_image: имя Docker образа OpenFace
-        """
-        self.docker_image = docker_image
-        self.base_dir = Path(__file__).parent.parent
-        
-        # Директории
-        self.input_dir = self.base_dir / "input_videos"
-        self.output_dir = self.base_dir / "output_data"
-        self.temp_dir = self.base_dir / "temp_frames"
-        
-        # Создаем директории если их нет
-        self.input_dir.mkdir(exist_ok=True)
-        self.output_dir.mkdir(exist_ok=True)
-        self.temp_dir.mkdir(exist_ok=True)
-        
-        # Проверяем доступность Docker
-        self.check_docker()
+    import tempfile
     
-    def check_docker(self):
-        """Проверяет доступность Docker и образа."""
+    _path = os.path.dirname(os.path.dirname(os.path.dirname(__file__)))
+    
+    if _path not in sys.path:
+        sys.path.append(_path)
+    
+    from utils.frame_manager import FrameManager
+    from utils.results_store import ResultsStore
+    
+    # Import OpenFaceAnalyzer from a separate module file
+    # Check if openface_analyzer.py exists, otherwise use the class from main.py
+    _module_path = os.path.dirname(__file__)
+    openface_file = os.path.join(_module_path, "openface_analyzer.py")
+    
+    if os.path.exists(openface_file):
+        from openface_analyzer import OpenFaceAnalyzer
+    else:
+        # Fallback: import from main.py using importlib to avoid circular import
+        import importlib.util
+        spec = importlib.util.spec_from_file_location("openface_module", os.path.join(_module_path, "main.py"))
+        openface_module = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(openface_module)
+        OpenFaceAnalyzer = openface_module.OpenFaceAnalyzer
+    
+    import warnings
+    warnings.filterwarnings("ignore", category=UserWarning)
+    
+    name = "micro_emotion"
+    
+    def load_json(path):
         try:
-            # Проверяем Docker
-            result = subprocess.run(["docker", "--version"], 
-                                  capture_output=True, text=True)
-            if result.returncode != 0:
-                raise RuntimeError("Docker не установлен или не запущен")
-            print(f"[INFO] Docker доступен: {result.stdout.strip()}")
-            
-            # Проверяем образ OpenFace
-            result = subprocess.run(["docker", "images", "openface/openface:latest", "--quiet"], capture_output=True, text=True)
-            if not result.stdout.strip():
-                raise RuntimeError("Образ OpenFace не найден. Скачайте: docker pull openface/openface:latest")
-            print("[INFO] Образ OpenFace доступен")
-            
-        except FileNotFoundError:
-            raise RuntimeError("Docker не установлен. Установите: sudo apt install docker.io")
-    
-    def analyze_video(self, video_path, output_name=None, features="all"):
-        """
-        Анализирует видео файл с помощью OpenFace.
-        
-        Args:
-            video_path: путь к видео файлу
-            output_name: имя для выходных файлов (без расширения)
-            features: какие признаки извлекать ("all", "basic", "au", "pose", "gaze")
-        
-        Returns:
-            dict: словарь с результатами анализа
-        """
-        video_path = Path(video_path)
-        if not video_path.exists():
-            raise FileNotFoundError(f"Видео не найдено: {video_path}")
-        
-        # Определяем имя выходного файла
-        if output_name is None:
-            output_name = video_path.stem
-        
-        # Копируем видео во входную директорию
-        target_video = self.input_dir / video_path.name
-        if not target_video.exists() or target_video.stat().st_size != video_path.stat().st_size:
-            import shutil
-            print(f"[INFO] Копирую видео: {video_path} -> {target_video}")
-            shutil.copy2(video_path, target_video)
-        
-        # Параметры для FeatureExtraction
-        feature_flags = {
-            "all": "-pose -aus -gaze -2Dfp -3Dfp -tracked",
-            "basic": "-pose -2Dfp",
-            "au": "-aus",
-            "pose": "-pose",
-            "gaze": "-gaze"
-        }
-        
-        flags = feature_flags.get(features, feature_flags["all"])
-        
-        # Создаем команду для Docker
-        cmd = [
-            "docker", "run", "--rm",
-            "-v", f"{self.input_dir.absolute()}:/input",
-            "-v", f"{self.output_dir.absolute()}:/output",
-            self.docker_image,
-            "/usr/local/bin/FeatureExtraction",
-            "-f", f"/input/{video_path.name}",
-            "-out_dir", "/output",
-            "-of", f"/output/{output_name}",
-        ] + flags.split()
-        
-        print(f"[INFO] Запускаю OpenFace анализ: {' '.join(cmd)}")
-        
-        # Запускаем анализ
-        start_time = datetime.now()
-        result = subprocess.run(cmd, capture_output=True, text=True)
-        elapsed = (datetime.now() - start_time).total_seconds()
-        
-        if result.returncode != 0:
-            print(f"[ERROR] OpenFace завершился с ошибкой:")
-            print(result.stderr[:500])  # Показываем первые 500 символов ошибки
-            return None
-        
-        print(f"[INFO] Анализ завершен за {elapsed:.2f} секунд")
-        
-        # Читаем результаты
-        results = self.load_results(output_name)
-        
-        return results
-    
-    def analyze_frames(self, frames, frame_indices=None, output_prefix="frames"):
-        """
-        Анализирует список кадров (numpy arrays).
-        
-        Args:
-            frames: список numpy arrays (каждое изображение BGR)
-            frame_indices: индексы кадров (если None, используются 0,1,2,...)
-            output_prefix: префикс для выходных файлов
-        
-        Returns:
-            list: список результатов для каждого кадра
-        """
-        if frame_indices is None:
-            frame_indices = list(range(len(frames)))
-        
-        all_results = []
-        
-        for i, (frame, idx) in enumerate(zip(frames, frame_indices)):
-            print(f"[INFO] Анализ кадра {i+1}/{len(frames)} (индекс {idx})")
-            
-            # Сохраняем кадр как временное изображение
-            frame_filename = f"{output_prefix}_frame_{idx:06d}.png"
-            frame_path = self.temp_dir / frame_filename
-            
-            # Конвертируем BGR в RGB для сохранения
-            frame_rgb = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
-            cv2.imwrite(str(frame_path), frame_rgb)
-            
-            # Анализируем кадр
-            result = self.analyze_single_image(frame_path, output_prefix=f"{output_prefix}_{idx}")
-            
-            if result is not None:
-                result['frame_index'] = idx
-                all_results.append(result)
-            
-            # Удаляем временный файл
-            frame_path.unlink(missing_ok=True)
-        
-        return all_results
-    
-    def analyze_single_image(self, image_path, output_prefix="image"):
-        """
-        Анализирует одно изображение.
-        
-        Args:
-            image_path: путь к изображению
-            output_prefix: префикс для выходных файлов
-        
-        Returns:
-            dict: результаты анализа
-        """
-        image_path = Path(image_path)
-        
-        # Копируем изображение во входную директорию
-        target_image = self.input_dir / image_path.name
-        import shutil
-        shutil.copy2(image_path, target_image)
-        
-        # Команда для анализа изображения
-        cmd = [
-            "docker", "run", "--rm",
-            "-v", f"{self.input_dir.absolute()}:/input",
-            "-v", f"{self.output_dir.absolute()}:/output",
-            self.docker_image,
-            "./build/bin/FaceLandmarkImg",
-            "-f", f"/input/{image_path.name}",
-            "-out_dir", f"/output",
-            "-of", f"/output/{output_prefix}"
-        ]
-        
-        result = subprocess.run(cmd, capture_output=True, text=True)
-        
-        # Удаляем копию изображения
-        target_image.unlink(missing_ok=True)
-        
-        if result.returncode != 0:
-            print(f"[WARNING] Не удалось проанализировать изображение: {image_path.name}")
-            return None
-        
-        # Загружаем результаты
-        csv_path = self.output_dir / f"{output_prefix}.csv"
-        if csv_path.exists():
-            try:
-                df = pd.read_csv(csv_path)
-                return self.extract_features_from_df(df)
-            except Exception as e:
-                print(f"[ERROR] Ошибка чтения CSV: {e}")
-                return None
-        
-        return None
-    
-    def load_results(self, output_name):
-        """
-        Загружает результаты анализа из CSV файла.
-        
-        Args:
-            output_name: имя выходного файла (без расширения)
-        
-        Returns:
-            dict: словарь с результатами
-        """
-        csv_path = self.output_dir / f"{output_name}.csv"
-        
-        if not csv_path.exists():
-            print(f"[WARNING] CSV файл не найден: {csv_path}")
-            return None
-        
-        try:
-            df = pd.read_csv(csv_path)
-            print(f"[INFO] Загружено {len(df)} кадров из {csv_path}")
-            
-            # Извлекаем основные признаки
-            features = self.extract_features_from_df(df)
-            
-            # Сохраняем также полный DataFrame
-            features['dataframe'] = df
-            features['csv_path'] = str(csv_path)
-            features['frame_count'] = len(df)
-            
-            return features
-            
+            with open(path, 'r', encoding='utf-8') as f:
+                return json.load(f)
         except Exception as e:
-            print(f"[ERROR] Ошибка загрузки CSV: {e}")
-            return None
+            raise Exception(f"{name} | main | load_json | Ошибка при открытии файла {path}: {e}")
     
-    def extract_features_from_df(self, df):
-        """
-        Извлекает ключевые признаки из DataFrame OpenFace.
+    from utils.logger import get_logger
+    logger = get_logger(name)
+    
+    parser = argparse.ArgumentParser(
+        description='Micro Emotion Module - Extracts micro-expressions and Action Units using OpenFace',
+        formatter_class=argparse.ArgumentDefaultsHelpFormatter
+    )
+    
+    parser.add_argument('--frames-dir', type=str, required=True, help='Path to frames directory')
+    parser.add_argument('--rs-path', type=str, default=None, help='Path to results store directory')
+    parser.add_argument('--features', type=str, default='all', choices=['all', 'basic', 'au', 'pose', 'gaze'], help='Which features to extract')
+    parser.add_argument('--batch-size', type=int, default=50, help='Batch size for processing frames')
+    parser.add_argument('--use-face-detection', action='store_true', help='Use face detection results to filter frames')
+    parser.add_argument('--docker-image', type=str, default='openface/openface:latest', help='Docker image for OpenFace')
+    
+    args = parser.parse_args()
+    
+    rs = ResultsStore(args.rs_path)
+    
+    metadata = load_json(f"{args.frames_dir}/metadata.json")
+    
+    frame_manager = FrameManager(
+        args.frames_dir, 
+        chunk_size=metadata["chunk_size"], 
+        cache_size=metadata["cache_size"]
+    )
+    
+    logger.info(f"VisualProcessor | {name} | main | Initializing OpenFaceAnalyzer")
+    
+    analyzer = OpenFaceAnalyzer(docker_image=args.docker_image)
         
-        Args:
-            df: DataFrame с результатами OpenFace
+    # Get frame indices - use face detection results if available
+    frame_indices = list(range(metadata["total_frames"]))
+    
+    if args.use_face_detection:
+        try:
+            face_results_path = f"{args.rs_path}/face_detection"
+            if os.path.exists(face_results_path):
+                face_files = [f for f in os.listdir(face_results_path) if f.endswith('.json')]
+                if face_files:
+                    face_data = load_json(f"{face_results_path}/{sorted(face_files)[-1]}")
+                    # Filter frames that have faces
+                    if 'frames' in face_data:
+                        frames_with_faces = [int(k) for k, v in face_data['frames'].items() if v and len(v) > 0]
+                        frame_indices = sorted(set(frame_indices) & set(frames_with_faces))
+                        logger.info(f"VisualProcessor | {name} | main | Filtered to {len(frame_indices)} frames with faces")
+        except Exception as e:
+            logger.warning(f"VisualProcessor | {name} | main | Could not load face detection data: {e}")
+    
+    # Process frames in batches
+    logger.info(f"VisualProcessor | {name} | main | Processing {len(frame_indices)} frames in batches of {args.batch_size}")
         
-        Returns:
-            dict: извлеченные признаки
-        """
-        features = {
+    all_results = []
+        
+    for batch_start in range(0, len(frame_indices), args.batch_size):
+        batch_end = min(batch_start + args.batch_size, len(frame_indices))
+        batch_indices = frame_indices[batch_start:batch_end]
+        
+        logger.info(f"VisualProcessor | {name} | main | Processing batch {batch_start // args.batch_size + 1}/{(len(frame_indices) + args.batch_size - 1) // args.batch_size}")
+        
+        # Get frames
+        frames = []
+        for idx in batch_indices:
+            try:
+                frame = frame_manager.get_frame(idx)
+                # Convert RGB to BGR for OpenCV
+                frame_bgr = cv2.cvtColor(frame, cv2.COLOR_RGB2BGR)
+                frames.append(frame_bgr)
+            except Exception as e:
+                logger.warning(f"VisualProcessor | {name} | main | Error loading frame {idx}: {e}")
+                continue
+        
+        if len(frames) == 0:
+            continue
+        
+        # Analyze frames using OpenFaceAnalyzer
+        try:
+            batch_results = analyzer.analyze_frames(
+                frames=frames,
+                frame_indices=batch_indices[:len(frames)],
+                output_prefix=f"batch_{batch_start}"
+            )
+            
+            if batch_results:
+                all_results.extend(batch_results)
+                logger.info(f"VisualProcessor | {name} | main | Processed {len(batch_results)} frames in batch")
+        except Exception as e:
+            logger.error(f"VisualProcessor | {name} | main | Error processing batch: {e}")
+            continue
+    
+    logger.info(f"VisualProcessor | {name} | main | Processed {len(all_results)} frames total")
+    
+    # Try to use optimized processor if DataFrame is available
+    result = None
+    try:
+        from micro_emotion_processor import MicroEmotionProcessor
+        import pandas as pd
+        
+        # Try to get DataFrame from results
+        df = None
+        csv_paths = []
+        
+        # Collect CSV paths from all batch results
+        for res in all_results:
+            if isinstance(res, dict):
+                if 'csv_path' in res and res['csv_path']:
+                    csv_paths.append(res['csv_path'])
+                elif 'dataframe' in res and res['dataframe'] is not None:
+                    if df is None:
+                        df = res['dataframe']
+                    else:
+                        df = pd.concat([df, res['dataframe']], ignore_index=True)
+        
+        # Try to load from CSV if DataFrame not available
+        if df is None and csv_paths:
+            # Use the last CSV (should contain all frames if OpenFace concatenates)
+            csv_path = csv_paths[-1]
+            if os.path.exists(csv_path):
+                df = pd.read_csv(csv_path)
+                logger.info(f"VisualProcessor | {name} | main | Loaded DataFrame from {csv_path}, shape: {df.shape}")
+        
+        # If we have DataFrame, use optimized processor
+        if df is not None and len(df) > 0:
+            logger.info(f"VisualProcessor | {name} | main | Using optimized MicroEmotionProcessor")
+            processor = MicroEmotionProcessor(fps=metadata.get('fps', 30))
+            processed = processor.process_openface_dataframe(df, fit_models=True)
+            
+            # Create result structure
+            frames_with_face = int(df['success'].sum()) if 'success' in df.columns else len(df)
+            result = {
+                'success': processed['success'] and frames_with_face > 0,
+                'face_count': frames_with_face,
+                'success_rate': float(df['success'].mean()) if 'success' in df.columns else 1.0,
+                'features': processed['features'],
+                'per_frame_vectors': processed['per_frame_vectors'].tolist(),
+                'reliability_flags': processed['reliability_flags'],
+                'microexpr_features': processed['microexpr_features'],
+                'summary': {
+                    'total_frames': len(frame_indices),
+                    'frames_processed': len(df),
+                    'frames_with_face': frames_with_face,
+                    'au_count': len([k for k in processed['features'].keys() if k.startswith('AU')]),
+                    'landmarks_2d_count': 68,
+                    'landmarks_3d_count': 68,
+                },
+                'metadata': {
+                    'features_extracted': args.features,
+                    'batch_size': args.batch_size,
+                    'docker_image': args.docker_image,
+                    'processing_mode': 'optimized',
+                }
+            }
+    except Exception as e:
+        logger.warning(f"VisualProcessor | {name} | main | Could not use optimized processor: {e}, falling back to original")
+        result = None
+    
+    # Fallback to original aggregation if optimized processor failed
+    if result is None:
+        # Aggregate results (original code)
+        if len(all_results) == 0:
+        logger.warning(f"VisualProcessor | {name} | main | No results extracted")
+        result = {
             'success': False,
             'face_count': 0,
             'action_units': {},
@@ -263,188 +212,107 @@ class OpenFaceAnalyzer:
             'gaze': {},
             'facial_landmarks_2d': [],
             'facial_landmarks_3d': [],
-            'emotions': {},
-            'summary': {}
+            'summary': {
+                'total_frames': len(frame_indices),
+                'frames_with_face': 0,
+                'au_count': 0,
+                'landmarks_2d_count': 0,
+                'landmarks_3d_count': 0
+            }
         }
-        
-        if df.empty:
-            return features
-        
-        # Проверяем наличие лиц
-        if 'success' in df.columns:
-            success_frames = df['success'].sum()
-            features['success'] = success_frames > 0
-            features['face_count'] = int(success_frames)
-            features['success_rate'] = float(success_frames / len(df))
-        
-        # Action Units (AU)
-        au_columns = [col for col in df.columns if col.startswith('AU') and col.endswith('_r')]
-        for au_col in au_columns:
-            au_name = au_col.replace('_r', '')
-            if au_name in df.columns:  # Есть ли интенсивность
-                features['action_units'][au_name] = {
-                    'intensity_mean': float(df[au_name].mean()),
-                    'intensity_std': float(df[au_name].std()),
-                    'presence_mean': float(df[au_col].mean()),
-                    'presence_std': float(df[au_col].std())
-                }
-        
-        # Pose (положение головы)
-        pose_columns = ['pose_Rx', 'pose_Ry', 'pose_Rz', 'pose_Tx', 'pose_Ty', 'pose_Tz']
-        for col in pose_columns:
-            if col in df.columns:
-                features['pose'][col] = {
-                    'mean': float(df[col].mean()),
-                    'std': float(df[col].std()),
-                    'min': float(df[col].min()),
-                    'max': float(df[col].max())
-                }
-        
-        # Gaze (направление взгляда)
-        gaze_columns = ['gaze_angle_x', 'gaze_angle_y']
-        for col in gaze_columns:
-            if col in df.columns:
-                features['gaze'][col] = {
-                    'mean': float(df[col].mean()),
-                    'std': float(df[col].std())
-                }
-        
-        # Facial Landmarks (2D и 3D)
-        # 2D landmarks (x_0, y_0, x_1, y_1, ...)
-        landmark_2d_cols = [col for col in df.columns if col.startswith('x_') or col.startswith('y_')]
-        if landmark_2d_cols:
-            # Группируем по точкам
-            points_2d = []
-            for i in range(68):  # OpenFace использует 68 точек
-                x_col = f'x_{i}'
-                y_col = f'y_{i}'
-                if x_col in df.columns and y_col in df.columns:
-                    point_data = {
-                        'x_mean': float(df[x_col].mean()),
-                        'x_std': float(df[x_col].std()),
-                        'y_mean': float(df[y_col].mean()),
-                        'y_std': float(df[y_col].std())
-                    }
-                    points_2d.append(point_data)
-            features['facial_landmarks_2d'] = points_2d
-        
-        # 3D landmarks (X_0, Y_0, Z_0, ...)
-        landmark_3d_cols = [col for col in df.columns if col.startswith('X_') or col.startswith('Y_') or col.startswith('Z_')]
-        if landmark_3d_cols:
-            points_3d = []
-            for i in range(68):
-                x_col = f'X_{i}'
-                y_col = f'Y_{i}'
-                z_col = f'Z_{i}'
-                if all(col in df.columns for col in [x_col, y_col, z_col]):
-                    point_data = {
-                        'X_mean': float(df[x_col].mean()),
-                        'Y_mean': float(df[y_col].mean()),
-                        'Z_mean': float(df[z_col].mean())
-                    }
-                    points_3d.append(point_data)
-            features['facial_landmarks_3d'] = points_3d
-        
-        # Сводная статистика
-        features['summary'] = {
-            'total_frames': len(df),
-            'frames_with_face': int(df['success'].sum()) if 'success' in df.columns else 0,
-            'au_count': len(features['action_units']),
-            'landmarks_2d_count': len(features['facial_landmarks_2d']),
-            'landmarks_3d_count': len(features['facial_landmarks_3d']),
-            'timestamp': datetime.now().isoformat()
-        }
-        
-        return features
-    
-    def save_results(self, results, output_path=None):
-        """Упрощенная версия сохранения результатов."""
-        import json
-        from datetime import datetime
-        
-        if output_path is None:
-            timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
-            output_path = "/home/ilya/Рабочий стол/DataProcessor/VisualProcessor2.0/other/micro_emotion/results/openface_results_{timestamp}.json"
-        
-        # Функция для конвертации всех типов в JSON-совместимые
-        def make_serializable(obj):
-            if isinstance(obj, dict):
-                return {k: make_serializable(v) for k, v in obj.items()}
-            elif isinstance(obj, list):
-                return [make_serializable(item) for item in obj]
-            elif isinstance(obj, (bool, np.bool_)):
-                return bool(obj)
-            elif isinstance(obj, (int, np.integer)):
-                return int(obj)
-            elif isinstance(obj, (float, np.floating)):
-                return float(obj)
-            elif isinstance(obj, np.ndarray):
-                return obj.tolist()
-            elif isinstance(obj, (str, Path)):
-                return str(obj)
-            elif hasattr(obj, '__str__'):
-                return str(obj)
-            else:
-                return obj
-        
-        # Удаляем dataframe если есть
-        results_copy = results.copy()
-        if 'dataframe' in results_copy:
-            del results_copy['dataframe']
-        
-        # Конвертируем
-        serializable_results = make_serializable(results_copy)
-        
-        # Сохраняем
-        with open(output_path, 'w', encoding='utf-8') as f:
-            json.dump(serializable_results, f, indent=2, ensure_ascii=False)
-        
-        print(f"[INFO] Результаты сохранены в: {output_path}")
-        return str(output_path)
-
-def main():
-    """Пример использования."""
-    import argparse
-    
-    parser = argparse.ArgumentParser(description='Анализ видео с OpenFace через Docker')
-    parser.add_argument('--video_path', help='Путь к видео файлу', default="-NSumhkOwSg.mp4")
-    parser.add_argument('--output', '-o', help='Имя выходного файла (без расширения)', default="test_analysis")
-    parser.add_argument('--features', '-f', default='all', 
-                       choices=['all', 'basic', 'au', 'pose', 'gaze'],
-                       help='Какие признаки извлекать')
-    
-    args = parser.parse_args()
-    
-    # Создаем анализатор
-    analyzer = OpenFaceAnalyzer()
-    
-    # Анализируем видео
-    print(f"[INFO] Начинаю анализ: {args.video_path}")
-    results = analyzer.analyze_video(
-        video_path=args.video_path,
-        output_name=args.output,
-        features=args.features
-    )
-    
-    if results:
-        # Сохраняем результаты
-        json_path = analyzer.save_results(results)
-        
-        # Выводим сводку
-        summary = results.get('summary', {})
-        print(f"\n=== СВОДКА АНАЛИЗА ===")
-        print(f"Всего кадров: {summary.get('total_frames', 0)}")
-        print(f"Кадров с лицами: {summary.get('frames_with_face', 0)}")
-        print(f"Обнаружено AU: {summary.get('au_count', 0)}")
-        print(f"Файл результатов: {json_path}")
-        
-        # Пример извлеченных AU
-        if results['action_units']:
-            print("\n=== ACTION UNITS (средняя интенсивность) ===")
-            for au, data in list(results['action_units'].items())[:10]:  # Показываем первые 10
-                print(f"{au}: {data['intensity_mean']:.3f}")
     else:
-        print("[ERROR] Анализ завершился неудачно")
-
-if __name__ == "__main__":
-    main()
+        # Aggregate action units
+        action_units = {}
+        pose_data = {}
+        gaze_data = {}
+        landmarks_2d_all = []
+        landmarks_3d_all = []
+        
+        frames_with_face = 0
+        
+        for res in all_results:
+            if res.get('success', False):
+                frames_with_face += 1
+                
+                # Aggregate AU
+                if 'action_units' in res:
+                    for au_name, au_data in res['action_units'].items():
+                        if au_name not in action_units:
+                            action_units[au_name] = {
+                                'intensity_mean': [],
+                                'intensity_std': [],
+                                'presence_mean': [],
+                                'presence_std': []
+                            }
+                        action_units[au_name]['intensity_mean'].append(au_data.get('intensity_mean', 0))
+                        action_units[au_name]['intensity_std'].append(au_data.get('intensity_std', 0))
+                        action_units[au_name]['presence_mean'].append(au_data.get('presence_mean', 0))
+                        action_units[au_name]['presence_std'].append(au_data.get('presence_std', 0))
+                
+                # Aggregate pose
+                if 'pose' in res:
+                    for pose_key, pose_val in res['pose'].items():
+                        if pose_key not in pose_data:
+                            pose_data[pose_key] = {'mean': [], 'std': [], 'min': [], 'max': []}
+                        pose_data[pose_key]['mean'].append(pose_val.get('mean', 0))
+                        pose_data[pose_key]['std'].append(pose_val.get('std', 0))
+                        pose_data[pose_key]['min'].append(pose_val.get('min', 0))
+                        pose_data[pose_key]['max'].append(pose_val.get('max', 0))
+                
+                # Aggregate gaze
+                if 'gaze' in res:
+                    for gaze_key, gaze_val in res['gaze'].items():
+                        if gaze_key not in gaze_data:
+                            gaze_data[gaze_key] = {'mean': [], 'std': []}
+                        gaze_data[gaze_key]['mean'].append(gaze_val.get('mean', 0))
+                        gaze_data[gaze_key]['std'].append(gaze_val.get('std', 0))
+        
+        # Compute final aggregated values
+        for au_name in action_units:
+            action_units[au_name] = {
+                'intensity_mean': float(np.mean(action_units[au_name]['intensity_mean'])) if action_units[au_name]['intensity_mean'] else 0.0,
+                'intensity_std': float(np.mean(action_units[au_name]['intensity_std'])) if action_units[au_name]['intensity_std'] else 0.0,
+                'presence_mean': float(np.mean(action_units[au_name]['presence_mean'])) if action_units[au_name]['presence_mean'] else 0.0,
+                'presence_std': float(np.mean(action_units[au_name]['presence_std'])) if action_units[au_name]['presence_std'] else 0.0
+            }
+        
+        for pose_key in pose_data:
+            pose_data[pose_key] = {
+                'mean': float(np.mean(pose_data[pose_key]['mean'])) if pose_data[pose_key]['mean'] else 0.0,
+                'std': float(np.mean(pose_data[pose_key]['std'])) if pose_data[pose_key]['std'] else 0.0,
+                'min': float(np.min(pose_data[pose_key]['min'])) if pose_data[pose_key]['min'] else 0.0,
+                'max': float(np.max(pose_data[pose_key]['max'])) if pose_data[pose_key]['max'] else 0.0
+            }
+        
+        for gaze_key in gaze_data:
+            gaze_data[gaze_key] = {
+                'mean': float(np.mean(gaze_data[gaze_key]['mean'])) if gaze_data[gaze_key]['mean'] else 0.0,
+                'std': float(np.mean(gaze_data[gaze_key]['std'])) if gaze_data[gaze_key]['std'] else 0.0
+            }
+        
+        result = {
+            'success': frames_with_face > 0,
+            'face_count': frames_with_face,
+            'success_rate': float(frames_with_face / len(all_results)) if len(all_results) > 0 else 0.0,
+            'action_units': action_units,
+            'pose': pose_data,
+            'gaze': gaze_data,
+            'facial_landmarks_2d': landmarks_2d_all[:68] if landmarks_2d_all else [],
+            'facial_landmarks_3d': landmarks_3d_all[:68] if landmarks_3d_all else [],
+            'summary': {
+                'total_frames': len(frame_indices),
+                'frames_processed': len(all_results),
+                'frames_with_face': frames_with_face,
+                'au_count': len(action_units),
+                'landmarks_2d_count': len(landmarks_2d_all),
+                'landmarks_3d_count': len(landmarks_3d_all)
+            },
+            'metadata': {
+                'features_extracted': args.features,
+                'batch_size': args.batch_size,
+                'docker_image': args.docker_image
+            }
+        }
+    
+    rs.store(result, name=name)
+    logger.info(f"VisualProcessor | {name} | main | Results stored successfully")

@@ -7,7 +7,7 @@ Features produced (examples):
 - fade_in_count, fade_out_count, dissolve_count, avg_fade_duration
 - whip_pan_transitions_count, zoom_transition_count, motion_cut_intensity_score
 - transition_wipe_count, transition_slide_count, transition_glitch_count...
-- cuts_per_second, cuts_per_minute, median_cut_interval, cut_interval_std, cut_interval_entropy
+- cuts_per_minute, median_cut_interval, cut_interval_std, cut_interval_cv, cut_interval_entropy
 - avg_shot_length, median_shot_length, short_shots_ratio, long_shots_ratio, very_long_shots_count
 - jump_cuts_count, jump_cut_ratio_per_minute, jump_cut_intensity
 - scene_count, avg_scene_length, scene_to_shot_ratio
@@ -178,6 +178,68 @@ def optical_flow_direction_consistency(flow_angles, window_size=5):
     consistency = np.sqrt(mean_cos**2 + mean_sin**2)
     return float(consistency)
 
+def estimate_global_motion_homography(prev_gray, gray):
+    """
+    Estimate global camera motion using RANSAC homography.
+    Returns homography matrix and inlier ratio.
+    """
+    try:
+        # Detect features using ORB (lightweight)
+        orb = cv2.ORB_create(nfeatures=500)
+        kp1, des1 = orb.detectAndCompute(prev_gray, None)
+        kp2, des2 = orb.detectAndCompute(gray, None)
+        
+        if des1 is None or des2 is None or len(des1) < 10 or len(des2) < 10:
+            return None, 0.0
+        
+        # Match features
+        bf = cv2.BFMatcher(cv2.NORM_HAMMING, crossCheck=False)
+        matches = bf.knnMatch(des1, des2, k=2)
+        
+        # Apply ratio test
+        good_matches = []
+        for match_pair in matches:
+            if len(match_pair) == 2:
+                m, n = match_pair
+                if m.distance < 0.75 * n.distance:
+                    good_matches.append(m)
+        
+        if len(good_matches) < 10:
+            return None, 0.0
+        
+        # Extract matched points
+        src_pts = np.float32([kp1[m.queryIdx].pt for m in good_matches]).reshape(-1, 1, 2)
+        dst_pts = np.float32([kp2[m.trainIdx].pt for m in good_matches]).reshape(-1, 1, 2)
+        
+        # Estimate homography with RANSAC
+        H, mask = cv2.findHomography(src_pts, dst_pts, cv2.RANSAC, 5.0)
+        inlier_ratio = float(np.sum(mask)) / len(good_matches) if mask is not None else 0.0
+        
+        return H, inlier_ratio
+    except Exception:
+        return None, 0.0
+
+def morphological_clean_cuts(cut_flags, min_neighbors=1):
+    """
+    Morphological cleaning: remove isolated cut detections.
+    cut_flags: binary array (1 = cut detected, 0 = no cut)
+    min_neighbors: minimum number of neighboring cuts within ±N frames
+    """
+    cleaned = cut_flags.copy()
+    n = len(cut_flags)
+    window = 3  # Check ±3 frames
+    
+    for i in range(n):
+        if cut_flags[i] == 1:
+            # Count neighbors
+            start = max(0, i - window)
+            end = min(n, i + window + 1)
+            neighbors = np.sum(cut_flags[start:end]) - 1  # Exclude self
+            if neighbors < min_neighbors:
+                cleaned[i] = 0
+    
+    return cleaned
+
 # -----------------------------
 # High-level cut detectors
 # -----------------------------
@@ -260,8 +322,10 @@ def detect_hard_cuts(
     
     # Temporal smoothing to reduce false positives
     if temporal_smoothing and len(scores) > 3:
+        # Apply median filter for robustness (removes spikes)
+        scores_median = medfilt(scores.astype(float), kernel_size=3)
         # Apply Gaussian smoothing
-        scores_smooth = gaussian_filter1d(scores, sigma=1.0)
+        scores_smooth = gaussian_filter1d(scores_median, sigma=1.0)
         # Require local maximum
         cut_candidates = []
         for i in range(1, len(scores_smooth)-1):
@@ -271,10 +335,20 @@ def detect_hard_cuts(
     else:
         cut_candidates = [(i+1, s) for i, s in enumerate(scores) if s >= 2.0]
     
+    # Morphological cleaning: remove isolated detections
+    cut_flag_array = np.zeros(len(frame_indices) - 1, dtype=int)
+    for idx, _ in cut_candidates:
+        if idx - 1 < len(cut_flag_array):
+            cut_flag_array[idx - 1] = 1
+    cut_flag_array = morphological_clean_cuts(cut_flag_array, min_neighbors=0)
+    
+    # Rebuild candidates from cleaned flags
+    cleaned_candidates = [(i+1, scores[i]) for i in range(len(cut_flag_array)) if cut_flag_array[i] == 1]
+    
     # Remove cuts that are too close (within 5 frames)
     cut_idxs = []
     strengths = []
-    for idx, strength in cut_candidates:
+    for idx, strength in cleaned_candidates:
         if not cut_idxs or idx - cut_idxs[-1] > 5:
             cut_idxs.append(idx)
             strengths.append(float(strength))
@@ -372,6 +446,7 @@ def detect_soft_cuts(frame_manager, frame_indices, fps, fade_threshold=0.02, min
             i += 1
     
     # Dissolve detection: moderate histogram drift with low flow consistency
+    # Improved: check for linear mixing correlation and exclude exposure changes
     if use_flow_consistency:
         window_size = min(10, n // 5)
         for i in range(window_size, n - window_size):
@@ -384,8 +459,28 @@ def detect_soft_cuts(frame_manager, frame_indices, fps, fade_threshold=0.02, min
             hist_mean = np.mean(hist_window)
             flow_mean = np.mean(flow_window)
             
-            # Dissolve: gradual histogram change + low motion
-            if hist_var < 0.001 and hist_mean > 0.01 and flow_mean < 2.0:
+            # Check for exposure changes (global brightness shift across entire frame)
+            # Exposure changes affect entire frame uniformly, dissolves affect content distribution
+            hsv_window = hsv_values[i-window_size//2:i+window_size//2]
+            lab_window = lab_values[i-window_size//2:i+window_size//2]
+            hsv_gradient = np.abs(np.diff(hsv_window))
+            lab_gradient = np.abs(np.diff(lab_window))
+            # Low gradient variance = uniform exposure change (not dissolve)
+            is_exposure_change = (np.var(hsv_gradient) < 0.0001 and np.var(lab_gradient) < 0.0001 and 
+                                 np.mean(np.abs(hsv_gradient)) > 0.01)  # Uniform but significant change
+            
+            # Dissolve: gradual histogram change + low motion + not exposure change
+            # Also check for linear correlation in histogram changes (dissolve = linear mixing)
+            hist_window_full = hist_diffs[max(0, i-window_size):min(n, i+window_size)]
+            if len(hist_window_full) > 3:
+                # Compute correlation of histogram changes (should be smooth/linear for dissolve)
+                hist_correlation = np.corrcoef(hist_window_full[:-1], hist_window_full[1:])[0, 1] if len(hist_window_full) > 1 else 0
+                is_smooth_mixing = hist_correlation > 0.5  # Positive correlation = smooth transition
+            else:
+                is_smooth_mixing = True
+            
+            if (hist_var < 0.001 and hist_mean > 0.01 and flow_mean < 2.0 and 
+                not is_exposure_change and is_smooth_mixing):
                 # Check if not already detected as fade
                 is_fade = any(e['start'] <= i <= e['end'] for e in events)
                 if not is_fade:
@@ -401,7 +496,8 @@ def detect_motion_based_cuts(
     flow_spike_factor=None, 
     use_direction_analysis=True, 
     adaptive_threshold=True, 
-    detect_speed_ramps=True
+    detect_speed_ramps=True,
+    use_camera_motion_compensation=True
 ):
     """
     Improved motion-based cut detection with direction analysis and adaptive thresholds.
@@ -420,10 +516,35 @@ def detect_motion_based_cuts(
     prev_gray = cv2.cvtColor(frame_manager.get(frame_indices[0]), cv2.COLOR_BGR2GRAY)
     prev_mag_map = None
     
+    # Resize frames for faster flow computation if large
+    sample_frame = frame_manager.get(frame_indices[0])
+    h, w = sample_frame.shape[:2]
+    use_low_res = (h * w > 640 * 480)  # Use low-res for large frames
+    target_size = (256, 256) if use_low_res else None
+    
     for i in range(1, n):
         gray = cv2.cvtColor(frame_manager.get(frame_indices[i]), cv2.COLOR_BGR2GRAY)
-        mag, mag_map, angles = optical_flow_magnitude(prev_gray, gray)
-        mags.append(mag)
+        
+        # Camera motion compensation: estimate global motion
+        is_camera_motion = False
+        if use_camera_motion_compensation:
+            H, inlier_ratio = estimate_global_motion_homography(prev_gray, gray)
+            # If high inlier ratio, motion is mostly global (camera motion)
+            # Subtract global motion contribution for object motion detection
+            is_camera_motion = inlier_ratio > 0.7 if H is not None else False
+        
+        # Compute flow (on low-res if needed)
+        if use_low_res:
+            prev_gray_small = cv2.resize(prev_gray, target_size)
+            gray_small = cv2.resize(gray, target_size)
+            mag, mag_map, angles = optical_flow_magnitude(prev_gray_small, gray_small)
+            # Scale magnitude back to original frame size
+            mag = mag * (h * w) / (target_size[0] * target_size[1])
+        else:
+            mag, mag_map, angles = optical_flow_magnitude(prev_gray, gray)
+        
+        # Store camera motion flag (will use later for classification)
+        mags.append((mag, is_camera_motion))
         angles_list.append(angles)
         
         # Direction consistency
@@ -444,7 +565,9 @@ def detect_motion_based_cuts(
         prev_gray = gray
         prev_mag_map = mag_map
     
-    mags = np.array(mags)
+    # Extract magnitudes and camera motion flags
+    mags_array = np.array([m[0] for m in mags])
+    camera_motion_flags = [m[1] for m in mags]
     direction_consistencies = np.array(direction_consistencies)
     mag_variances = np.array(mag_variances)
     
@@ -452,23 +575,27 @@ def detect_motion_based_cuts(
     if adaptive_threshold:
         if flow_spike_factor is None:
             # Use 95th percentile as threshold
-            threshold = np.percentile(mags, 95)
+            threshold = np.percentile(mags_array, 95)
         else:
-            median = np.median(mags)
-            std = np.std(mags) + 1e-9
+            median = np.median(mags_array)
+            std = np.std(mags_array) + 1e-9
             threshold = median + flow_spike_factor * std
     else:
-        median = np.median(mags)
-        std = np.std(mags) + 1e-9
+        median = np.median(mags_array)
+        std = np.std(mags_array) + 1e-9
         threshold = median + (flow_spike_factor or 3.0) * std
     
     # Speed ramp threshold: high magnitude + high variance
     speed_ramp_threshold = np.percentile(mag_variances, 90) if len(mag_variances) > 0 else 0.0
     
-    # Find spikes
-    spike_mask = mags > threshold
+    # Find spikes (exclude pure camera motion if compensation enabled)
+    spike_mask = mags_array > threshold
+    if use_camera_motion_compensation:
+        # Filter out spikes that are pure camera motion (already handled by hard cuts)
+        spike_mask = spike_mask & ~np.array(camera_motion_flags)
+    
     spike_idxs = np.where(spike_mask)[0] + 1  # +1 because indices start from frame 1
-    intensities = mags[spike_idxs-1].tolist()
+    intensities = mags_array[spike_idxs-1].tolist()
     
     # Classify as whip pan vs zoom vs speed ramp using direction consistency and variance
     types = []
@@ -477,14 +604,15 @@ def detect_motion_based_cuts(
             if idx-1 < len(direction_consistencies):
                 consistency = direction_consistencies[idx-1]
                 mag_var = mag_variances[idx-1] if idx-1 < len(mag_variances) else 0.0
+                is_cam_motion = camera_motion_flags[idx-1] if idx-1 < len(camera_motion_flags) else False
                 
                 # Speed ramp: high magnitude + high variance (fast motion gradient)
                 if detect_speed_ramps and mag_var > speed_ramp_threshold:
                     types.append('speed_ramp')
-                # High consistency + high magnitude = whip pan
-                elif consistency > 0.6:
+                # High consistency + high magnitude + camera motion = whip pan
+                elif consistency > 0.6 or is_cam_motion:
                     types.append('whip_pan')
-                # Low consistency + high magnitude = zoom
+                # Low consistency + high magnitude = zoom (object motion)
                 else:
                     types.append('zoom')
             else:
@@ -668,6 +796,7 @@ def detect_jump_cuts(
     prev_pose_landmarks = None
     prev_frame = None
     prev_background_embedding = None
+    prev_face_embedding = None  # For face ID similarity
     jump_idxs = []
     jump_scores = []
     
@@ -680,9 +809,14 @@ def detect_jump_cuts(
         # Face detection
         face_res = face_detector.process(img_rgb)
         face_landmarks = None
+        face_bbox = None
         if face_res.multi_face_landmarks:
             lm = face_res.multi_face_landmarks[0]
             face_landmarks = np.array([[p.x, p.y] for p in lm.landmark]).flatten()
+            # Get face bounding box for masking
+            xs = [p.x for p in lm.landmark]
+            ys = [p.y for p in lm.landmark]
+            face_bbox = (min(xs), min(ys), max(xs), max(ys))
         
         # Pose detection
         pose_landmarks = None
@@ -691,31 +825,78 @@ def detect_jump_cuts(
             if pose_res.pose_landmarks:
                 pose_landmarks = np.array([[p.x, p.y] for p in pose_res.pose_landmarks.landmark]).flatten()
         
-        # Background embedding (using deep features)
+        # Face ID embedding (for better face similarity check)
+        face_embedding = None
+        if embed_model is not None and transform is not None and face_bbox is not None:
+            try:
+                # Extract face region (expand bbox slightly)
+                h, w = f.shape[:2]
+                x1, y1, x2, y2 = face_bbox
+                x1, y1 = max(0, int((x1 - 0.1) * w)), max(0, int((y1 - 0.1) * h))
+                x2, y2 = min(w, int((x2 + 0.1) * w)), min(h, int((y2 + 0.1) * h))
+                face_roi = f[y1:y2, x1:x2]
+                if face_roi.size > 0:
+                    img_tensor = transform(ImageFromCV(face_roi)).unsqueeze(0).to(device)
+                    with torch.no_grad():
+                        face_emb = embed_model(img_tensor)
+                        face_emb = face_emb.view(face_emb.size(0), -1)
+                        face_emb = face_emb / (face_emb.norm(dim=1, keepdim=True)+1e-9)
+                        face_embedding = face_emb.cpu().numpy()[0]
+            except Exception:
+                pass
+        
+        # Background embedding (using deep features, excluding foreground if face detected)
         background_embedding = None
         if use_background_embedding and embed_model is not None and transform is not None:
-            # Compute embedding for background comparison
-            img_tensor = transform(ImageFromCV(f)).unsqueeze(0).to(device)
-            with torch.no_grad():
-                bg_emb = embed_model(img_tensor)
-                bg_emb = bg_emb.view(bg_emb.size(0), -1)
-                bg_emb = bg_emb / (bg_emb.norm(dim=1, keepdim=True)+1e-9)
-                background_embedding = bg_emb.cpu().numpy()[0]
+            try:
+                # If face detected, mask it out for background comparison
+                bg_frame = f.copy()
+                if face_bbox is not None:
+                    h, w = bg_frame.shape[:2]
+                    x1, y1, x2, y2 = face_bbox
+                    # Expand mask to exclude face region more completely
+                    mask_expand = 0.15
+                    x1_mask = max(0, int((x1 - mask_expand) * w))
+                    y1_mask = max(0, int((y1 - mask_expand) * h))
+                    x2_mask = min(w, int((x2 + mask_expand) * w))
+                    y2_mask = min(h, int((y2 + mask_expand) * h))
+                    # Blur face region to reduce its contribution
+                    bg_frame[y1_mask:y2_mask, x1_mask:x2_mask] = cv2.GaussianBlur(
+                        bg_frame[y1_mask:y2_mask, x1_mask:x2_mask], (15, 15), 5)
+                
+                img_tensor = transform(ImageFromCV(bg_frame)).unsqueeze(0).to(device)
+                with torch.no_grad():
+                    bg_emb = embed_model(img_tensor)
+                    bg_emb = bg_emb.view(bg_emb.size(0), -1)
+                    bg_emb = bg_emb / (bg_emb.norm(dim=1, keepdim=True)+1e-9)
+                    background_embedding = bg_emb.cpu().numpy()[0]
+            except Exception:
+                pass
         
         # Check for jump cut
         if prev_landmarks is not None or prev_pose_landmarks is not None:
             score = 0.0
             max_score = 0.0
+            confidence = 1.0
             
-            # Face similarity check
+            # Face similarity check (improved with face ID embedding)
             if face_landmarks is not None and prev_landmarks is not None:
-                a = face_landmarks - face_landmarks.mean()
-                b = prev_landmarks - prev_landmarks.mean()
-                denom = (np.linalg.norm(a)+1e-9)*(np.linalg.norm(b)+1e-9)
-                cos_face = np.dot(a, b) / denom
-                face_change = 1.0 - cos_face
+                # Use face embedding if available (better ID matching)
+                if face_embedding is not None and prev_face_embedding is not None:
+                    face_sim = np.dot(face_embedding, prev_face_embedding)
+                    face_change = 1.0 - face_sim
+                else:
+                    # Fallback to landmark-based similarity
+                    a = face_landmarks - face_landmarks.mean()
+                    b = prev_landmarks - prev_landmarks.mean()
+                    denom = (np.linalg.norm(a)+1e-9)*(np.linalg.norm(b)+1e-9)
+                    cos_face = np.dot(a, b) / denom
+                    face_change = 1.0 - cos_face
                 score += face_change
                 max_score += 1.0
+                # Lower confidence if face similarity is very high (likely same person)
+                if face_change < 0.2:
+                    confidence *= 0.7
             
             # Pose similarity check
             if pose_landmarks is not None and prev_pose_landmarks is not None:
@@ -727,24 +908,28 @@ def detect_jump_cuts(
                 score += pose_change
                 max_score += 1.0
             
-            # Background similarity check
+            # Background similarity check (improved with foreground masking)
             background_similar = True
+            bg_sim_value = 0.0
             if use_background_embedding and background_embedding is not None and prev_background_embedding is not None:
-                # Cosine similarity between background embeddings
-                bg_sim = np.dot(background_embedding, prev_background_embedding) / (
-                    (np.linalg.norm(background_embedding)+1e-9) * (np.linalg.norm(prev_background_embedding)+1e-9))
+                # Cosine similarity between background embeddings (with masked foreground)
+                bg_sim = np.dot(background_embedding, prev_background_embedding)
+                bg_sim_value = bg_sim
                 background_similar = bg_sim > 0.85  # High similarity = same background
             else:
                 # Fallback to SSIM
                 s = frame_ssim(prev_frame, f)
                 background_similar = s < 0.2  # Low SSIM drop = similar background
+                bg_sim_value = 1.0 - s
             
             # Jump cut: large pose/face change + similar background
+            # Use confidence-weighted threshold
+            threshold = 0.3 / confidence  # Lower threshold if confidence is higher
             if max_score > 0:
                 normalized_score = score / max_score
-                if normalized_score > 0.3 and background_similar:  # Significant pose change + similar background
+                if normalized_score > threshold and background_similar:  # Significant pose change + similar background
                     jump_idxs.append(i)
-                    jump_scores.append(float(normalized_score))
+                    jump_scores.append(float(normalized_score * bg_sim_value))  # Weight by background similarity
         
         # Update previous state
         prev_landmarks = face_landmarks
@@ -752,6 +937,8 @@ def detect_jump_cuts(
         prev_frame = f
         if background_embedding is not None:
             prev_background_embedding = background_embedding
+        if face_embedding is not None:
+            prev_face_embedding = face_embedding
     
     return jump_idxs, jump_scores
 
@@ -1187,15 +1374,16 @@ def analyze_scene_transition_types(scene_boundaries_shot_idx, shot_boundaries_fr
 def cut_timing_statistics(cut_frame_indices, fps, video_length_s):
     """
     From cut indices (frame numbers), compute statistics.
+    Improved formulas: normalized entropy, CV-based uniformity.
     """
     if not cut_frame_indices:
         return {
-            'cuts_per_second': 0.0,
             'cuts_per_minute': 0.0,
             'median_cut_interval': None,
             'min_cut_interval': None,
             'max_cut_interval': None,
             'cut_interval_std': None,
+            'cut_interval_cv': None,  # coefficient of variation
             'cut_interval_entropy': None,
             'cut_rhythm_uniformity_score': None
         }
@@ -1203,30 +1391,42 @@ def cut_timing_statistics(cut_frame_indices, fps, video_length_s):
     intervals = np.diff(times)
     if intervals.size == 0:
         intervals = np.array([video_length_s])
-    cps = len(cut_frame_indices) / video_length_s
-    cpm = cps * 60.0
+    cpm = len(cut_frame_indices) / video_length_s * 60.0  # Only per_minute
     median = float(np.median(intervals))
     mn = float(np.min(intervals))
     mx = float(np.max(intervals))
     std = float(np.std(intervals))
-    # entropy over quantized intervals
-    hist, _ = np.histogram(intervals, bins=min(20, len(intervals)))
+    mean_int = float(np.mean(intervals))
+    # Coefficient of variation
+    cv = std / (mean_int + 1e-9)
+    # entropy over quantized intervals - normalized by log(#bins)
+    n_bins = min(20, len(intervals))
+    hist, _ = np.histogram(intervals, bins=n_bins)
     hist = hist + 1e-9
+    hist = hist / hist.sum()  # Normalize to probabilities
     ent = float(scipy.stats.entropy(hist))
-    # uniformity: 1 - normalized std (higher -> more uniform)
-    uniformity = float(1.0 - (std / (mx + 1e-9)))
+    # Normalize entropy by log(n_bins) to get [0, 1] range
+    max_entropy = np.log(n_bins) if n_bins > 1 else 1.0
+    ent_normalized = ent / (max_entropy + 1e-9)
+    # uniformity: 1 - normalized CV (higher -> more uniform)
+    # Clip CV to reasonable range [0, 1] for uniformity computation
+    cv_clipped = np.clip(cv, 0.0, 1.0)
+    uniformity = float(1.0 - cv_clipped)
     return {
-        'cuts_per_second': float(cps),
         'cuts_per_minute': float(cpm),
         'median_cut_interval': median,
         'min_cut_interval': mn,
         'max_cut_interval': mx,
         'cut_interval_std': std,
-        'cut_interval_entropy': ent,
+        'cut_interval_cv': float(cv),
+        'cut_interval_entropy': float(ent_normalized),
         'cut_rhythm_uniformity_score': uniformity
     }
 
 def shot_length_stats(shot_frame_lengths, fps):
+    """
+    Compute shot length statistics including percentiles and histogram.
+    """
     durations_s = np.array([seconds_from_fps(l, fps) for l in shot_frame_lengths])
     if durations_s.size == 0:
         return {}
@@ -1236,13 +1436,26 @@ def shot_length_stats(shot_frame_lengths, fps):
     long_ratio = float((durations_s > 4.0).sum() / durations_s.size)
     very_long = int((durations_s > 10.0).sum())
     extremely_short = int((durations_s < 0.25).sum())
+    
+    # Percentiles for distribution analysis
+    percentiles = np.percentile(durations_s, [10, 25, 75, 90])
+    
+    # Histogram (8 bins) for compact distribution representation
+    hist, bin_edges = np.histogram(durations_s, bins=8)
+    hist_normalized = hist / (hist.sum() + 1e-9)  # Normalize to probabilities
+    
     return {
         'avg_shot_length': avg,
         'median_shot_length': med,
+        'shot_length_p10': float(percentiles[0]),
+        'shot_length_p25': float(percentiles[1]),
+        'shot_length_p75': float(percentiles[2]),
+        'shot_length_p90': float(percentiles[3]),
         'short_shots_ratio': short_ratio,
         'long_shots_ratio': long_ratio,
         'very_long_shots_count': very_long,
-        'extremely_short_shots_count': extremely_short
+        'extremely_short_shots_count': extremely_short,
+        'shot_length_histogram': hist_normalized.tolist()  # 8-bin normalized histogram
     }
 
 def classify_edit_style(cut_timing_stats, shot_stats, motion_cuts_count, jump_cuts_count,
@@ -1421,31 +1634,82 @@ class CutDetectionPipeline:
             frame_indices=frame_indices,
             use_direction_analysis=True,
             adaptive_threshold=True,
-            detect_speed_ramps=True
+            detect_speed_ramps=True,
+            use_camera_motion_compensation=True
         )
 
         tok = round(time.time() - tik, 2)
         logger.info(f"Motion-based cuts success | Time: {tok}")
         tik = time.time()
 
-        # 4. Stylized transitions via CLIP zero-shot with temporal aggregation
+        # 4. Stylized transitions via CLIP zero-shot with candidate-first optimization
         stylized_counts = {}
         stylized_probs_per_cut = []
         if self.clip_detector is not None:
+            # Candidate-first approach: pre-compute lightweight signals to filter candidates
+            candidate_windows = []
+            candidate_scores = []
+            
+            # Pre-compute lightweight transition signals for all frames
+            prev_gray = cv2.cvtColor(frame_manager.get(frame_indices[0]), cv2.COLOR_BGR2GRAY)
+            for idx in range(1, min(n-1, len(frame_indices)-1)):
+                fA = frame_manager.get(frame_indices[idx-1])
+                fB = frame_manager.get(frame_indices[idx])
+                
+                # Lightweight signals: hist diff, SSIM drop, flow spike
+                hdiff = frame_histogram_diff(fA, fB)
+                ssim_drop = frame_ssim(fA, fB)
+                gray = cv2.cvtColor(fB, cv2.COLOR_BGR2GRAY)
+                flow_mag, _, _ = optical_flow_magnitude(prev_gray, gray)
+                prev_gray = gray
+                
+                # Combined candidate score (threshold for CLIP evaluation)
+                candidate_score = hdiff + ssim_drop * 2.0 + min(flow_mag / 10.0, 1.0)
+                
+                # Only add as candidate if score exceeds threshold (top 30% or absolute threshold)
+                if candidate_score > 0.3:  # Adaptive threshold could be percentile-based
+                    candidate_windows.append(idx)
+                    candidate_scores.append(candidate_score)
+            
+            # Run CLIP only on candidate windows (significant reduction in compute)
+            logger.info(f"CLIP candidate-first: {len(candidate_windows)}/{n-1} windows selected")
+            
             window = 5
-            for idx in range(1, n-1):
-                start = max(0, idx - window//2)
-                end = min(n, idx + window//2 + 1)
-                window_frames = [frame_manager.get(idx) for idx in frame_indices[start:end]]
+            for candidate_idx in candidate_windows:
+                # candidate_idx is an index into frame_indices array (0-based relative to start)
+                # Convert to actual position in frame_indices list
+                if candidate_idx >= len(frame_indices):
+                    continue
+                
+                actual_frame_idx = frame_indices[candidate_idx] if candidate_idx < len(frame_indices) else None
+                if actual_frame_idx is None:
+                    continue
+                
+                # Get window around candidate
+                start_idx = max(0, candidate_idx - window//2)
+                end_idx = min(len(frame_indices), candidate_idx + window//2 + 1)
+                
+                window_frames = [frame_manager.get(frame_indices[i]) for i in range(start_idx, end_idx)]
+                
+                if not window_frames:
+                    continue
+                
                 # Use temporal aggregation
                 if self.clip_detector.use_temporal_aggregation:
                     probs = self.clip_detector.predict_transition_temporal(window_frames, window_size=5)
                 else:
                     probs = self.clip_detector.predict_transition(window_frames)
+                
                 # pick top label and increment
                 label = max(probs.keys(), key=lambda k: probs[k])
                 stylized_counts[label] = stylized_counts.get(label, 0) + 1
                 stylized_probs_per_cut.append(probs)
+            
+            # Initialize missing labels to 0
+            labels = self.clip_detector.labels if self.clip_detector else []
+            for lbl in labels:
+                if lbl not in stylized_counts:
+                    stylized_counts[lbl] = 0
         else:
             labels = self.clip_detector.labels if self.clip_detector else []
             stylized_counts = {lbl: 0 for lbl in labels}
@@ -1534,7 +1798,19 @@ class CutDetectionPipeline:
         features = {}
         # hard cuts
         features['hard_cuts_count'] = len(hard_idxs)
-        features['hard_cut_strength_mean'] = float(np.mean(hard_strengths)) if hard_strengths else 0.0
+        if hard_strengths:
+            features['hard_cut_strength_mean'] = float(np.mean(hard_strengths))
+            # Percentiles for strength distribution
+            strengths_array = np.array(hard_strengths)
+            percentiles = np.percentile(strengths_array, [25, 50, 75])
+            features['hard_cut_strength_p25'] = float(percentiles[0])
+            features['hard_cut_strength_p50'] = float(percentiles[1])
+            features['hard_cut_strength_p75'] = float(percentiles[2])
+        else:
+            features['hard_cut_strength_mean'] = 0.0
+            features['hard_cut_strength_p25'] = 0.0
+            features['hard_cut_strength_p50'] = 0.0
+            features['hard_cut_strength_p75'] = 0.0
         features['hard_cuts_per_minute'] = float(cut_timing_stats_dict['cuts_per_minute'])
 
         # soft cuts
