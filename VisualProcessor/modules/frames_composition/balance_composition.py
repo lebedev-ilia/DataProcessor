@@ -1,16 +1,7 @@
 import enum
 import cv2
 import numpy as np
-import torch
 import json
-from PIL import Image
-from torchvision import models, transforms
-from ultralytics import YOLO
-import mediapipe as mp
-from skimage.segmentation import slic
-from skimage.measure import shannon_entropy
-from sklearn.cluster import KMeans
-import torch.nn.functional as F
 from typing import Dict, List, Tuple, Optional, Any
 from dataclasses import dataclass
 from enum import Enum
@@ -29,6 +20,105 @@ name = "VideoCompositionAnalyzer"
 from utils.logger import get_logger
 logger = get_logger(name)
 
+
+# =========================
+# HELPERS ДЛЯ ЧТЕНИЯ CORE ПРОВАЙДЕРОВ
+# =========================
+
+def _load_core_object_detections(rs_path: Optional[str], frame_index: int) -> Optional[List[Dict]]:
+    """
+    Загружает детекции объектов из core_object_detections для конкретного кадра.
+    Возвращает None, если core данные недоступны.
+    """
+    if not rs_path:
+        return None
+    
+    detections_path = os.path.join(rs_path, "core_object_detections", "detections.json")
+    if not os.path.isfile(detections_path):
+        return None
+    
+    try:
+        with open(detections_path, "r", encoding="utf-8") as f:
+            data = json.load(f)
+        
+        frames_data = data.get("data", {}).get("frames", {})
+        frame_key = str(frame_index)
+        
+        if frame_key in frames_data:
+            # Преобразуем формат core в формат, ожидаемый extract_objects
+            detections = []
+            for det in frames_data[frame_key]:
+                detections.append({
+                    "bbox": det.get("bbox", []),
+                    "class": det.get("class", "unknown"),
+                    "confidence": det.get("confidence", 0.0),
+                    "class_id": det.get("class_id", -1),
+                })
+            return detections
+    except Exception as e:
+        logger.warning(f"{name} | _load_core_object_detections | Error loading core data: {e}")
+    
+    return None
+
+
+def _load_core_face_landmarks(rs_path: Optional[str], frame_index: int) -> Optional[Dict]:
+    """
+    Загружает landmarks лиц из core_face_landmarks для конкретного кадра.
+    Возвращает None, если core данные недоступны.
+    """
+    if not rs_path:
+        return None
+    
+    landmarks_path = os.path.join(rs_path, "core_face_landmarks", "landmarks.json")
+    if not os.path.isfile(landmarks_path):
+        return None
+    
+    try:
+        with open(landmarks_path, "r", encoding="utf-8") as f:
+            data = json.load(f)
+        
+        frames = data.get("frames", [])
+        for frame_data in frames:
+            if frame_data.get("frame_index") == frame_index:
+                return frame_data
+    except Exception as e:
+        logger.warning(f"{name} | _load_core_face_landmarks | Error loading core data: {e}")
+    
+    return None
+
+
+def _load_core_depth_midas(rs_path: Optional[str], frame_index: int) -> Optional[Dict[str, float]]:
+    """
+    Загружает статистику глубины из core_depth_midas для конкретного кадра.
+    Возвращает None, если core данные недоступны.
+    """
+    if not rs_path:
+        return None
+    
+    depth_path = os.path.join(rs_path, "core_depth_midas", "depth.json")
+    if not os.path.isfile(depth_path):
+        return None
+    
+    try:
+        with open(depth_path, "r", encoding="utf-8") as f:
+            data = json.load(f)
+        
+        per_frame = data.get("per_frame", [])
+        for pf in per_frame:
+            if pf.get("frame_index") == frame_index:
+                # Преобразуем в формат, ожидаемый analyze_depth
+                return {
+                    "depth_mean": pf.get("depth_mean", 0.5),
+                    "depth_std": pf.get("depth_std", 0.0),
+                    "depth_reliable": pf.get("depth_reliable", True),
+                    "foreground_ratio": pf.get("foreground_ratio", 0.0),
+                    "bokeh_potential": pf.get("bokeh_potential", 0.0),
+                }
+    except Exception as e:
+        logger.warning(f"{name} | _load_core_depth_midas | Error loading core data: {e}")
+    
+    return None
+
 # =========================
 # КОНФИГУРАЦИЯ
 # =========================
@@ -36,7 +126,8 @@ logger = get_logger(name)
 class Config:
     """Конфигурация системы анализа композиции"""
     # Общие настройки
-    device: str = 'cuda' if torch.cuda.is_available() else 'cpu'
+    device: str = 'cpu'  # torch удалён, device больше не используется для моделей
+    rs_path: Optional[str] = None  # Путь к result_store для чтения core провайдеров
     
     # Настройки YOLO
     yolo_model_path: str = 'yolo11n.pt'
@@ -103,81 +194,6 @@ class ModelManager:
             self._style_model = None
             self._style_transform = None
             self._initialized = True
-    
-    @property
-    def yolo_model(self):
-        if self._yolo_model is None:
-            logger.info("Загрузка YOLOv8...")
-
-            if "/" not in self.config.yolo_model_path:
-                self.config.yolo_model_path = f"{os.path.dirname(__file__)}/{self.config.yolo_model_path}"
-
-            self._yolo_model = YOLO(self.config.yolo_model_path)
-            self._yolo_model.to(self.config.device)
-        return self._yolo_model
-    
-    @property
-    def face_mesh(self):
-        if self._face_mesh is None:
-            logger.info("Загрузка MediaPipe Face Mesh...")
-            mp_face = mp.solutions.face_mesh
-            self._face_mesh = mp_face.FaceMesh(
-                static_image_mode=True,
-                max_num_faces=self.config.max_num_faces,
-                min_detection_confidence=self.config.min_detection_confidence
-            )
-        return self._face_mesh
-    
-    @property
-    def midas(self):
-        """
-        Lazy-loading MiDaS model + transform
-        """
-        if getattr(self, "_midas", None) is None:
-            if not self.config.use_midas:
-                raise RuntimeError("MiDaS disabled in config")
-
-            import torch
-
-            torch.hub.set_dir("./models")
-
-            model = torch.hub.load(
-                "intel-isl/MiDaS",
-                "MiDaS_small",
-                pretrained=True,
-                trust_repo=True,
-                verbose=False
-            ).to(self.config.device).eval()
-
-            transforms = torch.hub.load(
-                "intel-isl/MiDaS",
-                "transforms",
-                trust_repo=True,
-                verbose=False
-            )
-
-            self._midas = {
-                "model": model,
-                "transform": transforms.small_transform
-            }
-
-        return self._midas["model"], self._midas["transform"]
-    
-    @property
-    def style_model(self):
-        if self._style_model is None:
-            logger.info("Загрузка ResNet50 для классификации стилей...")
-            self._style_model = models.resnet50(pretrained=True).to(self.config.device)
-            self._style_model.eval()
-            self._style_transform = transforms.Compose([
-                transforms.Resize((224, 224)),
-                transforms.ToTensor(),
-                transforms.Normalize(
-                    mean=[0.485, 0.456, 0.406],
-                    std=[0.229, 0.224, 0.225]
-                )
-            ])
-        return self._style_model, self._style_transform
 
 # =========================
 # ОСНОВНЫЕ КОМПОНЕНТЫ АНАЛИЗА
@@ -189,16 +205,36 @@ class FrameAnalyzer:
         self.config = config or Config()
         self.models = ModelManager()
     
-    def extract_objects(self, frame: np.ndarray) -> Dict:
-        """Детекция объектов с YOLOv8 (улучшенная версия с масками и дополнительными фичами)"""
+    def extract_objects(self, frame: np.ndarray, frame_index: Optional[int] = None) -> Dict:
+        """
+        Детекция объектов с YOLOv8 (улучшенная версия с масками и дополнительными фичами).
+        Приоритет: core_object_detections > локальный YOLO.
+        """
         H, W = frame.shape[:2]
         frame_area = H * W
         
-        results = self.models.yolo_model(
-            frame, 
-            conf=self.config.yolo_conf_threshold,
-            verbose=False
-        )[0]
+        # Используем только core_object_detections - обязательное требование
+        if frame_index is None or not self.config.rs_path:
+            raise RuntimeError(
+                f"{name} | extract_objects | frame_index и rs_path обязательны для чтения core_object_detections"
+            )
+        
+        core_detections = _load_core_object_detections(self.config.rs_path, frame_index)
+        if core_detections is None:
+            raise RuntimeError(
+                f"{name} | extract_objects | core_object_detections не найдены для frame {frame_index}. "
+                f"Убедитесь, что core провайдер object_detections запущен перед этим модулем. "
+                f"rs_path: {self.config.rs_path}"
+            )
+        
+        # Используем core данные
+        class MockResults:
+            def __init__(self, detections):
+                self.boxes = None
+                self.masks = None
+                self.detections = detections
+        
+        results = MockResults(core_detections)
         
         objects = []
         object_mask = np.zeros((H, W), dtype=np.float32)
@@ -206,7 +242,56 @@ class FrameAnalyzer:
         main_subject = None
         main_subject_confidence = 0.0
         
-        if results.boxes is not None:
+        # Обрабатываем результаты из core_object_detections
+        if hasattr(results, 'detections') and results.detections:
+            # Обработка core детекций
+            boxes_sorted = sorted(
+                results.detections,
+                key=lambda x: x.get("confidence", 0.0),
+                reverse=True
+            )[:self.config.max_detections]
+            
+            for det in boxes_sorted:
+                bbox = det.get("bbox", [])
+                if len(bbox) != 4:
+                    continue
+                x1, y1, x2, y2 = map(int, bbox)
+                conf = float(det.get("confidence", 0.0))
+                label = det.get("class", "unknown")
+                
+                # Вычисляем площадь bbox
+                bbox_area = (x2 - x1) * (y2 - y1)
+                bbox_area_ratio = bbox_area / frame_area
+                
+                cx, cy = (x1 + x2) / 2, (y1 + y2) / 2
+                center_x_norm = cx / W
+                center_y_norm = cy / H
+                
+                # Добавляем объект (без масок для core данных)
+                objects.append({
+                    "label": label,
+                    "confidence": conf,
+                    "bbox": [x1, y1, x2, y2],
+                    "bbox_area": bbox_area,
+                    "bbox_area_ratio": bbox_area_ratio,
+                    "center": (cx, cy),
+                    "center_norm": (center_x_norm, center_y_norm),
+                })
+                
+                # Обновляем маску объектов (простой прямоугольник)
+                object_mask[y1:y2, x1:x2] = 1.0
+                object_centers.append((cx, cy))
+                
+                # Определяем главный объект
+                if conf > main_subject_confidence:
+                    main_subject_confidence = conf
+                    main_subject = {
+                        "label": label,
+                        "confidence": conf,
+                        "bbox": [x1, y1, x2, y2],
+                        "center": (cx, cy),
+                    }
+        elif results.boxes is not None:
             # Сортируем по confidence и ограничиваем количество
             boxes_sorted = sorted(
                 zip(results.boxes.xyxy, results.boxes.conf, results.boxes.cls),
@@ -275,27 +360,51 @@ class FrameAnalyzer:
             'main_subject_criterion': 'largest_object' if main_subject else None
         }
     
-    def extract_faces(self, frame: np.ndarray) -> Dict:
-        """Детекция лиц с MediaPipe (улучшенная версия с face_pose, eye_gaze, landmarks visibility)"""
+    def extract_faces(self, frame: np.ndarray, frame_index: Optional[int] = None) -> Dict:
+        """
+        Детекция лиц. Использует только core_face_landmarks.
+        """
         H, W = frame.shape[:2]
         frame_area = H * W
-        rgb_frame = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
-        results = self.models.face_mesh.process(rgb_frame)
+        
+        if frame_index is None or not self.config.rs_path:
+            raise RuntimeError(
+                f"{name} | extract_faces | frame_index и rs_path обязательны для чтения core_face_landmarks"
+            )
+        
+        core_frame = _load_core_face_landmarks(self.config.rs_path, frame_index)
+        if core_frame is None:
+            raise RuntimeError(
+                f"{name} | extract_faces | core_face_landmarks не найдены для frame {frame_index}. "
+                f"Убедитесь, что core провайдер core_face_landmarks запущен перед этим модулем. "
+                f"rs_path: {self.config.rs_path}"
+            )
+        
+        # Преобразуем core данные в формат, ожидаемый остальным кодом
+        face_landmarks_list_core = core_frame.get("face_landmarks", [])
         
         faces = []
         face_landmarks_list = []
         main_face = None
         main_face_confidence = 0.0
         
-        if results.multi_face_landmarks:
-            for face_idx, face_landmarks in enumerate(results.multi_face_landmarks):
-                # Извлекаем ключевые точки
+        if face_landmarks_list_core:
+            for face_idx, face_landmarks_data in enumerate(face_landmarks_list_core):
+                # Извлекаем ключевые точки из core формата
                 landmarks = []
                 landmark_3d = []
-                for landmark in face_landmarks.landmark:
-                    x, y = int(landmark.x * W), int(landmark.y * H)
-                    landmarks.append((x, y))
-                    landmark_3d.append((landmark.x, landmark.y, landmark.z))
+                for lm_data in face_landmarks_data:
+                    x = float(lm_data.get("x", 0.0))
+                    y = float(lm_data.get("y", 0.0))
+                    z = float(lm_data.get("z", 0.0))
+                    # Преобразуем нормализованные координаты в пиксели
+                    x_px = int(x * W)
+                    y_px = int(y * H)
+                    landmarks.append((x_px, y_px))
+                    landmark_3d.append((x, y, z))
+                
+                if len(landmarks) < 10:
+                    continue
                 
                 # Вычисляем bounding box лица
                 xs = [lm[0] for lm in landmarks]
@@ -315,19 +424,13 @@ class FrameAnalyzer:
                 center_y_norm = face_center[1] / H
                 
                 # Face pose estimation (yaw, pitch, roll) - упрощенная версия
-                # Используем ключевые точки для оценки позы
-                # MediaPipe Face Mesh имеет специфические индексы для ключевых точек
-                # Упрощенная оценка на основе относительных позиций
                 face_pose = self._estimate_face_pose(landmark_3d, W, H)
                 
                 # Eye gaze estimation (упрощенная версия)
                 eye_gaze = self._estimate_eye_gaze(landmark_3d, W, H)
                 
-                # Landmarks visibility ratio (сколько ключевых точек видно)
-                # MediaPipe предоставляет visibility для каждой точки
-                visible_count = sum(1 for lm in face_landmarks.landmark if lm.visibility > 0.5)
-                total_landmarks = len(face_landmarks.landmark)
-                landmarks_visibility_ratio = visible_count / total_landmarks if total_landmarks > 0 else 0.0
+                # Landmarks visibility ratio (предполагаем, что все видимы, если нет данных)
+                landmarks_visibility_ratio = 1.0
                 
                 face_data = {
                     'bbox': [x1, y1, x2, y2],
@@ -345,7 +448,7 @@ class FrameAnalyzer:
                 }
                 
                 faces.append(face_data)
-                face_landmarks_list.append(face_landmarks.landmark)
+                face_landmarks_list.append(face_landmarks_data)
                 
                 # Главное лицо: самое крупное с высокой видимостью
                 face_confidence = face_size_ratio * landmarks_visibility_ratio
@@ -653,135 +756,29 @@ class FrameAnalyzer:
         
         return saliency.astype(np.float32)
     
-    def analyze_depth(self, frame: np.ndarray) -> Dict[str, float]:
+    def analyze_depth(self, frame: np.ndarray, frame_index: Optional[int] = None) -> Dict[str, float]:
         """
         MiDaS-based depth analysis (relative depth only).
+        Приоритет: core_depth_midas > локальный MiDaS.
         Вычисляется только если use_midas=True и разрешение >= min_resolution_for_depth.
         """
         H, W = frame.shape[:2]
         
-        # Проверяем условия для depth analysis
-        depth_reliable = False
-        if not self.config.use_midas:
-            return {
-                'depth_mean': 0.5,
-                'depth_std': 0.0,
-                'depth_reliable': False,
-                'foreground_ratio': 0.0,
-                'bokeh_potential': 0.0
-            }
+        # Используем только core_depth_midas - обязательное требование
+        if frame_index is None or not self.config.rs_path:
+            raise RuntimeError(
+                f"{name} | analyze_depth | frame_index и rs_path обязательны для чтения core_depth_midas"
+            )
         
-        # Проверяем разрешение
-        min_res = min(H, W)
-        if min_res < self.config.min_resolution_for_depth:
-            return {
-                'depth_mean': 0.5,
-                'depth_std': 0.0,
-                'depth_reliable': False,
-                'foreground_ratio': 0.0,
-                'bokeh_potential': 0.0
-            }
+        core_depth = _load_core_depth_midas(self.config.rs_path, frame_index)
+        if core_depth is None:
+            raise RuntimeError(
+                f"{name} | analyze_depth | core_depth_midas не найдены для frame {frame_index}. "
+                f"Убедитесь, что core провайдер depth_midas запущен перед этим модулем. "
+                f"rs_path: {self.config.rs_path}"
+            )
         
-        try:
-            mm = ModelManager()
-            model, transform = mm.midas
-
-            # --- Preprocess ---
-            rgb = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
-            input_tensor = transform(rgb).to(self.config.device)
-
-            # --- Inference ---
-            with torch.no_grad():
-                depth = model(input_tensor)          # [1, h, w]
-                depth = depth.unsqueeze(1)           # [1, 1, h, w]
-                depth = F.interpolate(
-                    depth,
-                    size=(H, W),
-                    mode="bicubic",
-                    align_corners=False
-                ).squeeze()
-
-            depth = depth.cpu().numpy()
-
-            # --- Normalize (relative depth only) ---
-            d_min, d_max = depth.min(), depth.max()
-            if d_max > d_min:
-                depth = (depth - d_min) / (d_max - d_min + 1e-6)
-                depth_reliable = True
-            else:
-                depth_reliable = False
-                depth = np.ones_like(depth) * 0.5
-        except Exception as e:
-            logger.warning(f"Depth analysis failed: {e}")
-            return {
-                'depth_mean': 0.5,
-                'depth_std': 0.0,
-                'depth_reliable': False,
-                'foreground_ratio': 0.0,
-                'bokeh_potential': 0.0
-            }
-
-        # =========================
-        # STATISTICS
-        # =========================
-        mean = float(depth.mean())
-        std = float(depth.std())
-        p10, p50, p90 = np.percentile(depth, [10, 50, 90])
-
-        dynamic_range = float(p90 - p10)
-
-        # =========================
-        # DEPTH LAYERS (percentiles)
-        # =========================
-        fg_mask = depth <= p10
-        bg_mask = depth >= p90
-        mg_mask = (~fg_mask) & (~bg_mask)
-
-        fg_ratio = float(fg_mask.mean())
-        mg_ratio = float(mg_mask.mean())
-        bg_ratio = float(bg_mask.mean())
-
-        # =========================
-        # DEPTH EDGES / CONTRAST
-        # =========================
-        depth_uint8 = (depth * 255).astype(np.uint8)
-        edges = cv2.Canny(depth_uint8, 50, 150)
-        depth_edge_density = float(edges.mean() / 255.0)
-
-        # =========================
-        # DEPTH ENTROPY
-        # =========================
-        hist, _ = np.histogram(depth, bins=64, range=(0, 1))
-        prob = hist / (hist.sum() + 1e-8)
-        entropy = float(-np.sum(prob * np.log2(prob + 1e-8)))
-
-        # =========================
-        # BOKEH POTENTIAL
-        # =========================
-        bokeh_potential = float(np.clip(std * 2.0, 0.0, 1.0))
-
-        # Компактный возврат: только основные метрики для трансформера
-        result = {
-            "depth_mean": mean,
-            "depth_std": std,
-            "depth_reliable": depth_reliable,
-            "foreground_ratio": foreground_ratio,
-            "bokeh_potential": bokeh_potential,
-            "depth_p10": float(p10),
-            "depth_p90": float(p90),
-            "depth_dynamic_range": dynamic_range,
-            "depth_method": "midas_small"
-        }
-        
-        # Опциональные метрики (для агрегатов, не для трансформера)
-        if depth_reliable:
-            result["depth_p50"] = float(p50)
-            result["midground_ratio"] = float(mg_ratio)
-            result["background_ratio"] = float(bg_ratio)
-            result["depth_entropy"] = entropy
-            result["depth_edge_density"] = depth_edge_density
-        
-        return result
+        return core_depth
 
     def analyze_symmetry(self, frame: np.ndarray) -> Dict:
         """
@@ -1153,14 +1150,14 @@ class FrameAnalyzer:
         
         return line_features
     
-    def analyze_frame(self, frame: np.ndarray) -> Dict:
+    def analyze_frame(self, frame: np.ndarray, frame_index: Optional[int] = None) -> Dict:
         """Полный анализ одного кадра"""
         # Базовые данные
         H, W = frame.shape[:2]
         
         # Извлечение объектов и лиц
-        object_data = self.extract_objects(frame)
-        face_data = self.extract_faces(frame)
+        object_data = self.extract_objects(frame, frame_index=frame_index)
+        face_data = self.extract_faces(frame, frame_index=frame_index)
         
         # Основные субъекты
         main_subject = None
@@ -1189,7 +1186,7 @@ class FrameAnalyzer:
             },
             'composition_anchors': composition_anchors,  # Новое: объединенный анализ
             'balance': self.analyze_balance(frame, object_data['object_mask']),
-            'depth': self.analyze_depth(frame),
+            'depth': self.analyze_depth(frame, frame_index=frame_index),
             'symmetry': self.analyze_symmetry(frame),
             'negative_space': self.analyze_negative_space(frame, object_data['object_mask']),
             'complexity': self.analyze_complexity(frame),
@@ -1310,7 +1307,7 @@ class VideoCompositionAnalyzer:
 
             frame = frame_manager.get(idx)
 
-            frame_analysis = self.frame_analyzer.analyze_frame(frame)
+            frame_analysis = self.frame_analyzer.analyze_frame(frame, frame_index=idx)
 
             logger.info(f"Обработано кадров: {i+1}/{len(frame_indices)}")
 

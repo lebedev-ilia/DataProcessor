@@ -48,6 +48,7 @@ def main():
 
     config = Config(
         device = args.device,
+        rs_path = args.rs_path,  # Передаём rs_path для чтения core провайдеров
         yolo_model_path = args.yolo_model_path,
         yolo_conf_threshold = args.yolo_conf_threshold ,
         max_num_faces = args.max_num_faces ,

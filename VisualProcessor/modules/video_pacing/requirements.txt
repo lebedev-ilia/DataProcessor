@@ -1,1 +1,2 @@
-# clip        git+https://github.com/openai/CLIP.git
+# CLIP удалён - используется только core_clip провайдер
+# Зависимости перенесены в core/model_process/core_clip/

@@ -68,10 +68,15 @@ if __name__ == "__main__":
         )
 
     else:
-
+        # YOLO: используем core_object_detections
         from modules.object_detection.object_detection_yolo import ObjectDetectionYOLO
 
-        detector = ObjectDetectionYOLO(args.model, args.box_threshold, args.batch_size)
+        detector = ObjectDetectionYOLO(
+            model_path=args.model,  # Оставлен для обратной совместимости, но не используется
+            box_threshold=args.box_threshold,
+            batch_size=args.batch_size,  # Оставлен для обратной совместимости, но не используется
+            rs_path=args.rs_path  # Обязателен для чтения core_object_detections
+        )
 
     logger.info(f"VisualProcessor | {name} | main | Запущен detector.run (use_queries=True)")
 

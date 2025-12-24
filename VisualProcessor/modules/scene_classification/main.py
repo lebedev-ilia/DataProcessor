@@ -89,7 +89,8 @@ if __name__ == "__main__":
         temporal_smoothing=temporal_smoothing,
         smoothing_window=smoothing_window,
         enable_advanced_features=enable_advanced_features,
-        use_clip_for_semantics=use_clip_for_semantics
+        use_clip_for_semantics=use_clip_for_semantics,
+        rs_path=rs_path
     )
     
     rs = ResultsStore(root_path=rs_path)

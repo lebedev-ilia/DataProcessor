@@ -1,7 +1,6 @@
 import os
-import json
-
 import sys
+
 _path = os.path.dirname(os.path.dirname(os.path.dirname(__file__)))
 
 if _path not in sys.path:
@@ -18,15 +17,11 @@ from core.config import (
 
 from utils.frame_manager import FrameManager
 from utils.results_store import ResultsStore
+from utils.logger import get_logger
+from utils.utilites import load_metadata
 
 name = "optical_flow"
-
-def load_metadata(meta_path):
-    try:
-        with open(meta_path, "r") as f:
-            return json.load(f)
-    except:
-        raise f"{name} | main | load_metadata | Ошибка при открытии метадаты"
+logger = get_logger(name)
 
 
 if __name__ == "__main__":
@@ -100,7 +95,12 @@ if __name__ == "__main__":
     flow_processor = OpticalFlowProcessor(flow_config)
     stats_analyzer = FlowStatisticsAnalyzer(stats_config)
     
-    metadata = load_metadata(f"{args.frames_dir}/metadata.json")
+    try:
+        metadata = load_metadata(f"{args.frames_dir}/metadata.json", name)
+        logger.info(f"{name} | main | Загружена метадата")
+    except Exception as e:
+        logger.error(f"{name} | main | Ошибка загрузки метадаты: {e}")
+        raise
     
     frame_manager = FrameManager(frames_dir=args.frames_dir, chunk_size=metadata["chunk_size"], cache_size=metadata["cache_size"])
     

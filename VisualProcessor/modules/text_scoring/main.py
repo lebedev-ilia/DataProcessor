@@ -62,45 +62,104 @@ if __name__ == "__main__":
     
     # Try to load additional data from other modules if available
     seg_root = "/".join(args.frames_dir.split("/")[:-1])
+
+    # -------- core‑данные: motion / face / audio ----------
     motion_peaks = None
     face_peaks = None
     audio_peaks = None
-    
+
+    def _load_core_optical_flow(rs_path: str) -> list | None:
+        """
+        Загружает motion данные из core_optical_flow - обязательное требование.
+        """
+        if not rs_path:
+            return None
+        
+        # Используем optical_flow модуль (который работает как core провайдер через fallback в main.py)
+        stats_path = os.path.join(rs_path, "optical_flow", "statistical_analysis.json")
+        if not os.path.isfile(stats_path):
+            return None
+        
+        try:
+                motion_data = load_json(stats_path)
+                frame_stats = (motion_data.get("statistics") or {}).get("frame_statistics") or []
+                if frame_stats:
+                peaks = []
+                    for fs in frame_stats:
+                        v = (
+                            fs.get("magnitude_mean_px_sec_norm")
+                            if "magnitude_mean_px_sec_norm" in fs
+                            else fs.get("magnitude_mean_px_sec", fs.get("magnitude_mean", 0.0))
+                        )
+                    peaks.append(float(v))
+                logger.info(f"VisualProcessor | {name} | main | Loaded motion data from optical_flow")
+                return peaks
+        except Exception as e:
+            logger.warning(f"VisualProcessor | {name} | main | Could not load from optical_flow: {e}")
+        
+        return None
+
+    def _load_core_face_landmarks(rs_path: str) -> list | None:
+        """
+        Загружает face данные из core_face_landmarks.
+        Извлекает простую метрику присутствия лиц (количество лиц на кадр).
+        """
+        if not rs_path:
+            return None
+        
+        core_path = os.path.join(rs_path, "core_face_landmarks", "landmarks.json")
+        if not os.path.isfile(core_path):
+            return None
+        
+        try:
+            data = load_json(core_path)
+            frames = data.get("frames") or []
+            if not frames:
+                return None
+            
+            # Извлекаем метрику: количество лиц на кадр (нормализованное)
+            peaks = []
+            max_faces = 0
+            for f in frames:
+                face_count = len(f.get("face_landmarks", []))
+                max_faces = max(max_faces, face_count)
+                peaks.append(float(face_count))
+            
+            # Нормализуем к 0..1
+            if max_faces > 0:
+                peaks = [p / float(max_faces) for p in peaks]
+            
+            logger.info(f"VisualProcessor | {name} | main | Loaded face data from core_face_landmarks")
+            return peaks
+        except Exception as e:
+            logger.warning(f"VisualProcessor | {name} | main | Could not load from core_face_landmarks: {e}")
+            return None
+
     if args.use_motion_data:
-        try:
-            motion_results_path = f"{args.rs_path}/optical_flow"
-            if os.path.exists(motion_results_path):
-                motion_files = [f for f in os.listdir(motion_results_path) if f.endswith('.json')]
-                if motion_files:
-                    motion_data = load_json(f"{motion_results_path}/{sorted(motion_files)[-1]}")
-                    # Extract motion intensity curve if available
-                    if 'motion_intensity_curve' in motion_data:
-                        motion_peaks = motion_data['motion_intensity_curve']
-                    logger.info(f"VisualProcessor | {name} | main | Loaded motion data")
-        except Exception as e:
-            logger.warning(f"VisualProcessor | {name} | main | Could not load motion data: {e}")
-    
+        motion_peaks = _load_core_optical_flow(args.rs_path)
+        if motion_peaks is None:
+            raise RuntimeError(
+                f"VisualProcessor | {name} | main | core_optical_flow не найден. "
+                f"Убедитесь, что core провайдер optical_flow запущен перед этим модулем. "
+                f"rs_path: {args.rs_path}"
+            )
+
     if args.use_face_data:
-        try:
-            face_results_path = f"{args.rs_path}/emotion_face"
-            if os.path.exists(face_results_path):
-                face_files = [f for f in os.listdir(face_results_path) if f.endswith('.json')]
-                if face_files:
-                    face_data = load_json(f"{face_results_path}/{sorted(face_files)[-1]}")
-                    # Extract face emotion curve if available
-                    if 'emotion_curve' in face_data:
-                        face_peaks = face_data['emotion_curve']
-                    logger.info(f"VisualProcessor | {name} | main | Loaded face data")
-        except Exception as e:
-            logger.warning(f"VisualProcessor | {name} | main | Could not load face data: {e}")
-    
+        # Используем только core_face_landmarks - обязательное требование
+        face_peaks = _load_core_face_landmarks(args.rs_path)
+        if face_peaks is None:
+            raise RuntimeError(
+                f"VisualProcessor | {name} | main | core_face_landmarks не найдены. "
+                f"Убедитесь, что core провайдер core_face_landmarks запущен перед этим модулем. "
+                f"rs_path: {args.rs_path}"
+            )
+
     if args.use_audio_data:
+        # core_audio_embeddings ещё не реализован; оставляем заглушку под будущий провайдер.
         try:
-            audio_path = f"{seg_root}/audio"
+            audio_path = os.path.join(seg_root, "audio")
             if os.path.exists(audio_path):
-                # Audio processing would go here
-                # For now, we'll skip it
-                logger.info(f"VisualProcessor | {name} | main | Audio data path found but not processed yet")
+                logger.info(f"VisualProcessor | {name} | main | Audio data path found (core_audio_embeddings TBD)")
         except Exception as e:
             logger.warning(f"VisualProcessor | {name} | main | Could not load audio data: {e}")
     

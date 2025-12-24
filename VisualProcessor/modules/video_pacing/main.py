@@ -48,10 +48,11 @@ if __name__ == "__main__":
 
     # Инициализация pipeline
     pipeline = VideoPacingPipelineVisualOptimized(
-        frame_manager,
-        frame_indices,
+        frame_manager=frame_manager,
+        frame_indices=frame_indices,
         batch_size=args.batch_size,
-        downscale_factor=args.downscale_factor
+        downscale_factor=args.downscale_factor,
+        rs_path=args.rs_path,
     )
 
     # Извлечение всех метрик

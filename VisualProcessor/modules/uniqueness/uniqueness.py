@@ -17,11 +17,11 @@
 from typing import Dict, List, Optional, Any, Union, Tuple
 import numpy as np
 from scipy.spatial.distance import cosine
-from scipy.stats import pearsonr, entropy
+from scipy.stats import pearsonr, entropy, wasserstein_distance
 from sklearn.metrics.pairwise import cosine_similarity
-from scipy.stats import wasserstein_distance
 import warnings
-warnings.filterwarnings('ignore')
+
+warnings.filterwarnings("ignore")
 
 
 class UniquenessModule:
@@ -86,38 +86,88 @@ class UniquenessModule:
         """
         if len(reference_embeddings) == 0:
             return {
-                'semantic_novelty_score': 1.0,
-                'topic_novelty_score': 1.0,
-                'concept_diversity_score': 0.0
+                "semantic_novelty_score": 1.0,
+                "semantic_novelty_max": 1.0,
+                "semantic_novelty_topk_mean": 1.0,
+                "semantic_novelty_topk_median": 1.0,
+                "topic_novelty_score": 1.0,
+                "concept_diversity_score": 0.0,
+                "concept_diversity_entropy": 0.0,
+                "concept_diversity_unique_norm": 0.0,
             }
-        
+
         # Нормализуем embeddings
         video_emb_norm = video_embedding / (np.linalg.norm(video_embedding) + 1e-10)
-        
-        similarities = []
+
+        similarities: List[float] = []
         for ref_emb in reference_embeddings:
             ref_emb_norm = ref_emb / (np.linalg.norm(ref_emb) + 1e-10)
-            sim = np.dot(video_emb_norm, ref_emb_norm)
-            similarities.append(float(sim))
-        
-        similarities = np.array(similarities)
-        max_similarity = np.max(similarities)
-        
-        # Semantic novelty = 1 - max similarity
-        semantic_novelty = 1.0 - max_similarity
-        
+            sim = float(np.dot(video_emb_norm, ref_emb_norm))
+            similarities.append(sim)
+
+        similarities_arr = np.asarray(similarities, dtype=np.float32)
+        if similarities_arr.size == 0:
+            max_similarity = 0.0
+            topk_mean_sim = 0.0
+            topk_median_sim = 0.0
+        else:
+            similarities_sorted = np.sort(similarities_arr)[::-1]
+            max_similarity = float(similarities_sorted[0])
+            k = min(5, similarities_sorted.size)
+            topk = similarities_sorted[:k]
+            topk_mean_sim = float(topk.mean())
+            topk_median_sim = float(np.median(topk))
+
+        # Semantic novelty family: 1 - similarity
+        semantic_novelty_max = 1.0 - max_similarity
+        semantic_novelty_topk_mean = 1.0 - topk_mean_sim
+        semantic_novelty_topk_median = 1.0 - topk_median_sim
+
         # Topic novelty: доля новых концептов
         topic_novelty = 1.0
         if video_topics is not None and reference_topics_list is not None:
             topic_novelty = self._compute_topic_novelty(video_topics, reference_topics_list)
-        
-        # Concept diversity: количество уникальных концептов / общее количество
-        concept_diversity = self._compute_concept_diversity(video_topics) if video_topics is not None else 0.0
-        
+
+        # Concept diversity: энтропия + нормализованный unique count
+        diversity_entropy = 0.0
+        diversity_unique_norm = 0.0
+        if video_topics is not None:
+            if isinstance(video_topics, dict):
+                probs = np.array(list(video_topics.values()), dtype=np.float32)
+                if probs.size > 0:
+                    probs = probs / (probs.sum() + 1e-10)
+                    diversity_entropy = float(
+                        entropy(probs) / (np.log(len(probs) + 1e-10))
+                    )
+                    diversity_unique_norm = float(
+                        len([p for p in probs if p > 0.01]) / np.log(len(probs) + 1.0)
+                    )
+            elif isinstance(video_topics, (list, np.ndarray)) and len(video_topics) > 0:
+                if isinstance(video_topics[0], str):
+                    unique_count = len(set(video_topics))
+                    total_count = len(video_topics)
+                    diversity_unique_norm = float(
+                        unique_count / np.log(total_count + 1.0)
+                    ) if total_count > 0 else 0.0
+                else:
+                    arr = np.asarray(video_topics, dtype=np.float32)
+                    probs = arr / (arr.sum() + 1e-10)
+                    diversity_entropy = float(
+                        entropy(probs) / (np.log(len(probs) + 1e-10))
+                    )
+
+        # Для обратной совместимости concept_diversity_score = entropy-версия
+        concept_diversity_score = diversity_entropy
+
         return {
-            'semantic_novelty_score': float(semantic_novelty),
-            'topic_novelty_score': float(topic_novelty),
-            'concept_diversity_score': float(concept_diversity)
+            "semantic_novelty_score": float(semantic_novelty_max),
+            "semantic_novelty_max": float(semantic_novelty_max),
+            "semantic_novelty_topk_mean": float(semantic_novelty_topk_mean),
+            "semantic_novelty_topk_median": float(semantic_novelty_topk_median),
+            "topic_novelty_score": float(topic_novelty),
+            "concept_diversity_score": float(concept_diversity_score),
+            "concept_diversity_entropy": float(diversity_entropy),
+            "concept_diversity_unique_norm": float(diversity_unique_norm),
         }
     
     def _compute_topic_novelty(

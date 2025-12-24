@@ -69,7 +69,8 @@ if __name__ == "__main__":
         face_max_num_faces=args.face_max_num_faces,
         face_refine_landmarks=args.face_refine_landmarks,
         face_min_detection_confidence=args.face_min_detection_confidence,
-        face_min_tracking_confidence=args.face_min_tracking_confidence
+        face_min_tracking_confidence=args.face_min_tracking_confidence,
+        rs_path=args.rs_path,
     )
     
     metadata = load_json(f"{args.frames_dir}/metadata.json")

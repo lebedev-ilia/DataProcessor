@@ -41,6 +41,7 @@ def _log(logger, *args, **kwargs):
 # Video processing
 # -----------------------
 def process_video(
+    vid: str,
     video_path: str,
     out_dir: str,
     chunk_size: int = 512,
@@ -54,7 +55,7 @@ def process_video(
     Создаёт metadata.json c полями:
       total_frames, fps, height, width, channels, chunk_size, batches: [{batch_index, path, start_frame, end_frame}, ...]
     """
-    output = f"{out_dir}/video"
+    output = f"{out_dir}/{vid}/video"
 
     os.makedirs(output, exist_ok=True)
 
@@ -150,6 +151,7 @@ def _run_cmd(cmd: List[str]) -> Tuple[int, str, str]:
     return p.returncode, p.stdout, p.stderr
 
 def extract_audio(
+    vid: str,
     video_path: str,
     out_dir: str,
     target_sr: int = 16000,
@@ -162,7 +164,7 @@ def extract_audio(
     Возвращает аудио-мета: {audio_path, duration_sec, sample_rate, total_samples}
     Требует ffmpeg/ffprobe в PATH.
     """
-    output = f"{out_dir}/audio"
+    output = f"{out_dir}/{vid}/audio"
     os.makedirs(output, exist_ok=True)
     base = os.path.splitext(os.path.basename(video_path))[0]
     audio_fname = f"{base}.wav"
@@ -171,7 +173,6 @@ def extract_audio(
     if os.path.exists(audio_path) and not overwrite:
         _log(logger, f"[extract_audio] audio already exists: {audio_path}")
     else:
-        # ffmpeg команда: извлечь аудио, привести к нужной частоте и моно
         cmd = [
             "ffmpeg", "-y", "-i", video_path,
             "-vn",
@@ -184,14 +185,11 @@ def extract_audio(
         if code != 0:
             raise RuntimeError(f"ffmpeg failed: {err.strip()}")
 
-    # получить инфо через ffprobe (duration, sr)
     duration = None
     sample_rate = None
     total_samples = None
 
-    # duration
-    cmd_dur = ["ffprobe", "-v", "error", "-show_entries", "format=duration",
-               "-of", "default=noprint_wrappers=1:nokey=1", audio_path]
+    cmd_dur = ["ffprobe", "-v", "error", "-show_entries", "format=duration", "-of", "default=noprint_wrappers=1:nokey=1", audio_path]
     code, out, err = _run_cmd(cmd_dur)
     if code == 0 and out.strip():
         try:
@@ -219,10 +217,6 @@ def extract_audio(
         "sample_rate": sample_rate,
         "total_samples": total_samples
     }
-
-    # сохраняем мету
-    with open(os.path.join(out_dir, "audio_metadata.json"), "w") as f:
-        json.dump(audio_meta, f, indent=2)
 
     _log(logger, f"[extract_audio] saved audio metadata -> {audio_meta}")
     return audio_meta
@@ -365,8 +359,11 @@ class Segmenter:
         Возвращает dict с keys: frames_meta, audio_meta, extractor_meta
         """
         _log(self.logger, f"[Segmenter.run] starting processing {video_path}")
-        frames_meta = process_video(video_path, self.out_dir, chunk_size=self.chunk_size, overwrite=overwrite, logger=self.logger)
-        audio_meta = extract_audio(video_path, self.out_dir, overwrite=overwrite, logger=self.logger)
+
+        vid = video_path.split("/")[-1].replace(".mp4", '')
+        
+        frames_meta = process_video(vid, video_path, self.out_dir, chunk_size=self.chunk_size, overwrite=overwrite, logger=self.logger)
+        audio_meta = extract_audio(vid, video_path, self.out_dir, overwrite=overwrite, logger=self.logger)
         status = create_extractor_metadata(self.out_dir, frames_meta, audio_meta, extractor_configs, logger=self.logger)
 
         _log(self.logger, f"[Segmenter.run] finished. manifest saved -> segmenter_manifest.json")
@@ -398,7 +395,7 @@ if __name__ == "__main__":
         {"name": "cut_detection", "modality": "video", "frame_step": 5},
         {"name": "video_pacing", "modality": "video", "frame_step": 5},
         {"name": "story_structure", "modality": "video", "frame_step": 5},
-        # {"name": "", "modality": "video", "frame_step": 5},
+        {"name": "", "modality": "video", "frame_step": 5},
     ]
 
     seg.run(args.video_path, extractor_configs)

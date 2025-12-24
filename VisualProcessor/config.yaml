@@ -1,3 +1,9 @@
+core_providers:
+    core_clip: true
+    core_face_landmarks: true
+    depth_midas: true
+    object_detections: true
+
 modules:
     object_detection: false
     scene_classification: false
@@ -5,21 +11,41 @@ modules:
     detalize_face_modules: false
     emotion_face: false
     behavioral: false
-    optical_flow: true
-    action_recognition: true
-    color_light: true
-    frames_composition: true
-    shot_quality: true
-    cut_detection: true
-    video_pacing: true
-    story_structure: true
+    optical_flow: false
+    action_recognition: false
+    color_light: false
+    frames_composition: false
+    shot_quality: false
+    cut_detection: false
+    video_pacing: false
+    story_structure: false
 
 global:
     root_path: "/home/ilya/Рабочий стол/TrendFlowML/DataProcessor"
     frames_dir: "/home/ilya/Рабочий стол/TrendFlowML/DataProcessor/Segmenter/data/video"
     rs_path: "/home/ilya/Рабочий стол/TrendFlowML/DataProcessor/VisualProcessor/result_store"
 
-object_detection:
+core_face_landmarks:
+    use_pose: true
+    use_hands: true
+    use_face_mesh: true
+    pose_static_image_mode: false
+    pose_model_complexity: 2
+    pose_enable_segmentation: true
+    pose_min_detection_confidence: 0.5
+    pose_min_tracking_confidence: 0.5
+    hands_static_image_mode: false
+    hands_max_num_hands: 2
+    hands_model_complexity: 1
+    hands_min_detection_confidence: 0.5
+    hands_min_tracking_confidence: 0.5
+    face_mesh_static_image_mode: false
+    face_mesh_max_num_faces: 1
+    face_mesh_refine_landmarks: true
+    face_mesh_min_detection_confidence: 0.5
+    face_mesh_min_tracking_confidence: 0.5
+
+object_detections:
     model: "yolo11x.pt" # google/owlvit-base-patch32, google/owlvit-base-patch16, google/owlvit-large-patch14, google/owlv2-base-patch16, yolo11x.pt
     model_family: null # owlv2, owlvit, null
     batch_size: 16
@@ -93,24 +119,18 @@ emotion_face:
     device: "cuda"
 
 behavioral:
-    pose_static_image_mode: false
-    pose_model_complexity: 2
-    pose_smooth_landmarks: true
-    pose_min_detection_confidence: 0.5
-    pose_min_tracking_confidence: 0.5
-    hands_static_image_mode: false
-    hands_max_num_hands: 2
-    hands_model_complexity: 1
-    hands_min_detection_confidence: 0.5
-    hands_min_tracking_confidence: 0.5
-    face_static_image_mode: false
-    face_max_num_faces: 1
-    face_refine_landmarks: true
-    face_min_detection_confidence: 0.5
-    face_min_tracking_confidence: 0.5
     visualize: false
     visualize_dir: ""
 
+# object_detections:
+#     model: "yolo11x.pt"
+#     batch_size: 16
+#     use_queries: false
+#     model_family: null
+#     box_threshold: 0.6
+#     device: "cuda"
+
+# Конфигурация для optical_flow (используется как core провайдер через fallback)
 optical_flow:
     model: "small" # large
     max_dim: 256

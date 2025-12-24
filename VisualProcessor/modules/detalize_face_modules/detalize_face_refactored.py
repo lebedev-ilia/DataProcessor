@@ -6,12 +6,13 @@
 from __future__ import annotations
 
 import logging
+import os
+import json
 from typing import Any, Dict, List, Optional, Sequence, Tuple
 from pathlib import Path
 from collections import defaultdict, deque
 
 import cv2
-import mediapipe as mp
 import numpy as np
 
 from _modules import MODULE_REGISTRY
@@ -27,7 +28,28 @@ from _utils.landmarks_utils import LANDMARKS
 from utils.logger import get_logger
 logger = get_logger("DetalizeFaceExtractorRefactored")
 
-_FACE_MESH = mp.solutions.face_mesh
+
+def _load_core_face_landmarks(rs_path: Optional[str]):
+    """
+    Пытается загрузить предрасчитанные Mediapipe‑landmarks из core_face_landmarks.
+    Формат: result_store/core_face_landmarks/landmarks.json
+    """
+    if not rs_path:
+        return None
+
+    core_path = os.path.join(rs_path, "core_face_landmarks", "landmarks.json")
+    if not os.path.isfile(core_path):
+        return None
+
+    try:
+        with open(core_path, "r", encoding="utf-8") as f:
+            data = json.load(f)
+        frames = data.get("frames") or []
+        # Преобразуем в dict[frame_index] -> frame_payload
+        return {int(f["frame_index"]): f for f in frames if "frame_index" in f}
+    except Exception as e:
+        logger.warning(f"DetalizeFaceExtractorRefactored | _load_core_face_landmarks | error: {e}")
+        return None
 
 class DetalizeFaceExtractorRefactored():
     """
@@ -54,6 +76,8 @@ class DetalizeFaceExtractorRefactored():
         min_aspect_ratio: float = 0.6,
         max_aspect_ratio: float = 1.4,
         validate_landmarks: bool = True,
+        # core‑данные
+        rs_path: Optional[str] = None,
     ) -> None:
         """
         :param modules: список имен модулей для загрузки (если None - загружаются все)
@@ -64,21 +88,23 @@ class DetalizeFaceExtractorRefactored():
         """
 
         self.frames_with_face = self.frames_with_face_load("auto")
+        self.rs_path = rs_path
+        
+        # Загружаем core_face_landmarks - обязательное требование
+        self.core_landmarks = _load_core_face_landmarks(self.rs_path)
+        if not self.core_landmarks:
+            raise RuntimeError(
+                f"DetalizeFaceExtractorRefactored | init | core_face_landmarks не найдены. "
+                f"Убедитесь, что core провайдер core_face_landmarks запущен перед этим модулем. "
+                f"rs_path: {self.rs_path}"
+            )
 
         self.max_faces = max_faces
         self.refine_landmarks = refine_landmarks
 
-        logger.info(f"DetalizeFaceExtractorRefactored | init | face_mesh params | max_faces = {max_faces}")
-        logger.info(f"                                                          | refine_landmarks = {refine_landmarks}")
-        logger.info(f"                                                          | min_detection_confidence = {min_detection_confidence}")
-        logger.info(f"                                                          | min_tracking_confidence = {min_tracking_confidence}")
-
-        self.face_mesh = _FACE_MESH.FaceMesh(
-            max_num_faces=max_faces,
-            refine_landmarks=refine_landmarks,
-            min_detection_confidence=min_detection_confidence,
-            min_tracking_confidence=min_tracking_confidence,
-        )
+        logger.info(f"DetalizeFaceExtractorRefactored | init | Используем core_face_landmarks (max_faces = {max_faces})")
+        
+        # Mediapipe face_mesh удалён - используем только core_face_landmarks
 
         # Quality filtering parameters
         self.min_face_size = max(10, min_face_size)
@@ -151,10 +177,15 @@ class DetalizeFaceExtractorRefactored():
         outputs = {}
 
         for frame_idx in self.frames_with_face:
-
             frame = frame_manager.get(frame_idx)
 
-            frame_results = self._process_frame(frame, frame_idx)
+            # Используем только core_face_landmarks
+            if int(frame_idx) not in self.core_landmarks:
+                logger.warning(f"DetalizeFaceExtractorRefactored | extract | Frame {frame_idx} отсутствует в core_face_landmarks, пропускаем")
+                continue
+
+                core_frame = self.core_landmarks[int(frame_idx)]
+                frame_results = self._process_with_core(frame, frame_idx, core_frame)
             outputs[frame_idx] = frame_results
 
             # Visualize frame if enabled and faces detected
@@ -215,26 +246,40 @@ class DetalizeFaceExtractorRefactored():
             self._tracking_counter += 1
             return self._tracking_counter
 
-    def _process_frame(self, frame: np.ndarray, frame_idx: int) -> List[Dict[str, Any]]:
+    def _process_with_core(
+        self,
+        frame: np.ndarray,
+        frame_idx: int,
+        core_frame: Dict[str, Any],
+    ) -> List[Dict[str, Any]]:
         """
-        Обрабатывает один кадр, используя модульную архитектуру.
+        Обработка кадра на основе уже готовых core_face_landmarks.
+        По сути повторяет _process_frame, но вместо вызова Mediapipe
+        использует координаты из core‑слоя.
         """
         height, width = frame.shape[:2]
-        rgb = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
-        results = self.face_mesh.process(rgb)
 
-        if not results.multi_face_landmarks:
-            return []
+        faces_with_bbox: List[Tuple[int, Any, np.ndarray, np.ndarray, float]] = []
 
-        # Собираем все лица с их bbox для определения primary face
-        faces_with_bbox = []
-        for face_idx, landmark_list in enumerate(results.multi_face_landmarks):
-            coords = landmarks_to_ndarray(landmark_list, width, height)
+        # core_frame["face_landmarks"] — список лиц, каждое лицо — список точек [{x,y,z}, ...]
+        for face_idx, face_points in enumerate(core_frame.get("face_landmarks", []) or []):
+            if not face_points:
+                continue
+
+            # Восстанавливаем coords в пиксельных координатах, совместимых с MediaPipe‑пайплайном
+            coords = np.zeros((len(face_points), 3), dtype=np.float32)
+            for i, p in enumerate(face_points):
+                coords[i, 0] = float(p.get("x", 0.0)) * float(width)
+                coords[i, 1] = float(p.get("y", 0.0)) * float(height)
+                coords[i, 2] = float(p.get("z", 0.0))
+
             bbox = compute_bbox(coords, width, height)
-            
-            # Валидация
+
             if not validate_face_landmarks(
-                bbox, coords, width, height,
+                bbox,
+                coords,
+                width,
+                height,
                 min_face_size=self.min_face_size,
                 max_face_size_ratio=self.max_face_size_ratio,
                 min_aspect_ratio=self.min_aspect_ratio,
@@ -242,47 +287,44 @@ class DetalizeFaceExtractorRefactored():
                 validate_landmarks=self.validate_landmarks,
             ):
                 continue
-            
-            # Вычисляем площадь для определения primary face
+
             bbox_area = (bbox[2] - bbox[0]) * (bbox[3] - bbox[1])
-            faces_with_bbox.append((face_idx, landmark_list, coords, bbox, bbox_area))
-        
-        # Сортируем по площади (primary face = наибольшая площадь)
+            faces_with_bbox.append((face_idx, None, coords, bbox, bbox_area))
+
+        # Если ничего не осталось после валидации
+        if not faces_with_bbox:
+            return []
+
+        # Сортировка по площади для определения primary face
         faces_with_bbox.sort(key=lambda x: x[4], reverse=True)
-        
-        # Определяем primary face (индекс 0) и secondary faces
+
         frame_features: List[Dict[str, Any]] = []
         self._face_tracking[frame_idx] = {}
-        
-        for idx, (face_idx, landmark_list, coords, bbox, bbox_area) in enumerate(faces_with_bbox):
-            # Detection confidence (MediaPipe не предоставляет напрямую, используем эвристику)
-            # Можно использовать стабильность landmarks или другие метрики
-            detection_confidence = 0.9  # По умолчанию, можно улучшить
-            
-            # Назначаем tracking_id
+
+        for idx, (face_idx, _unused_landmarks, coords, bbox, bbox_area) in enumerate(faces_with_bbox):
+            detection_confidence = 0.9  # эвристика: core‑данные считаем надёжными
+
             tracking_id = self._assign_tracking_id(frame_idx, face_idx, bbox, detection_confidence)
             self._face_tracking[frame_idx][face_idx] = tracking_id
-            
-            # Обновляем историю трека
+
             if tracking_id not in self._track_history:
                 self._track_history[tracking_id] = deque(maxlen=30)
-            
-            self._track_history[tracking_id].append({
-                "bbox": bbox.tolist(),
-                "frame_idx": frame_idx,
-                "detection_confidence": detection_confidence,
-            })
 
-            # 4. Извлекаем ROI
+            self._track_history[tracking_id].append(
+                {
+                    "bbox": bbox.tolist(),
+                    "frame_idx": frame_idx,
+                    "detection_confidence": detection_confidence,
+                }
+            )
+
             roi = extract_roi(frame, bbox)
 
-            # 5. Конвертируем coords в систему координат ROI
             bbox_x_min, bbox_y_min = bbox[0], bbox[1]
             coords_roi = coords.copy()
             coords_roi[:, 0] -= bbox_x_min
             coords_roi[:, 1] -= bbox_y_min
 
-            # 6. Подготавливаем shared_data для модулей
             shared_data = {
                 "coords": coords,
                 "coords_roi": coords_roi,
@@ -292,11 +334,10 @@ class DetalizeFaceExtractorRefactored():
                 "face_idx": face_idx,
                 "tracking_id": tracking_id,
                 "detection_confidence": detection_confidence,
-                "is_primary_face": (idx == 0),  # Первое лицо = primary
+                "is_primary_face": (idx == 0),
             }
 
-            # 7. Обрабатываем через модули
-            face_feature = {
+            face_feature: Dict[str, Any] = {
                 "frame_index": frame_idx,
                 "face_index": face_idx,
                 "bbox": bbox.tolist(),
@@ -305,7 +346,6 @@ class DetalizeFaceExtractorRefactored():
                 "is_primary_face": (idx == 0),
             }
 
-            # Обрабатываем модули в порядке загрузки
             for module in self.modules:
                 if not module.can_process(shared_data):
                     continue
@@ -314,25 +354,23 @@ class DetalizeFaceExtractorRefactored():
                     module_result = module.process(shared_data)
                     face_feature.update(module_result)
 
-                    # Обновляем shared_data для зависимостей между модулями
-                    # (например, professional зависит от quality, eyes, motion, pose, lip_reading)
                     for key, value in module_result.items():
-                        # Добавляем все результаты модулей в shared_data для зависимостей
                         shared_data[key] = value
-
                 except Exception as e:
                     logger.error(
-                        f"Ошибка в модуле '{module.module_name}' на кадре {frame_idx}, лицо {face_idx}: {e}",
+                        f"DetalizeFaceExtractorRefactored | core | Ошибка в модуле '{module.module_name}' "
+                        f"на кадре {frame_idx}, лицо {face_idx}: {e}",
                         exc_info=True,
                     )
 
-            # Сохраняем landmarks для визуализации
             if self.visualize:
                 face_feature["_landmarks_coords"] = coords.tolist()
 
             frame_features.append(face_feature)
 
         return frame_features
+
+    # Метод _process_frame удалён - используем только core_face_landmarks через _process_with_core
 
     def _visualize_frame(
         self, frame: np.ndarray, frame_idx: int, frame_results: List[Dict[str, Any]]

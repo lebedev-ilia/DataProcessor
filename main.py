@@ -35,16 +35,10 @@ if __name__ == "__main__":
 
     logger.info("DataProcessor | main | Запуск main VisualProcessor")
 
-    st = time.time()
-
     cmd = [
-        f"{_path}/VisualProcessor/.venv/bin/python",
+        f"{_path}/VisualProcessor/.vp_venv/bin/python",
         f"{_path}/VisualProcessor/main.py",
         "--cfg-path", args.visual_cfg_path
     ]
 
     subprocess.run(cmd)
-
-    en = round(time.time() - st, 2)
-
-    logger.info(f"DataProcessor | main | Все модули VisualProcessor отработали | Time: {en}")

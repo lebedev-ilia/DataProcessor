@@ -4,7 +4,7 @@ import clip
 import numpy as np
 from PIL import Image
 from scipy.stats import entropy
-from typing import Dict
+from typing import Dict, Optional
 try:
     from aesthetic_predictor import AestheticPredictor
 except ImportError:
@@ -38,6 +38,38 @@ if _path not in sys.path:
 
 from utils.logger import get_logger
 logger = get_logger(name)
+
+# -----------------------------
+# HELPERS ДЛЯ ЧТЕНИЯ CORE ПРОВАЙДЕРОВ
+# -----------------------------
+
+def _load_core_clip_embeddings(rs_path: Optional[str], frame_index: int) -> Optional[np.ndarray]:
+    """
+    Загружает CLIP эмбеддинги из core_clip для конкретного кадра.
+    Возвращает None, если core данные недоступны.
+    """
+    if not rs_path:
+        return None
+    
+    core_path = os.path.join(rs_path, "core_clip", "embeddings.npz")
+    if not os.path.isfile(core_path):
+        return None
+    
+    try:
+        data = np.load(core_path)
+        emb = data.get("frame_embeddings")
+        if emb is None:
+            return None
+        emb = np.asarray(emb, dtype=np.float32)
+        
+        # Проверяем, что frame_index в пределах массива
+        if frame_index < 0 or frame_index >= emb.shape[0]:
+            return None
+        
+        return emb[frame_index]
+    except Exception as e:
+        logger.warning(f"{name} | _load_core_clip_embeddings | Error loading core data: {e}")
+        return None
 
 # -----------------------------
 # DNN MODELS: DnCNN, CBDNet, MiDaS
@@ -733,9 +765,11 @@ def rolling_shutter_artifacts_score(prev_frame, curr_frame):
 # ---------------------------------------------------------------
 
 class ShotQualityZeroShot:
-    def __init__(self, device="cuda"):
+    def __init__(self, device="cuda", rs_path: Optional[str] = None):
         self.device = device
-        self.clip_model, self.preprocess = clip.load("ViT-L/14", device=device)
+        self.rs_path = rs_path
+        # CLIP удалён - используем только core_clip
+        # Если core данные недоступны, будет ошибка при predict
         self.aesthetic = AestheticPredictor("vit-l-14")
 
         self.prompts = [
@@ -747,20 +781,55 @@ class ShotQualityZeroShot:
             "screen recording of display",
             "cctv surveillance camera footage low quality"
         ]
+        
+        # Загружаем текстовые эмбеддинги только один раз (они не зависят от кадра)
+        # Но для этого нужен CLIP модель, поэтому временно оставляем локальную загрузку
+        # TODO: вынести текстовые промпты в core провайдер или использовать предрасчитанные
+        try:
+            self.clip_model, self.preprocess = clip.load("ViT-L/14", device=device)
         self.text = clip.tokenize(self.prompts).to(device)
+            with torch.no_grad():
+                self.txt_feat = self.clip_model.encode_text(self.text)
+                self.txt_feat /= self.txt_feat.norm(dim=-1, keepdim=True)
+        except Exception as e:
+            logger.warning(f"{name} | ShotQualityZeroShot.__init__ | Failed to load CLIP for text embeddings: {e}")
+            self.clip_model = None
+            self.txt_feat = None
 
-    def predict(self, frame):
+    def predict(self, frame, frame_index: Optional[int] = None):
+        """
+        Предсказывает качество кадра. Использует только core_clip для изображений.
+        """
+        if frame_index is None:
+            raise RuntimeError(
+                f"{name} | ShotQualityZeroShot.predict | frame_index обязателен для чтения core_clip"
+            )
+        
+        if not self.rs_path:
+            raise RuntimeError(
+                f"{name} | ShotQualityZeroShot.predict | rs_path обязателен для чтения core_clip"
+            )
+        
+        # Загружаем CLIP эмбеддинг из core_clip
+        img_feat = _load_core_clip_embeddings(self.rs_path, frame_index)
+        if img_feat is None:
+            raise RuntimeError(
+                f"{name} | ShotQualityZeroShot.predict | core_clip embeddings не найдены для frame {frame_index}. "
+                f"Убедитесь, что core провайдер core_clip запущен перед этим модулем. "
+                f"rs_path: {self.rs_path}"
+            )
+
+        img_feat = img_feat.reshape(1, -1)  # [1, D]
+        img_feat = img_feat / (np.linalg.norm(img_feat, axis=1, keepdims=True) + 1e-9)
+        
+        # Вычисляем logits с текстовыми эмбеддингами
+        if self.txt_feat is not None:
+            logits = (torch.from_numpy(img_feat).to(self.device) @ self.txt_feat.T).softmax(dim=-1).cpu().numpy()[0]
+        else:
+            # Fallback: равномерное распределение
+            logits = np.ones(7) / 7.0
+        
         pil = Image.fromarray(cv2.cvtColor(frame, cv2.COLOR_BGR2RGB))
-        img_clip = self.preprocess(pil).unsqueeze(0).to(self.device)
-
-        with torch.no_grad():
-            img_feat = self.clip_model.encode_image(img_clip)
-            txt_feat = self.clip_model.encode_text(self.text)
-
-        img_feat /= img_feat.norm(dim=-1, keepdim=True)
-        txt_feat /= txt_feat.norm(dim=-1, keepdim=True)
-
-        logits = (img_feat @ txt_feat.T).softmax(dim=-1).cpu().numpy()[0]
         aesthetic = float(self.aesthetic.predict(pil))
 
         return {
@@ -772,7 +841,7 @@ class ShotQualityZeroShot:
             "quality_screenrecord_prob": float(logits[5]),
             "quality_surveillance_prob": float(logits[6]),
             "aesthetic_score": aesthetic,
-            "clip_embedding": img_feat.cpu().numpy()[0].tolist()
+            "clip_embedding": img_feat[0].tolist()
         }
 
 # ---------------------------------------------------------------
@@ -780,14 +849,16 @@ class ShotQualityZeroShot:
 # ---------------------------------------------------------------
 
 class ShotQualityPipeline:
-    def __init__(self, device="cuda"):
+    def __init__(self, device="cuda", rs_path: Optional[str] = None):
         self.device = device
+        self.rs_path = rs_path
 
-        try:
-            self.midas, self.midas_tf = load_midas(device)
-            logger.info("Загружена модель midas")
-        except Exception as e:
-            logger.error(f"Ошибка загрузки midas : {e}")
+        # MiDaS удалён - может использоваться core_depth_midas (опционально, если нужно)
+        # try:
+        #     self.midas, self.midas_tf = load_midas(device)
+        #     logger.info("Загружена модель midas")
+        # except Exception as e:
+        #     logger.error(f"Ошибка загрузки midas : {e}")
         try:
             self.dncnn = load_dncnn(device)
             logger.info("Загружена модель dncnn")
@@ -799,7 +870,7 @@ class ShotQualityPipeline:
         except Exception as e:
             logger.error(f"Ошибка загрузки cbdnet : {e}")
         try:
-            self.classifier = ShotQualityZeroShot(device)
+            self.classifier = ShotQualityZeroShot(device, rs_path=rs_path)
             logger.info("Загружена модель ShotQualityZeroShot")
         except Exception as e:
             logger.error(f"Ошибка загрузки ShotQualityZeroShot : {e}")
@@ -813,7 +884,7 @@ class ShotQualityPipeline:
             "noise": []
         }
 
-    def process_frame(self, frame):
+    def process_frame(self, frame, frame_index: Optional[int] = None):
         frame_rgb = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
         gray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
 
@@ -891,7 +962,10 @@ class ShotQualityPipeline:
         self.prev_frame = frame.copy()
 
         # Quality classifier
-        qc = self.classifier.predict(frame)
+        if frame_index is not None:
+            qc = self.classifier.predict(frame, frame_index=frame_index)
+        else:
+            qc = {}
 
         return {
             # Sharpness (компактные признаки)
@@ -971,7 +1045,7 @@ class ShotQualityPipeline:
             else:
                 frame_bgr = frame
 
-            result = self.process_frame(frame_bgr)
+            result = self.process_frame(frame_bgr, frame_index=idx)
             frame_results[idx] = result
 
             logger.info(f"Обработано кадров: {i + 1}/{len(frame_indices)}")

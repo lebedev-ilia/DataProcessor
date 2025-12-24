@@ -1,5 +1,65 @@
 # Описание модулей и их моделей
 
+## Архитектура core-слоя
+
+VisualProcessor использует двухфазную архитектуру:
+
+1. **Фаза 1 — core-провайдеры моделей** (`core/model_process/*`):
+   - Тяжёлые модели запускаются **один раз на видео**
+   - Сохраняют **сырые/универсальные фичи** в `result_store/core_*/`
+   - Каждый провайдер имеет свою виртуальную среду и запускается через subprocess
+
+2. **Фаза 2 — модульные анализаторы** (`modules/*`):
+   - Читают результаты из `result_store/core_*` и других модулей
+   - Не инициализируют модели заново, работают с уже готовыми данными
+   - Агрегируют и пост-обрабатывают фичи
+
+### Core-провайдеры
+
+#### core_clip
+- **Модель**: OpenAI CLIP (ViT-B/32, ViT-L/14 и др.)
+- **Выход**: `result_store/core_clip/embeddings.npz` (per-frame embeddings)
+- **Используют**: `video_pacing`, `story_structure`, `high_level_semantic`, `cut_detection`, `shot_quality`
+- **Документация**: `docs/FEATURES_DESCRIPTION_core_clip.md`
+
+#### core_optical_flow
+- **Модель**: RAFT (small/large) или Farneback
+- **Выход**: `result_store/optical_flow/statistical_analysis.json` (motion statistics)
+- **Используют**: `video_pacing`, `story_structure`, `cut_detection`, `text_scoring`
+- **Документация**: `docs/FEATURES_DESCRIPTION_core_optical_flow.md`
+
+#### core_face_landmarks
+- **Модель**: Mediapipe (pose, hands, face_mesh)
+- **Выход**: `result_store/core_face_landmarks/landmarks.json` (pose/hands/face landmarks)
+- **Используют**: `behavioral`, `detalize_face_modules`, `frames_composition`, `text_scoring`
+- **Документация**: `docs/FEATURES_DESCRIPTION_core_face_landmarks.md`
+
+#### core_depth_midas
+- **Модель**: MiDaS (depth estimation)
+- **Выход**: `result_store/core_depth_midas/depth.json` (depth statistics)
+- **Используют**: `frames_composition`, `shot_quality`
+- **Документация**: `docs/FEATURES_DESCRIPTION_core_depth_midas.md`
+
+#### core_object_detections
+- **Модель**: YOLO (yolo11x.pt и др.) или OWL-ViT/OWLv2 (open-vocabulary)
+- **Выход**: `result_store/core_object_detections/detections.json` (object detections per frame)
+- **Используют**: `frames_composition`, `object_detection`, `scene_classification`
+- **Документация**: `docs/FEATURES_DESCRIPTION_core_object_detections.md`
+
+### Миграция модулей на core-слой
+
+Модули постепенно переходят на использование core-провайдеров:
+
+- ✅ **behavioral**: использует `core_face_landmarks` (с fallback на локальный Mediapipe)
+- ✅ **video_pacing**: использует `core_clip` и `core_optical_flow` (с fallback)
+- ✅ **story_structure**: использует `core_clip` и `core_optical_flow` (с fallback)
+- ✅ **detalize_face_modules**: использует `core_face_landmarks` (с fallback)
+- ✅ **text_scoring**: использует `core_optical_flow` и `core_face_landmarks` (с fallback)
+
+Подробнее о плане рефакторинга: `docs/core_refactor_plan.md`
+
+---
+
 ## object_detection
 
 ### 1 Вариант - Если изначально неизвестно какие могут быть объекты на видео
@@ -162,6 +222,12 @@ model.eval()
 ## behavioral
 
 ### Модели:
+
+Модуль `behavioral` теперь работает поверх core‑слоя:
+
+- **Primary**: использует предрасчитанные Mediapipe‑landmarks из `core_face_landmarks/landmarks.json`  
+  (провайдер `core_face_landmarks` в фазе core считает pose/hands/face_mesh один раз на видео).
+- **Fallback**: если core‑данные недоступны, инициализирует Mediapipe локально, как раньше:
 
 ```python
 import mediapipe as mp
@@ -376,6 +442,16 @@ import pytesseract
 
 text = pytesseract.image_to_string(frame, lang='eng+rus')
 ```
+
+### Зависимость от core‑слоя:
+
+- **motion**: при наличии `core_optical_flow` используется кривая движения из  
+  `result_store/optical_flow/statistical_analysis.json` (`statistics.frame_statistics[*].magnitude_mean_px_sec_norm`  
+  или `magnitude_mean_px_sec` / `magnitude_mean` в качестве `motion_peaks`).  
+- **face**: на текущем этапе модуль читает face‑эмоции из модуля `emotion_face`  
+  (`result_store/emotion_face/*.json`, поле `emotion_curve`) — планируется переход на core‑провайдер  
+  поверх `core_face_landmarks`.  
+- **audio**: источник audio‑сигналов зарезервирован под будущий `core_audio_embeddings` и пока не активен.  
 
 ## high_level_semantic
 

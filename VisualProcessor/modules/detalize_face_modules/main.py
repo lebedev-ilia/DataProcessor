@@ -64,6 +64,7 @@ if __name__ == "__main__":
         min_aspect_ratio=args.min_aspect_ratio,
         max_aspect_ratio=args.max_aspect_ratio,
         validate_landmarks=args.validate_landmarks,
+        rs_path=args.rs_path,
     )
     
     metadata = load_json(f"{args.frames_dir}/metadata.json")

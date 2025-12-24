@@ -48,7 +48,8 @@ if __name__ == "__main__":
         frame_manager=frame_manager,
         frame_indices=frame_indices,
         clip_model=args.clip_model,
-        sentence_model=args.sentence_model
+        sentence_model=args.sentence_model,
+        rs_path=args.rs_path,
     )
 
     result = pipeline.extract_all_features(subtitles=subtitles)

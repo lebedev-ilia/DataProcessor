@@ -1,43 +1,143 @@
+import math
+import os
+import json
+
 import cv2
 import numpy as np
-import torch
+# torch удалён - больше не используется (CLIP перенесён в core_clip)
 from skimage.metrics import structural_similarity as ssim
 from skimage.color import rgb2lab
 from scipy.stats import entropy
-from typing import List, Dict
+from scipy.signal import find_peaks
+from typing import List, Dict, Optional
 
 import warnings
+
 warnings.filterwarnings("ignore")
 
-# Подключаем CLIP
-import clip
-device = "cuda" if torch.cuda.is_available() else "cpu"
+# CLIP удалён - используем только core_clip
+
+
+def gini_coefficient(values: np.ndarray) -> float:
+    """Gini для неотрицательного массива."""
+    if values.size == 0:
+        return 0.0
+    vals = values.astype(np.float64)
+    if np.any(vals < 0):
+        vals = vals - vals.min()
+    if np.allclose(vals, 0):
+        return 0.0
+    vals_sorted = np.sort(vals)
+    n = vals_sorted.size
+    index = np.arange(1, n + 1)
+    return float((2 * np.sum(index * vals_sorted) / (n * np.sum(vals_sorted))) - (n + 1) / n)
+
+
+def _load_core_optical_flow_curve(rs_path: Optional[str]) -> Optional[np.ndarray]:
+    """
+    Пытается загрузить покадровую кривую движения из core‑провайдера optical_flow.
+
+    Ожидается, что модуль optical_flow сохранил результаты в:
+    <rs_path>/optical_flow/statistical_analysis.json
+    """
+    if not rs_path:
+        return None
+
+    stats_path = os.path.join(rs_path, "optical_flow", "statistical_analysis.json")
+    if not os.path.isfile(stats_path):
+        return None
+
+    try:
+        with open(stats_path, "r", encoding="utf-8") as f:
+            data = json.load(f)
+    except Exception:
+        return None
+
+    stats = (data.get("statistics") or {}).get("frame_statistics") or []
+    if not stats:
+        return None
+
+    # Берём нормированную скорость движения, если есть, иначе – базовую величину.
+    curve = []
+    for fs in stats:
+        v = (
+            fs.get("magnitude_mean_px_sec_norm")
+            if "magnitude_mean_px_sec_norm" in fs
+            else fs.get("magnitude_mean_px_sec", fs.get("magnitude_mean", 0.0))
+        )
+        curve.append(float(v))
+
+    if not curve:
+        return None
+
+    return np.asarray(curve, dtype=np.float32)
+
+
+def _load_core_clip_embeddings(rs_path: Optional[str]) -> Optional[np.ndarray]:
+    """
+    Пытается загрузить CLIP‑эмбеддинги из core_clip провайдера.
+
+    Ожидается файл:
+    <rs_path>/core_clip/embeddings.npz
+    """
+    if not rs_path:
+        return None
+
+    core_path = os.path.join(rs_path, "core_clip", "embeddings.npz")
+    if not os.path.isfile(core_path):
+        return None
+
+    try:
+        data = np.load(core_path)
+        emb = data.get("frame_embeddings")
+        if emb is None:
+            return None
+        return np.asarray(emb, dtype=np.float32)
+    except Exception:
+        return None
+
 
 class VideoPacingPipelineVisualOptimized:
-    def __init__(self, frame_manager, frame_indices, clip_model_name="ViT-B/32", batch_size=32, downscale_factor=0.25):
+    def __init__(
+        self,
+        frame_manager,
+        frame_indices,
+        clip_model_name: str = "ViT-B/32",
+        batch_size: int = 32,
+        downscale_factor: float = 0.25,
+        min_shot_length_seconds: float = 0.15,
+        rs_path: Optional[str] = None,
+    ):
         """
         batch_size: батч для CLIP
         downscale_factor: для Optical Flow и color/lighting features
         """
-        self.batch_size = batch_size
-        self.downscale_factor = downscale_factor
+        self.batch_size = int(batch_size)
+        self.downscale_factor = float(downscale_factor)
 
         # Загружаем кадры через FrameManager
         self.frame_manager = frame_manager
         self.frame_indices = frame_indices
         self.total_frames = len(frame_indices)
-        self.fps = self.frame_manager.fps
+        self.fps = float(getattr(self.frame_manager, "fps", 30.0) or 30.0)
+        self.video_length_seconds = self.total_frames / self.fps if self.fps > 0 else 0.0
+        self.min_shot_length_seconds = float(min_shot_length_seconds)
+        self.rs_path = rs_path
 
-        # CLIP модель
-        self.clip_model, _ = clip.load(clip_model_name, device=device)
-        self.clip_model.eval()
+        # CLIP модель удалена - используем только core_clip
 
         # Определяем шоты и сцены
-        self.shot_boundaries = self._detect_shots()
-        self.scene_boundaries = self.shot_boundaries  # для упрощения
+        self.shot_boundaries = self._detect_shots_with_merging()
+        # Пока сцены отождествляем с шотами (alias), см. описание в FEATURES_DESCRIPTION
+        self.scene_boundaries = self.shot_boundaries
 
     def _get_resize_frame(self, idx):
-        return cv2.resize(self.frame_manager.get(idx), (0, 0), fx=self.downscale_factor, fy=self.downscale_factor) 
+        return cv2.resize(
+            self.frame_manager.get(idx),
+            (0, 0),
+            fx=self.downscale_factor,
+            fy=self.downscale_factor,
+        )
 
     # -------------------------
     # Shot Detection with SSIM
@@ -60,83 +160,364 @@ class VideoPacingPipelineVisualOptimized:
             win_size=win_size
         )
 
-    def _detect_shots(self) -> List[int]:
+    def _detect_shots_with_merging(self) -> List[int]:
+        """
+        Детекция шотов по комбинации SSIM + цвет/градиенты/яркость с последующим
+        объединением слишком коротких шотов.
+        """
+        if not self.frame_indices:
+            return [0]
+
         shot_indices = [0]
-        prev_frame = self._get_resize_frame(0)
-        for idx in self.frame_indices:
+        prev_idx = self.frame_indices[0]
+        prev_frame = self._get_resize_frame(prev_idx)
+        prev_gray = cv2.cvtColor(prev_frame, cv2.COLOR_RGB2GRAY)
+
+        # предвычислим гистограмму и границы
+        prev_hsv = cv2.cvtColor(prev_frame, cv2.COLOR_RGB2HSV)
+        prev_v = float(np.mean(prev_hsv[:, :, 2]))
+        prev_hist = cv2.calcHist([prev_gray], [0], None, [32], [0, 256])
+        prev_hist = cv2.normalize(prev_hist, None).flatten()
+        prev_edges = cv2.Canny(prev_gray, 50, 150)
+
+        for idx in self.frame_indices[1:]:
             curr_frame = self._get_resize_frame(idx)
-            score = self._safe_ssim(prev_frame, curr_frame)
-            if score < 0.95:  # threshold for hard cut
+            curr_gray = cv2.cvtColor(curr_frame, cv2.COLOR_RGB2GRAY)
+            curr_hsv = cv2.cvtColor(curr_frame, cv2.COLOR_RGB2HSV)
+            curr_v = float(np.mean(curr_hsv[:, :, 2]))
+
+            # 1) SSIM
+            ssim_score = self._safe_ssim(prev_frame, curr_frame)
+
+            # 2) Цветовая гистограмма (Chi-squared)
+            curr_hist = cv2.calcHist([curr_gray], [0], None, [32], [0, 256])
+            curr_hist = cv2.normalize(curr_hist, None).flatten()
+            chi_sq = 0.5 * np.sum(
+                ((prev_hist - curr_hist) ** 2) / (prev_hist + curr_hist + 1e-6)
+            )
+
+            # 3) Изменение границ (edge change ratio)
+            curr_edges = cv2.Canny(curr_gray, 50, 150)
+            edge_diff = np.mean(cv2.absdiff(prev_edges, curr_edges) > 0)
+
+            # 4) Изменение яркости
+            v_diff = abs(curr_v - prev_v)
+
+            # бинарные детекторы
+            ssim_cut = ssim_score < 0.93
+            hist_cut = chi_sq > 0.3
+            edge_cut = edge_diff > 0.25 or v_diff > 15.0
+
+            strong_hist = chi_sq > 0.6
+            strong_edge = edge_diff > 0.5 or v_diff > 30.0
+
+            detectors = [ssim_cut, hist_cut, edge_cut]
+            if sum(detectors) >= 2 or strong_hist or strong_edge:
                 shot_indices.append(idx)
-                prev_frame = curr_frame
-        return shot_indices
+
+            prev_frame = curr_frame
+            prev_gray = curr_gray
+            prev_hsv = curr_hsv
+            prev_v = curr_v
+            prev_hist = curr_hist
+            prev_edges = curr_edges
+
+        # Объединяем слишком короткие шоты
+        if len(shot_indices) <= 1:
+            return [0]
+
+        min_len_frames = max(int(self.min_shot_length_seconds * self.fps), 1)
+        # shot boundaries в кадрах: индексы в frame_indices
+        boundaries = sorted(set(shot_indices))
+        merged = [boundaries[0]]
+        last_start = boundaries[0]
+        for b in boundaries[1:]:
+            dur = b - last_start
+            if dur < min_len_frames:
+                # не открываем новый шот, просто сливаем
+                continue
+            merged.append(b)
+            last_start = b
+
+        if not merged:
+            merged = [0]
+        return merged
 
     # -------------------------
     # Shot Features
     # -------------------------
     def extract_shot_features(self) -> Dict:
-        durations = np.diff([0] + self.shot_boundaries + [self.total_frames])
+        # длительности в кадрах
+        shot_frame_boundaries = [0] + self.shot_boundaries + [self.total_frames]
+        durations_frames = np.diff(shot_frame_boundaries).astype(np.float32)
+        if durations_frames.size == 0:
+            return {}
+
+        durations_sec = durations_frames / self.fps
+
+        # базовые статистики
+        mean_dur = float(np.mean(durations_sec))
+        med_dur = float(np.median(durations_sec))
+        min_dur = float(np.min(durations_sec))
+        max_dur = float(np.max(durations_sec))
+        std_dur = float(np.std(durations_sec))
+
+        hist_counts, _ = np.histogram(durations_sec, bins=20)
+        dur_entropy = float(entropy(hist_counts + 1e-9))
+
+        # gini
+        gini = gini_coefficient(durations_sec)
+
+        # нормализация длительности на длину видео
+        norm_mean = float(mean_dur / max(self.video_length_seconds, 1e-6))
+
+        # short_shot_fraction (<0.5 s)
+        short_threshold = 0.5
+        short_shot_fraction = float(
+            np.mean(durations_sec < short_threshold) if durations_sec.size > 0 else 0.0
+        )
+
+        # quick_cut_burst_count: >=3 cut за 1 секунду (по временным индексам шотов)
+        cut_times = np.array(self.shot_boundaries, dtype=np.float32) / self.fps
+        quick_cut_burst_count = 0
+        if cut_times.size >= 3:
+            i = 0
+            while i < len(cut_times):
+                j = i + 1
+                while j < len(cut_times) and cut_times[j] - cut_times[i] <= 1.0:
+                    j += 1
+                if j - i >= 3:
+                    quick_cut_burst_count += 1
+                i += 1
+
+        # shot length histogram bins (very_short, short, medium, long, very_long)
+        bins_sec = np.array([0.0, 0.3, 0.7, 1.5, 3.0, np.inf], dtype=np.float32)
+        hist_counts_5, _ = np.histogram(durations_sec, bins=bins_sec)
+        total_shots = float(hist_counts_5.sum()) if hist_counts_5.sum() > 0 else 1.0
+        hist_fracs = (hist_counts_5 / total_shots).tolist()
+
+        # tempo_entropy: энтропия распределения shot durations (по 5 бинам)
+        tempo_entropy_val = float(entropy(hist_counts_5 + 1e-9))
+
+        # cuts per 10 seconds (максимум и медиана скользящего окна)
+        window = 10.0
+        if cut_times.size > 0 and self.video_length_seconds > 0:
+            t_edges = np.arange(0.0, self.video_length_seconds + window, window)
+            cuts_per_window, _ = np.histogram(cut_times, bins=t_edges)
+            cuts_per_10s_series = cuts_per_window / window
+            cuts_per_10s_max = float(cuts_per_10s_series.max())
+            cuts_per_10s_median = float(np.median(cuts_per_10s_series))
+            cuts_per_10s_global = float(cuts_per_window.sum() / max(self.video_length_seconds / window, 1e-6))
+        else:
+            cuts_per_10s_series = np.array([0.0], dtype=np.float32)
+            cuts_per_10s_max = 0.0
+            cuts_per_10s_median = 0.0
+            cuts_per_10s_global = 0.0
+
+        # cut_density_map по 8 бинам времени
+        if cut_times.size > 0 and self.video_length_seconds > 0:
+            bins8 = np.linspace(0.0, self.video_length_seconds, 9)
+            cuts8, _ = np.histogram(cut_times, bins=bins8)
+            cut_density_map = (cuts8 / max(self.video_length_seconds / 8.0, 1e-6)).tolist()
+        else:
+            cut_density_map = [0.0] * 8
+
         return {
-            "shot_duration_mean": float(np.mean(durations)),
-            "shot_duration_median": float(np.median(durations)),
-            "shot_duration_min": float(np.min(durations)),
-            "shot_duration_max": float(np.max(durations)),
-            "shot_duration_std": float(np.std(durations)),
-            "shot_duration_entropy": float(entropy(np.histogram(durations, bins=20)[0])),
-            "cuts_per_10s": float(len(self.shot_boundaries) / (self.total_frames / self.fps / 10)),
-            "cuts_variance": float(np.var(durations)),
-            "longest_shot_duration": float(np.max(durations)),
-            "shortest_shot_duration": float(np.min(durations))
+            "shot_duration_mean": mean_dur,
+            "shot_duration_median": med_dur,
+            "shot_duration_min": min_dur,
+            "shot_duration_max": max_dur,
+            "shot_duration_std": std_dur,
+            "shot_duration_entropy": dur_entropy,
+            "shot_duration_mean_normalized": norm_mean,
+            "shot_length_gini": gini,
+            "cuts_per_10s": cuts_per_10s_global,
+            "cuts_per_10s_max": cuts_per_10s_max,
+            "cuts_per_10s_median": cuts_per_10s_median,
+            "cuts_variance": float(np.var(durations_sec)),
+            "short_shot_fraction": short_shot_fraction,
+            "quick_cut_burst_count": int(quick_cut_burst_count),
+            "shot_length_histogram_5bins": hist_fracs,
+            "tempo_entropy": tempo_entropy_val,
+            "cut_density_map_8bins": cut_density_map,
         }
 
     def extract_pace_curve(self) -> Dict:
-        durations = np.diff([0] + self.shot_boundaries + [self.total_frames])
-        curve_slope = np.polyfit(np.arange(len(durations)), durations, 1)[0]
-        peaks = ((durations[1:-1] > durations[:-2]) & (durations[1:-1] > durations[2:])).sum()
-        autocorr = np.correlate(durations - np.mean(durations), durations - np.mean(durations), mode="full")
-        autocorr /= autocorr.max()
-        period = np.argmax(autocorr[len(autocorr)//2+1:]) + 1
+        shot_frame_boundaries = [0] + self.shot_boundaries + [self.total_frames]
+        durations_frames = np.diff(shot_frame_boundaries).astype(np.float32)
+        if durations_frames.size == 0:
+            return {}
+        durations_sec = durations_frames / self.fps
+
+        x = np.arange(len(durations_sec), dtype=np.float32)
+        if len(durations_sec) >= 2:
+            # простая регрессия (псевдо-робастность достигается за счёт клиппинга лог-длительностей)
+            y = np.log1p(durations_sec)
+            slope = float(np.polyfit(x, y, 1)[0])
+        else:
+            slope = 0.0
+        mean_dur = float(np.mean(durations_sec))
+        pace_curve_slope = slope
+        pace_curve_slope_normalized = float(slope * mean_dur) if mean_dur > 0 else 0.0
+
+        # пики (локальные максимумы длительностей = замедления)
+        if len(durations_sec) >= 3:
+            peaks, props = find_peaks(
+                durations_sec,
+                prominence=np.std(durations_sec) if np.std(durations_sec) > 0 else 0.0,
+                distance=1,
+            )
+            pace_curve_peaks = int(len(peaks))
+            peak_prom = props.get("prominences", np.zeros_like(peaks, dtype=np.float32))
+            pace_curve_peaks_mean_prominence = float(peak_prom.mean()) if peak_prom.size else 0.0
+            peak_positions = (peaks / max(len(durations_sec) - 1, 1)).astype(np.float32).tolist()
+        else:
+            pace_curve_peaks = 0
+            pace_curve_peaks_mean_prominence = 0.0
+            peak_positions = []
+
+        # периодичность: по автокорреляции, вернуть период в секундах и мощность
+        durations_centered = durations_sec - np.mean(durations_sec)
+        autocorr = np.correlate(durations_centered, durations_centered, mode="full")
+        mid = len(autocorr) // 2
+        autocorr = autocorr[mid + 1 :]
+        if autocorr.size > 0 and np.max(autocorr) > 0:
+            autocorr_norm = autocorr / np.max(autocorr)
+            best_lag = int(np.argmax(autocorr_norm) + 1)
+            dominant_period_sec = float(best_lag * np.mean(durations_sec))
+            power_at_period = float(autocorr_norm[best_lag - 1])
+        else:
+            dominant_period_sec = 0.0
+            power_at_period = 0.0
+
         return {
-            "pace_curve_mean": float(np.mean(durations)),
-            "pace_curve_slope": float(curve_slope),
-            "pace_curve_peaks": int(peaks),
-            "pace_curve_periodicity": int(period)
+            "pace_curve_mean": mean_dur,
+            "pace_curve_slope": pace_curve_slope,
+            "pace_curve_slope_normalized": pace_curve_slope_normalized,
+            "pace_curve_peaks": pace_curve_peaks,
+            "pace_curve_peaks_mean_prominence": pace_curve_peaks_mean_prominence,
+            "pace_curve_peak_positions": peak_positions,
+            "pace_curve_dominant_period_sec": dominant_period_sec,
+            "pace_curve_power_at_period": power_at_period,
         }
 
     def extract_scene_pacing(self) -> Dict:
-        durations = np.diff([0] + self.scene_boundaries + [self.total_frames])
+        durations = np.diff([0] + self.scene_boundaries + [self.total_frames]).astype(
+            np.float32
+        )
+        if durations.size == 0:
+            return {}
+        durations_sec = durations / self.fps
         return {
-            "scene_changes_per_minute": float(len(self.scene_boundaries) / ((self.total_frames/self.fps)/60)),
-            "average_scene_duration": float(np.mean(durations)),
-            "scene_duration_variance": float(np.var(durations))
+            # alias: в текущей версии сцены соответствуют шотам
+            "scene_changes_per_minute": float(
+                len(self.scene_boundaries) / max(self.video_length_seconds / 60.0, 1e-6)
+            ),
+            "average_scene_duration": float(np.mean(durations_sec)),
+            "scene_duration_variance": float(np.var(durations_sec)),
         }
 
     # -------------------------
     # Motion / Optical Flow
     # -------------------------
     def extract_motion_features(self) -> Dict:
-        flow_mags = []
-        dir_changes = []
-        prev_gray = cv2.cvtColor(self._get_resize_frame(0), cv2.COLOR_RGB2GRAY)
-        for idx in self.frame_indices[1:]:
-            frame = self._get_resize_frame(idx)
-            gray = cv2.cvtColor(frame, cv2.COLOR_RGB2GRAY)
-            flow = cv2.calcOpticalFlowFarneback(prev_gray, gray, None,
-                                                pyr_scale=0.5, levels=3, winsize=15,
-                                                iterations=3, poly_n=5, poly_sigma=1.2, flags=0)
-            mag, ang = cv2.cartToPolar(flow[...,0], flow[...,1])
-            flow_mags.append(np.mean(mag))
-            dir_changes.append(np.std(ang))
-            prev_gray = gray
-        flow_mags = np.array(flow_mags)
-        dir_changes = np.array(dir_changes)
+        """
+        Motion‑фичи. Используем только core_optical_flow (RAFT).
+        """
+        # Используем только core_optical_flow - обязательное требование
+        core_curve = _load_core_optical_flow_curve(self.rs_path)
+        
+        if core_curve is None or core_curve.size == 0:
+            raise RuntimeError(
+                f"video_pacing | extract_motion_features | core_optical_flow не найден. "
+                f"Убедитесь, что core провайдер optical_flow запущен перед этим модулем. "
+                f"rs_path: {self.rs_path}"
+            )
+        
+            # Дополнительное лёгкое сглаживание
+            if core_curve.size >= 3:
+                flow_mags_smooth = np.convolve(core_curve, np.ones(3) / 3.0, mode="same")
+            else:
+                flow_mags_smooth = core_curve
+        
+        angle_series = None  # core_optical_flow пока не предоставляет angle_series
+        
+        if flow_mags_smooth is None or flow_mags_smooth.size == 0:
+                return {}
+
+            flow_mags = np.asarray(flow_mags, dtype=np.float32)
+
+            # лёгкое сглаживание магнитиуд
+            if flow_mags.size >= 3:
+                flow_mags_smooth = np.convolve(flow_mags, np.ones(3) / 3.0, mode="same")
+            else:
+                flow_mags_smooth = flow_mags
+
+        # пер-кадровые метрики
+        mean_motion = float(np.mean(flow_mags_smooth))
+        median_motion = float(np.median(flow_mags_smooth))
+        var_motion = float(np.var(flow_mags_smooth))
+        perc90_motion = float(np.percentile(flow_mags_smooth, 90))
+
+        high_thr = float(np.percentile(flow_mags_smooth, 75))
+        share_high_frames = float(np.mean(flow_mags_smooth > high_thr))
+
+        # изменения направления: доля кадров с резким поворотом > X градусов
+        if angle_series is not None:
+            angle_series = np.asarray(angle_series, dtype=np.float32)
+            if angle_series.size >= 2:
+                # нормализуем углы к [-pi, pi]
+                diff_ang = np.diff(angle_series)
+                diff_ang = (diff_ang + np.pi) % (2 * np.pi) - np.pi
+                angle_deg = np.abs(diff_ang * 180.0 / np.pi)
+                direction_change_events = np.sum(angle_deg > 45.0)
+                time_seconds = max(len(self.frame_indices) / self.fps, 1e-6)
+                dir_changes_per_sec = float(direction_change_events / time_seconds)
+            else:
+                dir_changes_per_sec = 0.0
+        else:
+            # core_optical_flow пока не даёт углы, поэтому ставим 0.0
+            dir_changes_per_sec = 0.0
+
+        # пер-шотовые motion-агрегаты и корреляция с длиной шота
+        shot_frame_boundaries = [0] + self.shot_boundaries + [self.total_frames]
+        durations_frames = np.diff(shot_frame_boundaries).astype(np.float32)
+        durations_sec = durations_frames / self.fps
+
+        shot_motion_means = []
+        for i in range(len(shot_frame_boundaries) - 1):
+            start = shot_frame_boundaries[i]
+            end = shot_frame_boundaries[i + 1]
+            # flow_mags соответствует переходам между кадрами, сдвинуто на 1 относительно frame_indices
+            local = flow_mags_smooth[max(start - 1, 0) : max(end - 1, 0)]
+            if local.size > 0:
+                shot_motion_means.append(float(np.mean(local)))
+            else:
+                shot_motion_means.append(0.0)
+
+        motion_shot_corr = 0.0
+        if len(shot_motion_means) == len(durations_sec) and len(durations_sec) > 1:
+            x = np.asarray(durations_sec, dtype=np.float32)
+            y = np.asarray(shot_motion_means, dtype=np.float32)
+            if np.std(x) > 0 and np.std(y) > 0:
+                motion_shot_corr = float(np.corrcoef(x, y)[0, 1])
+
+        share_high_motion_shots = 0.0
+        if shot_motion_means:
+            thr_shot = float(np.percentile(shot_motion_means, 75))
+            share_high_motion_shots = float(
+                np.mean(np.asarray(shot_motion_means, dtype=np.float32) > thr_shot)
+            )
+
         return {
-            "mean_motion_speed_per_shot": float(np.mean(flow_mags)),
-            "motion_speed_median": float(np.median(flow_mags)),
-            "motion_speed_variance": float(np.var(flow_mags)),
-            "motion_speed_90perc": float(np.percentile(flow_mags, 90)),
-            "share_of_high_motion_frames": float(np.mean(flow_mags > np.percentile(flow_mags, 75))),
-            "optical_flow_direction_changes_per_second": float(np.mean(dir_changes)*self.fps)
+            "mean_motion_speed_per_shot": mean_motion,
+            "motion_speed_median": median_motion,
+            "motion_speed_variance": var_motion,
+            "motion_speed_90perc": perc90_motion,
+            "share_of_high_motion_frames": share_high_frames,
+            "share_of_high_motion_shots": share_high_motion_shots,
+            "motion_shot_corr": motion_shot_corr,
+            "optical_flow_direction_changes_per_second": dir_changes_per_sec,
         }
 
     def _get_clip_frame(self, idx):
@@ -148,21 +529,69 @@ class VideoPacingPipelineVisualOptimized:
     # CLIP embeddings (batched)
     # -------------------------
     def extract_content_change_rate(self) -> Dict:
-        embeddings = []
-        for i in range(0, self.total_frames, self.batch_size):
-            batch_frames = [self._get_clip_frame(idx) for idx in self.frame_indices[i:i+self.batch_size]]
-            batch_tensor = torch.tensor(np.stack(batch_frames)/255.0).permute(0,3,1,2).float().to(device)
-            with torch.no_grad():
-                emb = self.clip_model.encode_image(batch_tensor.half() if device=="cuda" else batch_tensor)
-                embeddings.append(emb.cpu().numpy())
-        embeddings = np.vstack(embeddings)
-        diff = np.linalg.norm(np.diff(embeddings, axis=0), axis=1)
-        diff_smooth = np.convolve(diff, np.ones(5)/5, mode='same')
+        # Используем только core_clip - обязательное требование
+        embeddings = _load_core_clip_embeddings(self.rs_path)
+
+        if embeddings is None:
+            raise RuntimeError(
+                f"video_pacing | extract_content_change_rate | core_clip embeddings не найдены. "
+                f"Убедитесь, что core провайдер core_clip запущен перед этим модулем. "
+                f"rs_path: {self.rs_path}"
+            )
+
+        # cosine distance между соседними эмбеддингами
+        # нормируем эмбеддинги
+        norms = np.linalg.norm(embeddings, axis=1, keepdims=True) + 1e-9
+        emb_norm = embeddings / norms
+        cos_sim = np.sum(emb_norm[1:] * emb_norm[:-1], axis=1)
+        cos_dist = 1.0 - cos_sim  # 0..2
+
+        # сглаживание
+        if cos_dist.size >= 7:
+            kernel_size = 5
+            kernel = np.ones(kernel_size, dtype=np.float32) / kernel_size
+            diff_smooth = np.convolve(cos_dist, kernel, mode="same")
+        else:
+            diff_smooth = cos_dist
+
+        mean_diff = float(np.mean(diff_smooth))
+        std_diff = float(np.std(diff_smooth))
+
+        thr75 = float(np.percentile(diff_smooth, 75))
+        high_change_ratio = float(np.mean(diff_smooth > thr75))
+
+        thr_jump = mean_diff + 2.0 * std_diff
+        scene_jumps = int(np.sum(diff_smooth > thr_jump))
+
+        # semantic_change_burst_count: количество кластеров >=3 high-change кадров в окне 5 секунд
+        high_mask = diff_smooth > thr_jump
+        if self.fps > 0:
+            window_frames = int(5.0 * self.fps)
+        else:
+            window_frames = 5
+        if window_frames < 3:
+            window_frames = 3
+
+        burst_count = 0
+        if high_mask.size > 0:
+            i = 0
+            while i < high_mask.size:
+                if not high_mask[i]:
+                    i += 1
+                    continue
+                j = i
+                while j < high_mask.size and j - i <= window_frames and high_mask[j]:
+                    j += 1
+                if j - i >= 3:
+                    burst_count += 1
+                i = j
+
         return {
-            "frame_embedding_diff_mean": float(np.mean(diff_smooth)),
-            "frame_embedding_diff_std": float(np.std(diff_smooth)),
-            "high_change_frames_ratio": float(np.mean(diff_smooth > np.percentile(diff_smooth, 75))),
-            "scene_embedding_jumps": int(np.sum(diff_smooth > 2*np.std(diff_smooth)))
+            "frame_embedding_diff_mean": mean_diff,
+            "frame_embedding_diff_std": std_diff,
+            "high_change_frames_ratio": high_change_ratio,
+            "scene_embedding_jumps": scene_jumps,
+            "semantic_change_burst_count": int(burst_count),
         }
 
     # -------------------------
@@ -178,38 +607,105 @@ class VideoPacingPipelineVisualOptimized:
             deltaE = np.sqrt(np.sum((lab1-lab2)**2, axis=2))
             hist_diffs.append(np.mean(deltaE))
             prev_frame = frame
-        hist_diffs = np.array(hist_diffs)
-        saturation = [np.mean(cv2.cvtColor(self._get_resize_frame(idx), cv2.COLOR_RGB2HSV)[:,:,1]) for idx in self.frame_indices]
-        brightness = [np.mean(cv2.cvtColor(self._get_resize_frame(idx), cv2.COLOR_RGB2HSV)[:,:,2]) for idx in self.frame_indices]
+        hist_diffs = np.array(hist_diffs, dtype=np.float32)
+
+        # локальный baseline (скользящее среднее) для дельты цвета
+        if hist_diffs.size >= 7:
+            kernel = np.ones(7, dtype=np.float32) / 7.0
+            baseline = np.convolve(hist_diffs, kernel, mode="same")
+        else:
+            baseline = np.full_like(hist_diffs, float(np.mean(hist_diffs)) if hist_diffs.size else 0.0)
+        hist_diffs_detrended = hist_diffs - baseline
+
+        saturation = [
+            np.mean(cv2.cvtColor(self._get_resize_frame(idx), cv2.COLOR_RGB2HSV)[:, :, 1])
+            for idx in self.frame_indices
+        ]
+        brightness = [
+            np.mean(cv2.cvtColor(self._get_resize_frame(idx), cv2.COLOR_RGB2HSV)[:, :, 2])
+            for idx in self.frame_indices
+        ]
+
+        # color_change_bursts по detrended DeltaE
+        if hist_diffs_detrended.size > 0:
+            thr_color = float(
+                np.mean(hist_diffs_detrended) + 2.0 * np.std(hist_diffs_detrended)
+            )
+            peaks, _ = find_peaks(hist_diffs_detrended, height=thr_color, distance=1)
+            color_change_bursts = int(len(peaks))
+        else:
+            color_change_bursts = 0
+
         return {
             "color_histogram_diff_mean": float(np.mean(hist_diffs)),
             "color_histogram_diff_std": float(np.std(hist_diffs)),
             "saturation_change_rate": float(np.std(saturation)),
-            "brightness_change_rate": float(np.std(brightness))
+            "brightness_change_rate": float(np.std(brightness)),
+            "color_change_bursts": color_change_bursts,
         }
 
     def extract_lighting_pacing(self) -> Dict:
-        lum = [np.mean(cv2.cvtColor(self._get_resize_frame(idx), cv2.COLOR_RGB2GRAY)) for idx in self.frame_indices]
+        lum = [
+            np.mean(cv2.cvtColor(self._get_resize_frame(idx), cv2.COLOR_RGB2GRAY))
+            for idx in self.frame_indices
+        ]
+        lum = np.asarray(lum, dtype=np.float32)
+        if lum.size < 2:
+            return {
+                "luminance_spikes_per_minute": 0.0,
+                "high_frequency_flash_ratio": 0.0,
+            }
+
         lum_diff = np.diff(lum)
-        lum_fft = np.fft.fft(lum_diff)
-        hf_ratio = np.sum(np.abs(lum_fft[len(lum_fft)//4:len(lum_fft)//2])) / (np.sum(np.abs(lum_fft))+1e-9)
+        std_lum = float(np.std(lum_diff))
+        # простой порог шума камеры
+        noise_threshold = max(5.0, std_lum)
+        spikes = np.abs(lum_diff) > noise_threshold
+        spikes_count = int(np.sum(spikes))
+
+        time_minutes = max(self.video_length_seconds / 60.0, 1e-6)
+        lum_spikes_per_minute = float(spikes_count / time_minutes)
+
+        # high frequency flash ratio через FFT
+        lum_fft = np.fft.fft(lum_diff - np.mean(lum_diff))
+        mag = np.abs(lum_fft)
+        nyq = len(mag) // 2
+        cutoff = int(0.25 * nyq)
+        hf_power = np.sum(mag[cutoff:nyq])
+        total_power = np.sum(mag[:nyq]) + 1e-9
+        hf_ratio = float(hf_power / total_power)
+
         return {
-            "luminance_spikes_per_minute": float(np.sum(np.abs(lum_diff) > np.std(lum_diff)) / (len(self.frame_indices)/self.fps*60)),
-            "high_frequency_flash_ratio": float(hf_ratio)
+            "luminance_spikes_per_minute": lum_spikes_per_minute,
+            "high_frequency_flash_ratio": hf_ratio,
         }
 
     # -------------------------
     # Structural Pacing
     # -------------------------
     def extract_structural_pacing(self) -> Dict:
-        durations = np.diff([0] + self.shot_boundaries + [self.total_frames])
+        shot_frame_boundaries = [0] + self.shot_boundaries + [self.total_frames]
+        durations_frames = np.diff(shot_frame_boundaries).astype(np.float32)
+        if durations_frames.size == 0:
+            return {}
+        durations_sec = durations_frames / self.fps
         n = len(durations)
-        quarter = max(n//4,1)
+        quarter = max(n // 4, 1)
+        intro = float(np.median(durations_sec[:quarter]))
+        main = float(np.median(durations_sec[quarter : 3 * quarter]))
+        climax = float(np.median(durations_sec[3 * quarter :]))
+        overall_med = float(np.median(durations_sec))
+
+        if overall_med > 0:
+            pacing_symmetry = float((climax - intro) / overall_med)
+        else:
+            pacing_symmetry = 0.0
+
         return {
-            "intro_speed": float(np.median(durations[:quarter])),
-            "main_speed": float(np.median(durations[quarter:3*quarter])),
-            "climax_speed": float(np.median(durations[3*quarter:])),
-            "pacing_symmetry": float(np.mean(np.diff(durations)))
+            "intro_speed": intro,
+            "main_speed": main,
+            "climax_speed": climax,
+            "pacing_symmetry": pacing_symmetry,
         }
 
     # -------------------------

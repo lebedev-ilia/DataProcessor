@@ -10,15 +10,40 @@
 """
 
 import cv2
+import json
+import os
+
 import numpy as np
-import mediapipe as mp
-from typing import Dict, List, Any
+from typing import Dict, List, Any, Optional
 from collections import deque
 
 name = "behavior_analyzer"
 
 from utils.logger import get_logger
+
 logger = get_logger(name)
+
+
+def _load_core_face_landmarks(rs_path: Optional[str]):
+    """
+    Пытается загрузить предрасчитанные Mediapipe‑landmarks из core_face_landmarks.
+    Формат: result_store/core_face_landmarks/landmarks.json
+    """
+    if not rs_path:
+        return None
+
+    core_path = os.path.join(rs_path, "core_face_landmarks", "landmarks.json")
+    if not os.path.isfile(core_path):
+        return None
+
+    try:
+        with open(core_path, "r", encoding="utf-8") as f:
+            data = json.load(f)
+        frames = data.get("frames") or []
+        return {int(f["frame_index"]): f for f in frames if "frame_index" in f}
+    except Exception as e:
+        logger.warning(f"{name} | _load_core_face_landmarks | error: {e}")
+        return None
 
 class HandGestureClassifier:
     """
@@ -604,34 +629,13 @@ class BehaviorAnalyzer:
         face_refine_landmarks: bool = True,
         face_min_detection_confidence: float = 0.5,
         face_min_tracking_confidence: float = 0.5,
+        # core‑данные
+        rs_path: Optional[str] = None,
     ):
-        self.mp_pose = mp.solutions.pose
-        self.mp_hands = mp.solutions.hands
-        self.mp_face_mesh = mp.solutions.face_mesh
-        
-        self.pose = self.mp_pose.Pose(
-            static_image_mode=pose_static_image_mode,
-            model_complexity=pose_model_complexity,
-            smooth_landmarks=pose_smooth_landmarks,
-            min_detection_confidence=pose_min_detection_confidence,
-            min_tracking_confidence=pose_min_tracking_confidence
-        )
-        
-        self.hands = self.mp_hands.Hands(
-            static_image_mode=hands_static_image_mode,
-            max_num_hands=hands_max_num_hands,
-            model_complexity=hands_model_complexity,
-            min_detection_confidence=hands_min_detection_confidence,
-            min_tracking_confidence=hands_min_tracking_confidence
-        )
-        
-        self.face_mesh = self.mp_face_mesh.FaceMesh(
-            static_image_mode=face_static_image_mode,
-            max_num_faces=face_max_num_faces,
-            refine_landmarks=face_refine_landmarks,
-            min_detection_confidence=face_min_detection_confidence,
-            min_tracking_confidence=face_min_tracking_confidence
-        )
+        self.rs_path = rs_path
+
+        # Mediapipe модели удалены - используем только core_face_landmarks
+        # Если core данные недоступны, модуль выбросит ошибку
         
         self.gesture_classifier = HandGestureClassifier()
         self.body_analyzer = BodyLanguageAnalyzer()
@@ -644,180 +648,73 @@ class BehaviorAnalyzer:
         self._prev_shoulder_angle = None
         self._prev_hands_center = None
     
-    def process_frame(self, frame: np.ndarray) -> Dict[str, Any]:
-        """
-        Обрабатывает один кадр и возвращает "сырые" непрерывные поведенческие сигналы.
-
-        Результат содержит:
-          - sequence_features: числовые каналы для VisualTransformer
-          - вспомогательные поля (hand_gestures, body_language_raw, и т.п.) для отладки.
-        """
-        rgb_frame = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
-        rgb_frame.flags.writeable = False
-        
-        h, w = frame.shape[:2]
-        
-        # Обработка
-        pose_results = self.pose.process(rgb_frame)
-        hands_results = self.hands.process(rgb_frame)
-        face_results = self.face_mesh.process(rgb_frame)
-        
-        results: Dict[str, Any] = {}
-        sequence_features: Dict[str, Any] = {}
-        
-        # -------------------------
-        # 1. РУКИ И ЖЕСТЫ
-        # -------------------------
-        hand_gestures = []
-        hand_landmarks_list = []
-        if hands_results.multi_hand_landmarks:
-            for hand_landmarks in hands_results.multi_hand_landmarks:
-                hand_landmarks_list.append(hand_landmarks)
-                gesture = self.gesture_classifier.classify_gesture_hard(
-                    hand_landmarks,
-                    pose_results.pose_landmarks
-                )
-                hand_gestures.append(gesture)
-        
-        results['hand_gestures'] = hand_gestures
-        num_hands = len(hand_landmarks_list)
-        results['num_hands'] = num_hands
-        sequence_features['num_hands'] = int(num_hands)
-        sequence_features['hands_visibility'] = 1 if num_hands > 0 else 0
-
-        # Мягкое представление жестов: усредняем по всем рукам
-        gesture_probs_accum = {g: 0.0 for g in self.gesture_classifier.gesture_types.keys()}
-        if hand_landmarks_list:
-            for hand_landmarks in hand_landmarks_list:
-                probs = self.gesture_classifier.classify_gesture_soft(
-                    hand_landmarks,
-                    pose_results.pose_landmarks
-                )
-                for g, p in probs.items():
-                    gesture_probs_accum[g] += float(p)
-            # усредняем по числу рук
-            for g in gesture_probs_accum.keys():
-                gesture_probs_accum[g] /= float(len(hand_landmarks_list))
-        # пишем как отдельные каналы
-        sequence_features['gesture_probs'] = gesture_probs_accum
-
-        # Hand motion energy: движение центра запястий между кадрами
-        current_hands_center = None
-        if hand_landmarks_list:
-            wrist_points = []
-            for hand_landmarks in hand_landmarks_list:
-                wrist = hand_landmarks.landmark[0]
-                wrist_points.append(np.array([wrist.x * w, wrist.y * h]))
-            current_hands_center = np.mean(wrist_points, axis=0)
-
-        if current_hands_center is not None and self._prev_hands_center is not None:
-            hand_motion_energy = float(np.linalg.norm(current_hands_center - self._prev_hands_center))
-        else:
-            hand_motion_energy = 0.0
-        sequence_features['hand_motion_energy'] = hand_motion_energy
-        self._prev_hands_center = current_hands_center
-        
-        # -------------------------
-        # 2. ТЕЛО / ПОЗА
-        # -------------------------
-        if pose_results.pose_landmarks:
-            body_language = self.body_analyzer.analyze_posture(
-                pose_results.pose_landmarks,
-                frame.shape
-            )
-            results['body_language'] = body_language  # raw debug
-
-            sequence_features['arm_openness'] = float(body_language.get('arm_openness', 0.0))
-            sequence_features['pose_expansion'] = float(body_language.get('pose_expansion', 0.0))
-            sequence_features['body_lean_angle'] = float(body_language.get('body_lean_angle', 0.0))
-            sequence_features['balance_offset'] = float(body_language.get('balance_offset', 0.0))
-
-            shoulder_angle = float(body_language.get('shoulder_angle', 0.0))
-            sequence_features['shoulder_angle'] = shoulder_angle
-
-            if self._prev_shoulder_angle is not None:
-                shoulder_angle_velocity = abs(shoulder_angle - self._prev_shoulder_angle)
-            else:
-                shoulder_angle_velocity = 0.0
-            sequence_features['shoulder_angle_velocity'] = float(shoulder_angle_velocity)
-            self._prev_shoulder_angle = shoulder_angle
-        
-        # -------------------------
-        # 3. ГОЛОВА / ВЗГЛЯД (proxy)
-        # -------------------------
-        head_position_x_norm = 0.0
-        head_position_y_norm = 0.0
-        head_motion_energy = 0.0
-        head_stability = 1.0
-
-        face_landmarks = None
-        if face_results.multi_face_landmarks:
-            face_landmarks = face_results.multi_face_landmarks[0]
-            # центр головы как центр bbox по всем точкам
-            xs = []
-            ys = []
-            for lm in face_landmarks.landmark:
-                xs.append(lm.x * w)
-                ys.append(lm.y * h)
-            if xs and ys:
-                cx = float(np.mean(xs))
-                cy = float(np.mean(ys))
-                head_position_x_norm = cx / max(float(w), 1.0)
-                head_position_y_norm = cy / max(float(h), 1.0)
-
-                current_head_center = np.array([cx, cy])
-                if self._prev_head_center is not None:
-                    head_motion_energy = float(np.linalg.norm(current_head_center - self._prev_head_center))
-                self._prev_head_center = current_head_center
-
-        sequence_features['head_position_x_norm'] = float(head_position_x_norm)
-        sequence_features['head_position_y_norm'] = float(head_position_y_norm)
-        sequence_features['head_motion_energy'] = float(head_motion_energy)
-        head_stability = float(1.0 / (head_motion_energy + 1e-6))
-        sequence_features['head_stability'] = head_stability
-
-        # -------------------------
-        # 4. РОТ / РЕЧЬ
-        # -------------------------
-        if face_landmarks is not None:
-            mouth_dynamics = self.speech_analyzer.analyze_mouth_dynamics(
-                face_landmarks,
-                frame.shape
-            )
-            results['speech_behavior'] = mouth_dynamics
-            sequence_features.update(mouth_dynamics)
-
-        # -------------------------
-        # 5. СТРЕСС: RAW СИГНАЛЫ
-        # -------------------------
-        stress = self.stress_analyzer.analyze_stress(
-            face_landmarks,
-            pose_results.pose_landmarks,
-            hand_landmarks_list,
-            frame.shape
-        )
-        results['stress'] = stress
-        sequence_features.update(stress)
-
-        # Записываем sequence_features
-        results['sequence_features'] = sequence_features
-        
-        return results
+    # Метод process_frame удалён - используем только core_face_landmarks через _process_with_results
     
     def process_video(self, frame_manager, frame_indices) -> Dict[str, Any]:
         """Обрабатывает видео"""
         import time
 
         fps = frame_manager.fps
+
+        # Загружаем core_face_landmarks - обязательное требование
+        core_landmarks = _load_core_face_landmarks(self.rs_path)
         
+        if not core_landmarks:
+            raise RuntimeError(
+                f"{name} | process_video | core_face_landmarks не найдены. "
+                f"Убедитесь, что core провайдер core_face_landmarks запущен перед этим модулем. "
+                f"rs_path: {self.rs_path}"
+            )
+
         all_results: Dict[int, Dict[str, Any]] = {}
         c = 0
         t = time.time()
-        
+
         for frame_idx in frame_indices:
             frame = frame_manager.get(frame_idx)
-            
-            result = self.process_frame(frame)
+
+            if int(frame_idx) not in core_landmarks:
+                logger.warning(f"{name} | process_video | Frame {frame_idx} отсутствует в core_face_landmarks, пропускаем")
+                continue
+
+                core_frame = core_landmarks[int(frame_idx)]
+
+                # Восстанавливаем упрощённые объекты, похожие на результаты Mediapipe
+                def _make_lms(points, with_visibility: bool = False):
+                    lm_list = []
+                    for p in points:
+                        x = float(p.get("x", 0.0))
+                        y = float(p.get("y", 0.0))
+                        z = float(p.get("z", 0.0))
+                        vis = float(p.get("visibility", 1.0)) if with_visibility else 1.0
+                        lm_list.append(type("LM", (), {"x": x, "y": y, "z": z, "visibility": vis}))
+                    return lm_list
+
+                pose_lms = None
+                if "pose_landmarks" in core_frame:
+                    pose_lms = _make_lms(core_frame["pose_landmarks"], with_visibility=True)
+
+                hands_lms = []
+                for hand in core_frame.get("hands_landmarks", []):
+                    hands_lms.append(type("HandsLM", (), {"landmark": _make_lms(hand)}))
+
+                face_lms = []
+                for face in core_frame.get("face_landmarks", []):
+                    face_lms.append(type("FaceLM", (), {"landmark": _make_lms(face)}))
+
+                pose_results = type("PoseRes", (), {
+                    "pose_landmarks": type("PoseLM", (), {"landmark": pose_lms}) if pose_lms else None
+                })
+                hands_results = type("HandsRes", (), {
+                    "multi_hand_landmarks": hands_lms or None
+                })
+                face_results = type("FaceRes", (), {
+                    "multi_face_landmarks": face_lms or None
+                })
+
+            # Используем готовые результаты из core
+                result = self._process_with_results(frame, pose_results, hands_results, face_results)
+
             timestamp = frame_idx / fps
             result['timestamp'] = float(timestamp)
             all_results[frame_idx] = result
@@ -847,6 +744,141 @@ class BehaviorAnalyzer:
             'frame_results': self.make_serializable(all_results),
             'aggregated': self.make_serializable(aggregated)
         }
+
+    def _process_with_results(
+        self,
+        frame: np.ndarray,
+        pose_results,
+        hands_results,
+        face_results,
+    ) -> Dict[str, Any]:
+        """
+        Обработка кадра на основе уже готовых результатов Mediapipe / core_face_landmarks.
+        """
+        h, w = frame.shape[:2]
+
+        results: Dict[str, Any] = {}
+        sequence_features: Dict[str, Any] = {}
+
+        # 1. Руки и жесты
+        hand_gestures = []
+        hand_landmarks_list = []
+        if hands_results and getattr(hands_results, "multi_hand_landmarks", None):
+            for hand_landmarks in hands_results.multi_hand_landmarks:
+                hand_landmarks_list.append(hand_landmarks)
+                gesture = self.gesture_classifier.classify_gesture_hard(
+                    hand_landmarks,
+                    pose_results.pose_landmarks if pose_results else None
+                )
+                hand_gestures.append(gesture)
+
+        results['hand_gestures'] = hand_gestures
+        num_hands = len(hand_landmarks_list)
+        results['num_hands'] = num_hands
+        sequence_features['num_hands'] = int(num_hands)
+        sequence_features['hands_visibility'] = 1 if num_hands > 0 else 0
+
+        gesture_probs_accum = {g: 0.0 for g in self.gesture_classifier.gesture_types.keys()}
+        if hand_landmarks_list:
+            for hand_landmarks in hand_landmarks_list:
+                probs = self.gesture_classifier.classify_gesture_soft(
+                    hand_landmarks,
+                    pose_results.pose_landmarks if pose_results else None
+                )
+                for g, p in probs.items():
+                    gesture_probs_accum[g] += float(p)
+            for g in gesture_probs_accum.keys():
+                gesture_probs_accum[g] /= float(len(hand_landmarks_list))
+        sequence_features['gesture_probs'] = gesture_probs_accum
+
+        current_hands_center = None
+        if hand_landmarks_list:
+            wrist_points = []
+            for hand_landmarks in hand_landmarks_list:
+                wrist = hand_landmarks.landmark[0]
+                wrist_points.append(np.array([wrist.x * w, wrist.y * h]))
+            current_hands_center = np.mean(wrist_points, axis=0)
+
+        if current_hands_center is not None and self._prev_hands_center is not None:
+            hand_motion_energy = float(np.linalg.norm(current_hands_center - self._prev_hands_center))
+        else:
+            hand_motion_energy = 0.0
+        sequence_features['hand_motion_energy'] = hand_motion_energy
+        self._prev_hands_center = current_hands_center
+
+        # 2. Тело / поза
+        if pose_results and getattr(pose_results, "pose_landmarks", None):
+            body_language = self.body_analyzer.analyze_posture(
+                pose_results.pose_landmarks,
+                frame.shape
+            )
+            results['body_language'] = body_language
+
+            sequence_features['arm_openness'] = float(body_language.get('arm_openness', 0.0))
+            sequence_features['pose_expansion'] = float(body_language.get('pose_expansion', 0.0))
+            sequence_features['body_lean_angle'] = float(body_language.get('body_lean_angle', 0.0))
+            sequence_features['balance_offset'] = float(body_language.get('balance_offset', 0.0))
+
+            shoulder_angle = float(body_language.get('shoulder_angle', 0.0))
+            sequence_features['shoulder_angle'] = shoulder_angle
+
+            if self._prev_shoulder_angle is not None:
+                shoulder_angle_velocity = abs(shoulder_angle - self._prev_shoulder_angle)
+            else:
+                shoulder_angle_velocity = 0.0
+            sequence_features['shoulder_angle_velocity'] = float(shoulder_angle_velocity)
+            self._prev_shoulder_angle = shoulder_angle
+
+        # 3. Голова / взгляд
+        head_position_x_norm = 0.0
+        head_position_y_norm = 0.0
+        head_motion_energy = 0.0
+
+        face_landmarks = None
+        if face_results and getattr(face_results, "multi_face_landmarks", None):
+            face_landmarks = face_results.multi_face_landmarks[0]
+            xs = []
+            ys = []
+            for lm in face_landmarks.landmark:
+                xs.append(lm.x * w)
+                ys.append(lm.y * h)
+            if xs and ys:
+                cx = float(np.mean(xs))
+                cy = float(np.mean(ys))
+                head_position_x_norm = cx / max(float(w), 1.0)
+                head_position_y_norm = cy / max(float(h), 1.0)
+
+                current_head_center = np.array([cx, cy])
+                if self._prev_head_center is not None:
+                    head_motion_energy = float(np.linalg.norm(current_head_center - self._prev_head_center))
+                self._prev_head_center = current_head_center
+
+        sequence_features['head_position_x_norm'] = float(head_position_x_norm)
+        sequence_features['head_position_y_norm'] = float(head_position_y_norm)
+        sequence_features['head_motion_energy'] = float(head_motion_energy)
+        sequence_features['head_stability'] = float(1.0 / (head_motion_energy + 1e-6))
+
+        # 4. Рот / речь
+        if face_landmarks is not None:
+            mouth_dynamics = self.speech_analyzer.analyze_mouth_dynamics(
+                face_landmarks,
+                frame.shape
+            )
+            results['speech_behavior'] = mouth_dynamics
+            sequence_features.update(mouth_dynamics)
+
+        # 5. Стресс
+        stress = self.stress_analyzer.analyze_stress(
+            face_landmarks,
+            pose_results.pose_landmarks if pose_results else None,
+            hand_landmarks_list,
+            frame.shape
+        )
+        results['stress'] = stress
+        sequence_features.update(stress)
+
+        results['sequence_features'] = sequence_features
+        return results
 
     def make_serializable(self, obj):
         import numpy as np

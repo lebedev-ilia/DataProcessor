@@ -1095,10 +1095,17 @@ class FlowStatisticsAnalyzer:
         # Сводные метрики
         summary_metrics = self._extract_summary_metrics(frame_stats_list, temporal_results)
         
+        # Извлекаем model_type из video_metadata
+        model_type = video_metadata.get('processing_parameters', {}).get('model', 'unknown')
+        model_name = f"RAFT_{model_type}" if model_type in ['small', 'large'] else f"RAFT_{model_type}"
+        
         return {
             'analysis_info': {
                 'version': '1.0.0',
-                'timestamp': datetime.now().isoformat(),
+                'created_at': datetime.now().isoformat(),
+                'timestamp': datetime.now().isoformat(),  # Для обратной совместимости
+                'model_type': model_type,
+                'model_name': model_name,
             },
             'processing_info': {
                 'total_frames_analyzed': len(frame_stats_list),

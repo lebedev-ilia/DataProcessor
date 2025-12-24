@@ -15,20 +15,8 @@ build/
 # Virtual environments
 .venv/
 .data_venv/
-.object_detection_venv/
-.scene_classification_venv/
-.detalize_face_modules_venv/
-.emotion_face_venv/
-.face_detection_venv/
-.behavioral_venv/
-.optical_flow_venv/
-.action_recognition_venv/
-.color_light_venv/
-.frames_composition_venv/
-.shot_quality_venv/
-.cut_detection_venv/
-.video_pacing_venv/
-.story_structure_venv/
+.vp_venv/
+.model_process_venv/
 venv/
 env/
 ENV/

@@ -40,14 +40,6 @@ try:
 except Exception:
     CLIP_AVAILABLE = False
 
-try:
-    import mediapipe as mp
-    MEDIAPIPE_AVAILABLE = True
-    mp_pose = mp.solutions.pose
-    mp_face = mp.solutions.face_mesh
-except Exception:
-    MEDIAPIPE_AVAILABLE = False
-
 name = "CutDetectionPipeline"
 
 import os

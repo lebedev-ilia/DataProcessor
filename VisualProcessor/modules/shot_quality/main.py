@@ -36,7 +36,7 @@ def main():
     
     args = parser.parse_args()
     
-    pipeline = ShotQualityPipeline(device=args.device)
+    pipeline = ShotQualityPipeline(device=args.device, rs_path=args.rs_path)
 
     rs = ResultsStore(args.rs_path)
 

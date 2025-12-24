@@ -8420,43 +8420,58 @@ flow = cv2.calcOpticalFlowFarneback(prev_gray, gray, None, pyr_scale=0.5, levels
 
 ```json
 {
-    "shot_duration_mean": 1.0,
-    "shot_duration_median": 5.0,
-    "shot_duration_min": -34.0,
-    "shot_duration_max": 5.0,
-    "shot_duration_std": 11.159993483217386,
-    "shot_duration_entropy": 0.6001660731596457,
-    "cuts_per_10s": 227.27272727272728,
-    "cuts_variance": 124.54545454545455,
-    "longest_shot_duration": 5.0,
-    "shortest_shot_duration": -34.0,
-    "pace_curve_mean": 1.0,
-    "pace_curve_slope": -1.5454545454545452,
-    "pace_curve_peaks": 0,
-    "pace_curve_periodicity": 10,
-    "scene_changes_per_minute": 1363.6363636363637,
-    "average_scene_duration": 1.0,
-    "scene_duration_variance": 124.54545454545455,
-    "mean_motion_speed_per_shot": 4.361773490905762,
-    "motion_speed_median": 3.4547228813171387,
-    "motion_speed_variance": 12.483506202697754,
-    "motion_speed_90perc": 8.83588695526123,
+    "shot_duration_mean": 0.85,
+    "shot_duration_median": 0.7,
+    "shot_duration_min": 0.12,
+    "shot_duration_max": 3.5,
+    "shot_duration_std": 0.6,
+    "shot_duration_entropy": 1.2,
+    "shot_duration_mean_normalized": 0.18,
+    "shot_length_gini": 0.42,
+    "cuts_per_10s": 3.2,
+    "cuts_per_10s_max": 7.0,
+    "cuts_per_10s_median": 2.5,
+    "cuts_variance": 0.36,
+    "short_shot_fraction": 0.4,
+    "quick_cut_burst_count": 2,
+    "shot_length_histogram_5bins": [0.25, 0.35, 0.25, 0.1, 0.05],
+    "tempo_entropy": 1.35,
+    "cut_density_map_8bins": [0.5, 0.8, 0.3, 0.2, 0.1, 0.4, 0.6, 0.7],
+    "pace_curve_mean": 0.85,
+    "pace_curve_slope": -0.02,
+    "pace_curve_slope_normalized": -0.017,
+    "pace_curve_peaks": 3,
+    "pace_curve_peaks_mean_prominence": 0.4,
+    "pace_curve_peak_positions": [0.15, 0.5, 0.85],
+    "pace_curve_dominant_period_sec": 2.4,
+    "pace_curve_power_at_period": 0.62,
+    "scene_changes_per_minute": 14.0,
+    "average_scene_duration": 0.85,
+    "scene_duration_variance": 0.36,
+    "mean_motion_speed_per_shot": 4.36,
+    "motion_speed_median": 3.45,
+    "motion_speed_variance": 12.48,
+    "motion_speed_90perc": 8.83,
     "share_of_high_motion_frames": 0.3,
-    "optical_flow_direction_changes_per_second": 38.984718322753906,
-    "frame_embedding_diff_mean": 3.0031445312500002,
-    "frame_embedding_diff_std": 0.5831001971531512,
+    "share_of_high_motion_shots": 0.4,
+    "motion_shot_corr": -0.35,
+    "optical_flow_direction_changes_per_second": 2.1,
+    "frame_embedding_diff_mean": 0.3,
+    "frame_embedding_diff_std": 0.08,
     "high_change_frames_ratio": 0.3,
     "scene_embedding_jumps": 10,
-    "color_histogram_diff_mean": 14.647560011983845,
-    "color_histogram_diff_std": 14.473575861487438,
-    "saturation_change_rate": 18.82555224503436,
-    "brightness_change_rate": 16.600123659165646,
-    "luminance_spikes_per_minute": 0.03787878787878788,
-    "high_frequency_flash_ratio": 0.28328965790017435,
-    "intro_speed": 2.5,
-    "main_speed": 5.0,
-    "climax_speed": 5.0,
-    "pacing_symmetry": -3.4
+    "semantic_change_burst_count": 2,
+    "color_histogram_diff_mean": 14.64,
+    "color_histogram_diff_std": 14.47,
+    "saturation_change_rate": 18.82,
+    "brightness_change_rate": 16.6,
+    "color_change_bursts": 3,
+    "luminance_spikes_per_minute": 1.2,
+    "high_frequency_flash_ratio": 0.28,
+    "intro_speed": 0.9,
+    "main_speed": 0.8,
+    "climax_speed": 0.7,
+    "pacing_symmetry": -0.25
 }
 ```
 
@@ -8464,7 +8479,7 @@ flow = cv2.calcOpticalFlowFarneback(prev_gray, gray, None, pyr_scale=0.5, levels
 
 #### 1. Shot Features (Характеристики кадров)
 
-#### 1.1. - 1.9. shot_duration_mean, shot_duration_median, shot_duration_min, shot_duration_max, shot_duration_std, shot_duration_entropy, cuts_per_10s, cuts_variance, longest_shot_duration, shortest_shot_duration
+#### 1.1. - ... shot_duration_mean, shot_duration_median, shot_duration_min, shot_duration_max, shot_duration_std, shot_duration_entropy, shot_duration_mean_normalized, shot_length_gini, cuts_per_10s, cuts_per_10s_max, cuts_per_10s_median, cuts_variance, short_shot_fraction, quick_cut_burst_count, shot_length_histogram_5bins, tempo_entropy, cut_density_map_8bins
 
 ```py
 def _detect_shots(self) -> List[int]:
@@ -8496,7 +8511,7 @@ def extract_shot_features(self) -> Dict:
 
 #### 2. Pace Curve (Кривая темпа)
 
-#### 2.1. - 2.4. pace_curve_mean, pace_curve_slope, pace_curve_peaks, pace_curve_periodicity
+#### 2.1. - ... pace_curve_mean, pace_curve_slope, pace_curve_slope_normalized, pace_curve_peaks, pace_curve_peaks_mean_prominence, pace_curve_peak_positions, pace_curve_dominant_period_sec, pace_curve_power_at_period
 
 ```py
 def extract_pace_curve(self) -> Dict:
@@ -8687,21 +8702,27 @@ flow = cv2.calcOpticalFlowFarneback(prev_gray, gray, None, 0.5, 3, 15, 3, 5, 1.2
 {
     "number_of_story_segments": 5,
     "avg_story_segment_duration": 2.2,
+    "avg_story_segment_duration_normalized": 0.18,
     "abrupt_story_transition_count": 4,
     "narrative_continuity_score": 0.7054986040083917,
     "narrative_continuity_std": 0.0692671015474594,
     "hook_motion_intensity": 5.746213912963867,
     "hook_cut_rate": 0.2,
     "hook_motion_spikes": 1,
+    "hook_rhythm_score": 1.5,
     "hook_face_presence": 0.0,
     "hook_visual_surprise_score": 0.12894346546282595,
     "hook_visual_surprise_std": 0.09942302256606807,
-    "hook_brightness_spike": 5.148181520061726,
-    "hook_saturation_spike": 3.50595987654323,
+    "hook_brightness_spike": 1.1,
+    "hook_saturation_spike": 0.9,
     "climax_timestamp": 0,
+    "climax_position_normalized": 0.0,
     "climax_strength": 7.072592735290527,
+    "climax_strength_normalized": 1.9,
     "number_of_peaks": 1,
     "climax_duration": 5,
+    "time_from_hook_to_climax": 0.0,
+    "hook_to_avg_energy_ratio": 1.2,
     "story_energy_curve": [
         7.072592735290527,
         6.375296592712402,
@@ -8714,15 +8735,21 @@ flow = cv2.calcOpticalFlowFarneback(prev_gray, gray, None, 0.5, 3, 15, 3, 5, 1.2
         3.280890464782715,
         2.912097454071045
     ],
-    "number_of_speakers": 0,
+    "story_energy_curve_downsampled_128": [...],
+    "number_of_unique_identities": 0,
     "main_character_screen_time": 0.0,
     "speaker_switch_rate": 0.0,
     "face_presence_curve": [0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0],
+    "face_area_fraction_curve": [0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0],
+    "has_subtitles": true,
     "number_of_topics": 3,
     "avg_topic_duration": 1.0,
+    "avg_topic_duration_normalized": 0.33,
     "topic_shift_times": [0, 1],
     "topic_diversity": 1.0,
-    "semantic_coherence_score": 0
+    "topic_diversity_normalized": 1.58,
+    "semantic_coherence_score": 0.7,
+    "topic_coherence_std": 0.1
 }
 ```
 
@@ -8927,19 +8954,54 @@ reader = easyocr.Reader(['en', 'ru'], gpu=True)
 results = reader.readtext(frame)
 ```
 
+### Core‑интеграция:
+
+- **motion_peaks** — приоритетно из `core_optical_flow`  
+  (`result_store/optical_flow/statistical_analysis.json`, поле  
+  `statistics.frame_statistics[*].magnitude_mean_px_sec_norm`  
+  или `magnitude_mean_px_sec` / `magnitude_mean`); при отсутствии core‑слоя  
+  используется старый результат модуля `optical_flow` (`motion_intensity_curve`).  
+- **face_peaks** — пока считываются из `emotion_face`  
+  (`result_store/emotion_face/*.json`, поле `emotion_curve`);  
+  планируется перенос на провайдер поверх `core_face_landmarks`.  
+- **audio_peaks** — зарезервировано под будущий `core_audio_embeddings`  
+  (энергия/эмбеддинги аудио по кадрам), сейчас не используется.  
+
 ### Выход:
 
 ```json
 {
     "text_action_sync_score": 0.45,
     "text_motion_alignment": 0.52,
+    "text_motion_alignment_windowed": 0.61,
     "multimodal_attention_boost_score": 0.78,
+    "multimodal_attention_boost_position": 0.32,
     "text_on_screen_continuity": 2.3,
+    "text_on_screen_continuity_normalized": 0.18,
+    "text_on_screen_continuity_median": 1.9,
+    "text_on_screen_continuity_max": 5.4,
+    "text_on_screen_continuity_std": 0.7,
     "text_switch_rate": 0.15,
-    "cta_presence": 1,
+    "num_unique_texts": 12,
+    "time_to_first_text_sec": 0.8,
+    "time_to_first_text_position": 0.05,
+    "text_area_fraction": 0.12,
+    "cta_presence": 0.92,
     "cta_timestamp": 45.2,
+    "cta_first_timestamp": 30.1,
+    "cta_mean_timestamp": 45.2,
+    "cta_last_timestamp": 58.7,
+    "cta_first_position": 0.21,
+    "cta_mean_position": 0.32,
+    "cta_last_position": 0.41,
     "cta_strength": 0.65,
-    "text_emphasis_peak_flags": [120, 245, 380],
+    "persistent_cta_flag": true,
+    "text_emphasis_peak_flags": [2, 5, 9],
+    "text_emphasis_peak_prominence": [0.23, 0.31, 0.19],
+    "text_emphasis_peak_positions": [0.12, 0.35, 0.7],
+    "text_readability_score": 0.74,
+    "ocr_language_entropy": 0.45,
+    "text_movement_speed": 0.03,
     "metadata": {
         "total_frames": 900,
         "fps": 30,
@@ -8954,7 +9016,7 @@ results = reader.readtext(frame)
 #### 1. Text → Action / Motion Correlation
 
 #### 1.1. text_action_sync_score
-Средняя корреляция между появлением текста и пиками движения в видео. Вычисляется как среднее значение интенсивности движения в моменты появления текста.
+Робастная оценка синхронизации текста с движением, основанная на z-score энергии движения в окне вокруг появления текста и усечённом среднем по всем текстовым элементам.
 
 ```py
 text_action_scores = []
@@ -8967,15 +9029,21 @@ text_action_sync_score = np.mean(text_action_scores) if text_action_scores else 
 ```
 
 #### 1.2. text_motion_alignment
-Средняя оценка выравнивания текста с мультимодальными пиками (движение + лицо + аудио). Вычисляется как взвешенная комбинация пиков движения (40%), лица (30%) и аудио (30%).
+Средняя оценка мультимодального выравнивания текста (движение + лицо + аудио) в момент появления текста. Веса каналов задаются в пайплайне и нормализуются до суммы 1.0.
 
 ```py
 multimodal_score = 0.4*motion_peak_val + 0.3*face_peak_val + 0.3*audio_peak_val
 text_motion_alignment = np.mean(text_motion_align_scores)
 ```
 
-#### 1.3. multimodal_attention_boost_score
-Максимальная оценка мультимодального выравнивания текста. Показывает пиковый момент синхронизации.
+#### 1.3. text_motion_alignment_windowed
+Оконная версия text_motion_alignment — усреднение максимальных мультимодальных скорингов в окне \([t-w, t+w]\) вокруг появления текста.
+
+#### 1.4. multimodal_attention_boost_score
+Максимальная оценка мультимодального выравнивания текста по всем уникальным текстовым элементам.
+
+#### 1.5. multimodal_attention_boost_position
+Относительная позиция (0..1) текстового элемента, дающего максимум по `multimodal_attention_boost_score`.
 
 ```py
 multimodal_attention_boost_score = np.max(text_motion_align_scores) if text_motion_align_scores else 0
@@ -8984,24 +9052,25 @@ multimodal_attention_boost_score = np.max(text_motion_align_scores) if text_moti
 #### 2. Text Duration and Continuity
 
 #### 2.1. text_on_screen_continuity
-Средняя длительность отображения текста на экране в секундах.
+Средняя длительность отображения уникальных текстовых элементов в секундах (с учётом дедупликации по IoU+тексту).
 
-```py
-durations = [len(frames)/self.video_fps for frames in text_durations.values()]
-text_on_screen_continuity = np.mean(durations) if durations else 0
-```
+Дополнительно считаются:  
+- `text_on_screen_continuity_normalized` — средняя длительность, делённая на длину видео,  
+- `text_on_screen_continuity_median`, `text_on_screen_continuity_max`, `text_on_screen_continuity_std`.
 
 #### 2.2. text_switch_rate
-Частота смены текста на экране (количество уникальных текстов в секунду).
+Частота смены текста на экране — число уникальных текстовых элементов в секунду видео: `num_unique_texts / video_length_seconds`.
 
-```py
-text_switch_rate = len(text_durations)/(num_frames/self.video_fps + 1e-6) if num_frames > 0 else 0
-```
+Также возвращаются `num_unique_texts`, `time_to_first_text_sec`, `time_to_first_text_position` и `text_area_fraction` (средняя доля площади кадра с текстом).
 
 #### 3. Call-to-Action (CTA) Detection
 
 #### 3.1. - 3.3. cta_presence, cta_timestamp, cta_strength
-Детекция призывов к действию через ключевые слова: "subscribe", "follow", "like", "link in bio", "click", "watch".
+Детекция призывов к действию через комбинацию:
+- флагов `is_cta_candidate` из OCR,  
+- fuzzy-match по CTA-ключевым словам (EN/RU) и нормализованному тексту.  
+`cta_presence` — вероятность наличия CTA (0..1), `cta_timestamp` / `cta_mean_timestamp` — среднее время появления CTA, `cta_strength` — средний мультимодальный скор в CTA-моментах.  
+Дополнительно возвращаются `cta_first_timestamp` / `cta_last_timestamp` и их нормализованные версии, а также `persistent_cta_flag` для долгих CTA.
 
 ```py
 cta_keywords = ['subscribe', 'follow', 'like', 'link in bio', 'click', 'watch']
@@ -9019,12 +9088,7 @@ cta_strength = np.mean(cta_strengths) if cta_strengths else 0
 #### 4. Text Emphasis Peaks
 
 #### 4.1. text_emphasis_peak_flags
-Список индексов кадров с максимальным выделением текста (верхние 15% по мультимодальной оценке).
-
-```py
-threshold = np.percentile(text_motion_align_scores, 85) if text_motion_align_scores else 1.0
-text_emphasis_peak_flags = [i for i, s in enumerate(text_motion_align_scores) if s >= threshold]
-```
+Список индексов текстовых элементов, где мультимодальный текстовый скор образует пики (через `find_peaks`), а также их prominence и нормализованные позиции по видео.
 
 ## high_level_semantic
 
@@ -9637,8 +9701,13 @@ viral_pattern_score = overall_similarity   # В бою лучше обучать
 {
     "features": {
         "semantic_novelty_score": 0.75,
+        "semantic_novelty_max": 0.75,
+        "semantic_novelty_topk_mean": 0.68,
+        "semantic_novelty_topk_median": 0.70,
         "topic_novelty_score": 0.60,
         "concept_diversity_score": 0.85,
+        "concept_diversity_entropy": 0.85,
+        "concept_diversity_unique_norm": 0.42,
         "color_palette_novelty": 0.70,
         "lighting_style_novelty": 0.65,
         "shot_type_novelty": 0.55,
