@@ -1,11 +1,11 @@
 core_providers:
-    core_clip: true
-    core_face_landmarks: true
-    depth_midas: true
+    core_clip: false
+    core_face_landmarks: false
+    depth_midas: false
     object_detections: true
 
 modules:
-    object_detection: false
+    object_detection: true
     scene_classification: false
     face_detection: false
     detalize_face_modules: false
@@ -46,6 +46,16 @@ core_face_landmarks:
     face_mesh_min_tracking_confidence: 0.5
 
 object_detections:
+    model: "yolo11x.pt" # google/owlvit-base-patch32, google/owlvit-base-patch16, google/owlvit-large-patch14, google/owlv2-base-patch16, yolo11x.pt
+    model_family: null # owlv2, owlvit, null
+    batch_size: 16
+    use_queries: false
+    default_categories: null # "person,bus"
+    device: "cuda"
+    box_threshold: 0.6 # 0.3 для owl
+
+
+object_detection:
     model: "yolo11x.pt" # google/owlvit-base-patch32, google/owlvit-base-patch16, google/owlvit-large-patch14, google/owlv2-base-patch16, yolo11x.pt
     model_family: null # owlv2, owlvit, null
     batch_size: 16

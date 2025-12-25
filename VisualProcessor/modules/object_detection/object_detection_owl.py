@@ -29,24 +29,6 @@ from transformers import (
 )
 
 
-from utils.logger import get_logger
-logger = get_logger("ObjectDetectionModule")
-
-
-@dataclass
-class TrackedObject:
-    """Represents a tracked object across frames."""
-    track_id: int
-    label: str
-    first_frame: int
-    last_frame: int
-    frames: List[int] = field(default_factory=list)
-    bboxes: List[List[float]] = field(default_factory=list)
-    scores: List[float] = field(default_factory=list)
-    center_positions: List[Tuple[float, float]] = field(default_factory=list)
-    colors: Optional[List[Tuple[int, int, int]]] = None
-    semantic_tags: Optional[List[str]] = None
-
 
 class ObjectDetectionModule:
     """
@@ -167,76 +149,10 @@ class ObjectDetectionModule:
         x_max = max(0.0, min(x_max, width - 1.0))
         y_min = max(0.0, min(y_min, height - 1.0))
         y_max = max(0.0, min(y_max, height - 1.0))
-        # Ensure min < max
         if x_max <= x_min or y_max <= y_min:
-            # return degenerate box (handled by caller)
             return [0.0, 0.0, 0.0, 0.0]
         return [x_min, y_min, x_max, y_max]
 
-    def _extract_color_from_bbox(self, frame: np.ndarray, bbox: List[float], k: int = 3) -> Tuple[int, int, int]:
-        """
-        Extract dominant color from the BGR ROI.
-        Fallback to mean color if sklearn.cluster.KMeans not available.
-        """
-        x_min, y_min, x_max, y_max = [int(round(coord)) for coord in bbox]
-        x_min = max(0, x_min)
-        y_min = max(0, y_min)
-        x_max = min(frame.shape[1], x_max)
-        y_max = min(frame.shape[0], y_max)
-
-        if x_max <= x_min or y_max <= y_min:
-            return (128, 128, 128)
-
-        roi = frame[y_min:y_max, x_min:x_max]
-        if roi.size == 0:
-            return (128, 128, 128)
-
-        pixels = roi.reshape(-1, 3).astype(np.float32)
-
-        # # Try sklearn KMeans for better dominant color
-        # try:
-        #     from sklearn.cluster import KMeans
-        #     n_clusters = min(k, len(pixels))
-        #     if n_clusters <= 0:
-        #         mean_color = np.mean(pixels, axis=0).astype(int)
-        #         return tuple(int(c) for c in mean_color.tolist())
-        #     kmeans = KMeans(n_clusters=n_clusters, n_init=10, random_state=42)
-        #     kmeans.fit(pixels)
-        #     centers = kmeans.cluster_centers_.astype(int)
-        #     # choose the largest cluster center (first one is fine, but be explicit)
-        #     labels, counts = np.unique(kmeans.labels_, return_counts=True)
-        #     dominant_index = labels[np.argmax(counts)]
-        #     dominant_color = centers[dominant_index]
-        #     return (int(dominant_color[0]), int(dominant_color[1]), int(dominant_color[2]))
-        # except Exception:
-        #     # fallback to mean color (B, G, R)
-        mean_color = np.mean(pixels, axis=0).astype(int)
-        return (int(mean_color[0]), int(mean_color[1]), int(mean_color[2]))
-
-    def _detect_semantic_tags(self, detections: List[Dict[str, Any]], frame: np.ndarray) -> List[Dict[str, Any]]:
-        """Enrich detections with basic semantic tags using label and heuristics."""
-        for det in detections:
-            tags: List[str] = []
-            label_lower = str(det.get("label", "")).lower()
-
-            for semantic, keywords in self.semantic_queries.items():
-                if any(keyword in label_lower for keyword in keywords):
-                    tags.append(semantic)
-
-            # Heuristics examples
-            if any(w in label_lower for w in ["car", "vehicle", "motorcycle"]):
-                if det.get("score", 0.0) >= 0.75:
-                    tags.append("luxury")
-
-            if any(w in label_lower for w in ["knife", "gun", "weapon", "blade"]):
-                tags.append("danger")
-
-            if any(w in label_lower for w in ["cat", "dog", "puppy", "kitten", "teddy"]):
-                tags.append("cute")
-
-            det["semantic_tags"] = tags
-
-        return detections
 
     def _detect_objects_in_frame(
         self,

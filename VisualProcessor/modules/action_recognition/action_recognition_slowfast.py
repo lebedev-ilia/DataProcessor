@@ -1,453 +1,537 @@
 # action_recognition_slowfast.py
+"""
+Production-ready action recognition and analytics based on SlowFast (ResNet-50).
+
+Основные отличия от "простого" варианта:
+- интеграция с BaseModule для единообразия
+- более безопасная обработка ошибок и памяти
+- нормализация эмбеддингов выполняется на устройстве (GPU если доступен)
+- результаты сохраняются в детерминированном формате, сопровождаемые metadata
+- комментарии на русском
+"""
+
+import os, sys
+sys.path.append(os.path.dirname(os.path.dirname(os.path.dirname(__file__))))
 
 from typing import Dict, List, Any, Optional, Tuple
-import numpy as np
 from collections import defaultdict
+import random
+import json
+
+import numpy as np
+import cv2
+
 import torch
 import torch.nn as nn
-import cv2
+import torch.nn.functional as F
+
 from torchvision.models.video import slowfast_r50
 from sklearn.decomposition import PCA
 from sklearn.cluster import KMeans
 
+from modules.base_module import BaseModule
+from utils.frame_manager import FrameManager
+
 
 def entropy_of_prob(p: np.ndarray) -> float:
+    """Энтропия распределения вероятностей"""
     p = np.clip(p, 1e-12, 1.0)
     return float(-np.sum(p * np.log(p)))
 
-def longest_run_fraction(labels: List[int]) -> float:
-    if len(labels) == 0:
-        return 0.0
-    max_run = cur = 1
-    for a, b in zip(labels, labels[1:]):
-        cur = cur + 1 if a == b else 1
-        max_run = max(max_run, cur)
-    return max_run / max(1, len(labels))
 
 def cosine_similarity(a: np.ndarray, b: np.ndarray) -> float:
+    """Косинусное сходство"""
     a_norm = a / (np.linalg.norm(a) + 1e-6)
     b_norm = b / (np.linalg.norm(b) + 1e-6)
     return float(np.dot(a_norm, b_norm))
 
 
-class SlowFastActionRecognizer:
+def longest_run_fraction(labels: List[int]) -> float:
+    """Доля самой длинной непрерывной серии одинаковых кластеров"""
+    if not labels:
+        return 0.0
+    max_run = cur = 1
+    for a, b in zip(labels, labels[1:]):
+        cur = cur + 1 if a == b else 1
+        max_run = max(max_run, cur)
+    return max_run / len(labels)
+
+
+class SlowFastActionRecognizer(BaseModule):
+    """
+    Production-реализация анализатора действий на основе SlowFast.
+    
+    Наследуется от BaseModule для единообразия с другими модулями.
+    """
+
     def __init__(
         self,
-        frame_manager,
-        model_name: Optional[str] = None,
-        clip_len: int = 32,
+        rs_path: Optional[str] = None,
+        clip_len: int = 16,
         stride: Optional[int] = None,
-        batch_size: int = 4,
-        device: Optional[str] = None,
+        batch_size: int = 8,
         embedding_dim: int = 256,
+        device: Optional[str] = None,
+        seed: Optional[int] = 42,
+        **kwargs: Any
     ):
-        self.fm = frame_manager
-        self.clip_len = clip_len
-        self.stride = stride or max(1, clip_len // 2)
-        self.batch_size = batch_size
+        """
+        Инициализация SlowFastActionRecognizer.
+        
+        Args:
+            rs_path: Путь к хранилищу результатов
+            clip_len: Длина клипа в кадрах
+            stride: Шаг для создания клипов (по умолчанию clip_len // 2)
+            batch_size: Размер батча для inference
+            embedding_dim: Размерность эмбеддингов
+            device: Устройство для обработки (cuda/cpu)
+            seed: Seed для детерминированности
+            **kwargs: Дополнительные параметры для BaseModule
+        """
+        super().__init__(rs_path=rs_path, **kwargs)
+        
+        # параметры
+        self.clip_len = int(clip_len)
+        self.stride = stride or max(1, self.clip_len // 2)
+        self.batch_size = int(batch_size)
+        self.embedding_dim = int(embedding_dim)
         self.device = device or ("cuda" if torch.cuda.is_available() else "cpu")
-        self.embedding_dim = embedding_dim
+        self.seed = seed
 
-        model_full = slowfast_r50(pretrained=True)
-        self.model = model_full.to(self.device)
-        self.model.eval()
-        
+        # детерминированность по умолчанию (если задан seed)
+        if seed is not None:
+            np.random.seed(seed)
+            random.seed(seed)
+            torch.manual_seed(seed)
+            if torch.cuda.is_available():
+                torch.cuda.manual_seed_all(seed)
+
+        # Модель будет загружена в _do_initialize()
+        self.model: Optional[torch.nn.Module] = None
+        self.embedding_proj: Optional[torch.nn.Module] = None
         self.raw_embedding_dim = 2048
-        
-        self.embedding_proj = nn.Linear(self.raw_embedding_dim, embedding_dim).to(self.device)
 
+        # нормализация входа (ImageNet-like)
+        self.mean = np.array([0.45, 0.45, 0.45], dtype=np.float32)
+        self.std = np.array([0.225, 0.225, 0.225], dtype=np.float32)
+    
+    def _do_initialize(self) -> None:
+        """Инициализация модели SlowFast."""
+        self.logger.info("Инициализация SlowFast R50 (pretrained=True)")
+
+        # загружаем модель
+        model = slowfast_r50(pretrained=True)
+        self.model = model.to(self.device).eval()
+
+        # проекция в компактное пространство (инициализация)
+        self.embedding_proj = nn.Linear(self.raw_embedding_dim, self.embedding_dim).to(self.device)
         nn.init.xavier_uniform_(self.embedding_proj.weight)
         nn.init.zeros_(self.embedding_proj.bias)
         self.embedding_proj.eval()
-        
-        self.features_cache = None
 
-        self.mean = np.array([0.45, 0.45, 0.45])
-        self.std = np.array([0.225, 0.225, 0.225])
+        self.logger.info(
+            f"SlowFastActionRecognizer готов | clip_len={self.clip_len} stride={self.stride} "
+            f"batch_size={self.batch_size} embedding_dim={self.embedding_dim} device={self.device}"
+        )
 
-
-    def _load_frames(self, indices: List[int]):
-        frames = []
-        
+    def _load_frames(self, frame_manager: FrameManager, indices: List[int]) -> List[np.ndarray]:
+        """Загружает и нормализует кадры как RGB uint8 HxWx3"""
+        frames: List[np.ndarray] = []
         for idx in indices:
-            im = self.fm.get(idx)
+            im = frame_manager.get(idx)
+            if im is None:
+                raise ValueError(f"FrameManager.get({idx}) вернул None")
             if im.ndim == 2:
                 im = np.stack([im] * 3, axis=-1)
             if im.shape[-1] == 4:
                 im = im[..., :3]
             frames.append(im.astype(np.uint8))
-        
         return frames
 
+    def _make_clips(self, frames: List[np.ndarray]) -> List[List[np.ndarray]]:
+        """Разбивает последовательность кадров на перекрывающиеся клипы length=clip_len, stride=self.stride"""
+        if len(frames) == 0:
+            return []
 
-    def _make_clips(self, frames: List[np.ndarray]):
-        n = len(frames)
-        if n < self.clip_len:
-            frames = frames + [frames[-1]]*(self.clip_len - n)
-            n = len(frames)
+        if len(frames) < self.clip_len:
+            frames = frames + [frames[-1]] * (self.clip_len - len(frames))
 
-        clips = []
-
-        for s in range(0, n - self.clip_len + 1, self.stride):
-            clips.append(frames[s:s+self.clip_len])
+        clips: List[List[np.ndarray]] = []
+        for start in range(0, len(frames) - self.clip_len + 1, self.stride):
+            clips.append(frames[start:start + self.clip_len])
 
         if not clips:
             clips.append(frames[-self.clip_len:])
 
         return clips
 
-
     def _preprocess_clip(self, clip: List[np.ndarray]) -> torch.Tensor:
-        processed_frames = []
+        """
+        Преобразует clip (List[HxWx3]) в Tensor [C, T, H, W] float32 на CPU.
+        Приводит кадры к 224x224, выполняет нормализацию.
+        """
+        processed = []
         for frame in clip:
-            frame_resized = cv2.resize(frame, (224, 224))
+            # resize -> float32 -> normalize -> C,H,W
+            frame_resized = cv2.resize(frame, (224, 224), interpolation=cv2.INTER_LINEAR)
             frame_float = frame_resized.astype(np.float32) / 255.0
-            frame_normalized = (frame_float - self.mean) / self.std
-            frame_chw = np.transpose(frame_normalized, (2, 0, 1))
-            processed_frames.append(frame_chw)
-        
-        clip_tensor = np.stack(processed_frames, axis=1)
-        return torch.from_numpy(clip_tensor).float()
+            frame_norm = (frame_float - self.mean) / self.std
+            frame_chw = np.transpose(frame_norm, (2, 0, 1))
+            processed.append(frame_chw)
+        clip_arr = np.stack(processed, axis=1)  # C,T,H,W
+        return torch.from_numpy(clip_arr).float()
 
+    @staticmethod
+    def _prepare_slow_fast(batch: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor]:
+        """
+        batch: [B, C, T, H, W] -> возвращает slow и fast пути
+        Замечание: выбор индексов стабильный и детерминированный.
+        """
+        if batch.dim() != 5:
+            raise ValueError(f"Ожидался batch.dim()==5, получено {batch.dim()}")
+        B, C, T, H, W = batch.shape
+        # детерминированные индексы: берем примерно 8 и 16 сэмплов
+        slow_idx = list(range(0, T, max(1, T // 8)))
+        fast_idx = list(range(0, T, max(1, T // 16)))
+        slow = batch[:, :, slow_idx, :, :]
+        fast = batch[:, :, fast_idx, :, :]
+        return slow, fast
 
-    def _extract_embeddings(self, clips: List[List[np.ndarray]]) -> Tuple[List[np.ndarray], List[np.ndarray]]:
-        raw_embeddings_list = []
-        B = self.batch_size
-
-        for i in range(0, len(clips), B):
-            batch_clips = clips[i:i+B]
-
-            batch_tensors = []
-            for clip in batch_clips:
-                clip_tensor = self._preprocess_clip(clip)
-                batch_tensors.append(clip_tensor)
-            
-            batch = torch.stack(batch_tensors).to(self.device)
-            
-            with torch.no_grad():
-                T = batch.shape[2]
-                slow_indices = list(range(0, T, max(1, T // 8)))
-                fast_indices = list(range(0, T, max(1, T // 16)))
-                
-                slow_frames = batch[:, :, slow_indices, :, :] if len(slow_indices) > 0 else batch
-                fast_frames = batch[:, :, fast_indices, :, :] if len(fast_indices) > 0 else batch
-                
-                feat = self._extract_features_manual(slow_frames, fast_frames)
-                
-                if len(feat.shape) > 2:
-                    feat = feat.view(feat.shape[0], -1)
-                
-                if feat.shape[1] > self.raw_embedding_dim:
-                    feat = feat[:, :self.raw_embedding_dim]
-                elif feat.shape[1] < self.raw_embedding_dim:
-                    padding = torch.zeros(feat.shape[0], self.raw_embedding_dim - feat.shape[1], device=feat.device)
-                    feat = torch.cat([feat, padding], dim=1)
-                
-                feat_proj = self.embedding_proj(feat)
-                
-                raw_embeddings_list.extend(feat_proj.cpu().numpy())
-
-        raw_embeddings_arr = np.array(raw_embeddings_list)
-        
-        norms = np.linalg.norm(raw_embeddings_arr, axis=1, keepdims=True) + 1e-6
-        normed_embeddings_arr = raw_embeddings_arr / norms  # [num_clips, embedding_dim]
-        
-        return raw_embeddings_arr, normed_embeddings_arr
-    
-    def _extract_features_manual(self, slow_frames: torch.Tensor, fast_frames: torch.Tensor) -> torch.Tensor:
-        if hasattr(self.model, 'forward_features'):
-            try:
-                feat = self.model.forward_features((slow_frames, fast_frames))
-                if len(feat.shape) > 2:
-                    feat = feat.mean(dim=[-1, -2, -3]) if len(feat.shape) == 5 else feat.mean(dim=[-1, -2])
-                return feat
-            except:
-                pass
-        
+    def _extract_features(self, slow: torch.Tensor, fast: torch.Tensor) -> torch.Tensor:
+        """
+        Прогоняем через модель и приводим к [B, raw_embedding_dim].
+        В случае ошибки возвращаем нулевой тензор (предсказуемый fallback).
+        """
         try:
-            x_slow = self.model.s1(slow_frames)
-            x_slow = self.model.s1_fuse(x_slow)
-            x_slow = self.model.s2(x_slow)
-            x_slow = self.model.s2_fuse(x_slow)
-            x_slow = self.model.s3(x_slow)
-            x_slow = self.model.s3_fuse(x_slow)
-            x_slow = self.model.s4(x_slow)
-            x_slow = self.model.s4_fuse(x_slow)
-            x_slow = self.model.s5(x_slow)
-            
-            if len(x_slow.shape) == 5:
-                x_slow = x_slow.mean(dim=[-1, -2, -3])
-            elif len(x_slow.shape) == 4:
-                x_slow = x_slow.mean(dim=[-1, -2])
-            
-            if x_slow.shape[1] != self.raw_embedding_dim:
-                if x_slow.shape[1] > self.raw_embedding_dim:
-                    x_slow = x_slow[:, :self.raw_embedding_dim]
-                else:
-                    padding = torch.zeros(x_slow.shape[0], self.raw_embedding_dim - x_slow.shape[1], device=x_slow.device)
-                    x_slow = torch.cat([x_slow, padding], dim=1)
-            
-            return x_slow
-        except (AttributeError, RuntimeError) as e:
+            with torch.no_grad():
+                out = self.model((slow, fast))
+
+            # модель может вернуть tensor или tuple/list; пытаемся извлечь tensor
+            if torch.is_tensor(out):
+                feat = out
+            elif isinstance(out, (list, tuple)) and len(out) > 0 and torch.is_tensor(out[0]):
+                feat = out[0]
+            else:
+                raise RuntimeError("Неожиданный тип выхода модели: %s" % type(out))
+
+            # уменьшаем пространственно-временные размерности
+            if feat.dim() == 5:
+                # B, C, T, H, W -> усредняем по T,H,W -> B,C
+                feat = feat.mean(dim=[2, 3, 4])
+            elif feat.dim() == 4:
+                # B,C,H,W -> усредняем по H,W -> B,C
+                feat = feat.mean(dim=[2, 3])
+            elif feat.dim() == 3:
+                # B,C,T -> усредняем по T -> B,C
+                feat = feat.mean(dim=2)
+
+            feat = feat.view(feat.size(0), -1)  # B, D
+
+        except Exception:
+            self.logger.exception("Ошибка при извлечении признаков через SlowFast. Возвращаем нули как fallback.")
+            feat = torch.zeros((slow.size(0), self.raw_embedding_dim), device=self.device)
+
+        # выравнивание по целевому raw_embedding_dim
+        if feat.shape[1] > self.raw_embedding_dim:
+            feat = feat[:, : self.raw_embedding_dim]
+        elif feat.shape[1] < self.raw_embedding_dim:
+            pad = torch.zeros((feat.shape[0], self.raw_embedding_dim - feat.shape[1]), device=feat.device)
+            feat = torch.cat([feat, pad], dim=1)
+
+        return feat
+
+    def _extract_embeddings(self, clips: List[List[np.ndarray]]) -> np.ndarray:
+        """
+        Прогоняет все клипы батчами и возвращает np.ndarray эмбеддингов формы [N_clips, embedding_dim].
+        Если клипов нет — возвращает пустой массив shape (0, embedding_dim).
+        """
+        if not clips:
+            return np.zeros((0, self.embedding_dim), dtype=np.float32)
+
+        projected_all = []
+        total_clips = len(clips)
+        self.logger.info("Начинаем извлечение эмбеддингов: clips=%d batch_size=%d", total_clips, self.batch_size)
+
+        for start in range(0, total_clips, self.batch_size):
+            batch_clips = clips[start: start + self.batch_size]
+            # преобразуем каждый клип в тензор C,T,H,W на CPU
+            tensors_cpu = [self._preprocess_clip(c) for c in batch_clips]  # list of [C,T,H,W]
+            batch = torch.stack(tensors_cpu, dim=0).to(self.device)  # [B,C,T,H,W]
+
             try:
-                features = []
-                def hook(module, input, output):
-                    if len(output.shape) >= 2:
-                        if len(output.shape) == 5:
-                            feat = output.mean(dim=[-1, -2, -3])
-                        elif len(output.shape) == 4:
-                            feat = output.mean(dim=[-1, -2])
-                        else:
-                            feat = output
-                        features.append(feat)
-                
-                handle = self.model.s5.register_forward_hook(hook)
-                _ = self.model((slow_frames, fast_frames))
-                handle.remove()
-                
-                if features:
-                    feat = features[0]
-                    if feat.shape[1] != self.raw_embedding_dim:
-                        if feat.shape[1] > self.raw_embedding_dim:
-                            feat = feat[:, :self.raw_embedding_dim]
-                        else:
-                            padding = torch.zeros(feat.shape[0], self.raw_embedding_dim - feat.shape[1], device=feat.device)
-                            feat = torch.cat([feat, padding], dim=1)
-                    return feat
-            except:
-                pass
-            
-            return torch.randn(slow_frames.shape[0], self.raw_embedding_dim, device=self.device)
+                slow, fast = self._prepare_slow_fast(batch)
+            except Exception:
+                self.logger.exception("Некорректный batch shape при подготовке slow/fast. Пропускаем этот батч.")
+                # очищаем память и продолжаем
+                del batch
+                if torch.cuda.is_available():
+                    torch.cuda.empty_cache()
+                continue
 
+            feat = self._extract_features(slow, fast)  # [B, raw_dim]
 
-    def _extract_sequence_features(self, normed_embeddings: np.ndarray) -> Dict[str, np.ndarray]:
-        temporal_diffs = np.zeros(len(normed_embeddings))
-        if len(normed_embeddings) > 1:
-            for i in range(1, len(normed_embeddings)):
-                temporal_diffs[i] = 1.0 - cosine_similarity(
-                    normed_embeddings[i],
-                    normed_embeddings[i - 1],
-                )
-        
-        return {
-            'embedding_normed_256d': normed_embeddings,
-            'temporal_diff_normalized': temporal_diffs
-        }
+            # Проекция + нормализация на device
+            with torch.no_grad():
+                proj = self.embedding_proj(feat)  # [B, embedding_dim]
+                proj = F.normalize(proj, p=2, dim=1)
 
+            # переносим на CPU и сохраняем
+            projected_all.append(proj.cpu().numpy().astype(np.float32))
 
-    def _aggregate(self, raw_embeddings: np.ndarray, normed_embeddings: np.ndarray,
-                   clip_len: Optional[int] = None, 
-                   fps: Optional[float] = None) -> dict:
+            # освобождение
+            del batch, slow, fast, feat, proj
+            if torch.cuda.is_available():
+                torch.cuda.empty_cache()
 
-        clip_len = clip_len or self.clip_len
-        fps = fps or getattr(self.fm, 'fps', 30.0)
-        
-        embeddings_arr = raw_embeddings
-        
-        embedding_norms = np.linalg.norm(embeddings_arr, axis=1)
-        mean_embedding_norm = float(np.mean(embedding_norms))
-        std_embedding_norm = float(np.std(embedding_norms))
-        
-        mean_embedding_normed = np.mean(normed_embeddings, axis=0)
-        temporal_variance = float(np.mean([np.linalg.norm(e - mean_embedding_normed) for e in normed_embeddings]))
-        
-        if len(normed_embeddings) > 1:
-            temporal_jumps = [np.linalg.norm(normed_embeddings[i] - normed_embeddings[i-1]) 
-                            for i in range(1, len(normed_embeddings))]
-            max_temporal_jump = float(np.max(temporal_jumps))
-        else:
-            max_temporal_jump = 0.0
-        
-        num_clips = len(normed_embeddings)
-        
-        if num_clips < 3:
-            labels = np.zeros(max(1, num_clips), dtype=int)
-            stability = 1.0
-            switch_rate_per_sec = 0.0
-            num_unique_actions = 1
-            dominant_action_ratio = 1.0
-        else:
-            n_pca_components = min(32, normed_embeddings.shape[1], num_clips - 1)
-            if n_pca_components > 0:
-                pca = PCA(n_components=n_pca_components)
-                embeddings_for_cluster = pca.fit_transform(normed_embeddings)
+            if (start // self.batch_size) % 10 == 0:
+                self.logger.debug("Processed %d/%d clips", min(start + self.batch_size, total_clips), total_clips)
+
+        if not projected_all:
+            return np.zeros((0, self.embedding_dim), dtype=np.float32)
+
+        embeddings = np.concatenate(projected_all, axis=0)
+        # safety: если размер не совпадает — обрезаем/паддим
+        if embeddings.shape[1] != self.embedding_dim:
+            if embeddings.shape[1] > self.embedding_dim:
+                embeddings = embeddings[:, : self.embedding_dim]
             else:
-                embeddings_for_cluster = normed_embeddings
-            
-            k = min(5, max(1, len(embeddings_for_cluster) // 2))
-            kmeans = KMeans(n_clusters=k, random_state=42, n_init=10)
-            labels = kmeans.fit_predict(embeddings_for_cluster)
-            stability = longest_run_fraction(labels.tolist())
-            
-            transitions = int(np.sum(labels[1:] != labels[:-1]))
-            total_time_sec = len(labels) * clip_len / fps
-            switch_rate_per_sec = transitions / max(1e-6, total_time_sec)
-        
-        if len(normed_embeddings) >= 2:
-            mid = len(normed_embeddings) // 2
-            early_embedding = np.mean(normed_embeddings[:mid], axis=0)
-            late_embedding = np.mean(normed_embeddings[mid:], axis=0)
-            cosine_sim = cosine_similarity(early_embedding, late_embedding)
-            early_late_embedding_shift = 1.0 - cosine_sim  # 0 = same, 1 = different
-        else:
-            early_late_embedding_shift = 0.0
-        
-        if len(normed_embeddings) > 1:
-            temporal_diffs = []
-            for i in range(1, len(normed_embeddings)):
-                diff = normed_embeddings[i] - normed_embeddings[i-1]
-                temporal_diffs.append(np.linalg.norm(diff))
-            
-            if len(temporal_diffs) > 1 and max(temporal_diffs) > 0:
-                temporal_diffs_norm = np.array(temporal_diffs) / (max(temporal_diffs) + 1e-6)
-                temporal_diffs_probs = temporal_diffs_norm / (temporal_diffs_norm.sum() + 1e-6)
-                motion_entropy_raw = entropy_of_prob(temporal_diffs_probs)
-                motion_entropy = float(
-                    motion_entropy_raw / (np.log(len(temporal_diffs) + 1e-6) + 1e-12)
-                )
-            else:
-                motion_entropy = 0.0
-        else:
-            motion_entropy = 0.0
-        
-        if num_clips >= 3:
-            num_unique_actions = int(len(np.unique(labels)))
-            unique, counts = np.unique(labels, return_counts=True)
-            dominant_action_ratio = float(np.max(counts) / len(labels))
-        else:
-            num_unique_actions = 1
-            dominant_action_ratio = 1.0
-        
-        if len(normed_embeddings) > 1:
-            cov_matrix = np.cov(normed_embeddings.T)
-            cov_matrix = cov_matrix + 1e-5 * np.eye(cov_matrix.shape[0])
-            eigenvalues = np.linalg.eigh(cov_matrix)[0]
-            eigenvalues = np.real(eigenvalues)
-            eigenvalues = np.abs(eigenvalues)
-            eigenvalues = eigenvalues[eigenvalues > 1e-6]
-            
-            if len(eigenvalues) > 0:
-                eigenvalues_norm = eigenvalues / (eigenvalues.sum() + 1e-6)
-                embedding_entropy = entropy_of_prob(eigenvalues_norm)
-            else:
-                embedding_entropy = 0.0
-        else:
-            embedding_entropy = 0.0
-        
-        features = {
-            "mean_embedding_norm_raw": mean_embedding_norm,
-            "std_embedding_norm_raw": std_embedding_norm,
-            "temporal_variance": temporal_variance,
-            "max_temporal_jump": max_temporal_jump,
-            
-            "stability": stability,
-            "switch_rate_per_sec": switch_rate_per_sec,
-            "early_late_embedding_shift": early_late_embedding_shift, 
-            
-            "motion_entropy": motion_entropy,
-            
-            "num_unique_actions": num_unique_actions,
-            "dominant_action_ratio": dominant_action_ratio,
-            "embedding_entropy": embedding_entropy,
-        }
-        
-        return features
+                pad = np.zeros((embeddings.shape[0], self.embedding_dim - embeddings.shape[1]), dtype=np.float32)
+                embeddings = np.concatenate([embeddings, pad], axis=1)
 
-    def _analyze_multi_person_actions(self, results_per_track: Dict[int, Dict[str, Any]]) -> Dict[str, Any]:
-        num_tracks = len(results_per_track)
-        
-        if num_tracks < 2:
+        return embeddings
+
+    def _aggregate(self, embeddings: np.ndarray) -> Dict[str, Any]:
+        """
+        Вычисляет метрики для последовательности эмбеддингов трека.
+        Возвращает словарь метрик (числа и статистика).
+        """
+        n = len(embeddings)
+        if n == 0:
+            # пустой трек — возвращаем нейтральные значения
             return {
-                'is_multi_person': False,
-                'num_persons': num_tracks,
-                'action_synchronization': 0.0
+                "mean_embedding_norm": 0.0,
+                "std_embedding_norm": 0.0,
+                "max_temporal_jump": 0.0,
+                "stability": 1.0,
+                "num_switches": 0,
+                "embedding_dim": self.embedding_dim,
             }
 
-        num_persons = min(num_tracks, 5)
-        
-        track_embeddings = []
-        for track_id, track_results in results_per_track.items():
-            if 'sequence_features' in track_results and 'embedding_normed_256d' in track_results['sequence_features']:
-                embeddings = np.array(track_results['sequence_features']['embedding_normed_256d'])
-                mean_embedding = np.mean(embeddings, axis=0)
-                track_embeddings.append(mean_embedding)
-        
-        if len(track_embeddings) >= 2:
-            similarities = []
-            for i in range(len(track_embeddings)):
-                for j in range(i+1, len(track_embeddings)):
-                    sim = cosine_similarity(track_embeddings[i], track_embeddings[j])
-                    similarities.append(sim)
-            action_synchronization = float(np.mean(similarities)) if similarities else 0.0
+        norms = np.linalg.norm(embeddings, axis=1)
+        mean_norm = float(np.mean(norms))
+        std_norm = float(np.std(norms))
+
+        if n > 1:
+            diffs = [np.linalg.norm(embeddings[i] - embeddings[i - 1]) for i in range(1, n)]
+            max_jump = float(np.max(diffs))
         else:
-            features_list = []
-            for track_id, track_results in results_per_track.items():
-                feat_vec = np.array([
-                    track_results.get('mean_embedding_norm_raw', 0.0),
-                    track_results.get('temporal_variance', 0.0),
-                    track_results.get('stability', 0.0),
-                ])
-                features_list.append(feat_vec)
-            
-            if len(features_list) > 1:
-                similarities = []
-                for i in range(len(features_list)):
-                    for j in range(i+1, len(features_list)):
-                        sim = cosine_similarity(features_list[i], features_list[j])
-                        similarities.append(sim)
-                action_synchronization = float(np.mean(similarities)) if similarities else 0.0
-            else:
-                action_synchronization = 1.0
-        
+            max_jump = 0.0
+
+        # кластеризация только при достаточном числе клипов
+        if n >= 3:
+            pca_dim = min(32, embeddings.shape[1], n - 1)
+            try:
+                emb_pca = PCA(n_components=pca_dim).fit_transform(embeddings)
+                k = min(5, max(1, n // 2))
+                labels = KMeans(n_clusters=k, n_init=10, random_state=42).fit_predict(emb_pca)
+                stability = longest_run_fraction(labels.tolist())
+                switches = int(np.sum(labels[1:] != labels[:-1]))
+            except Exception:
+                self.logger.exception("Ошибка в PCA/KMeans на треке — возвращаем безопасные метрики.")
+                stability = 1.0
+                switches = 0
+        else:
+            stability = 1.0
+            switches = 0
+
         return {
-            'is_multi_person': True,
-            'num_persons': num_persons,
-            'action_synchronization': action_synchronization
+            "mean_embedding_norm": mean_norm,
+            "std_embedding_norm": std_norm,
+            "max_temporal_jump": max_jump,
+            "stability": stability,
+            "num_switches": switches,
+            "embedding_dim": self.embedding_dim,
         }
 
-    def process(self, frame_indices_per_person: Dict[int, List[int]]) -> Dict[int, Dict[str, Any]]:
-        all_clips = []
-        meta = []
+    def process(
+        self,
+        frame_manager: FrameManager,
+        frame_indices: List[int],
+        config: Dict[str, Any]
+    ) -> Dict[int, Dict[str, Any]]:
+        """
+        Основной метод обработки видео (интерфейс BaseModule).
+        
+        Args:
+            frame_manager: Менеджер кадров
+            frame_indices: Список индексов кадров для обработки
+            config: Конфигурация модуля:
+                - tracks_json: путь к JSON с треками (опционально)
+                - max_tracks: максимальное количество треков (опционально)
+                - total_frames: общее количество кадров (для fallback)
+                
+        Returns:
+            Dict[track_id, Dict] - результаты по трекам с эмбеддингами
+        """
+        self.initialize()  # Гарантируем инициализацию модели
+        
+        # Получаем frame_indices_per_person из config
+        frame_indices_per_person = self._prepare_tracks(
+            frame_indices=frame_indices,
+            config=config
+        )
+        
+        if not frame_indices_per_person:
+            self.logger.warning("Нет треков для обработки")
+            return {}
+        
+        all_clips: List[List[np.ndarray]] = []
+        clip_owner: List[int] = []
 
-        for track_id, indices in frame_indices_per_person.items():
-            if len(indices) == 0:
+        # сбор всех клипов
+        for tid, indices in frame_indices_per_person.items():
+            if not indices:
+                self.logger.debug("Пропускаем трек %s (пустой список индексов)", tid)
                 continue
-            frames = self._load_frames(indices)
+            frames = self._load_frames(frame_manager, indices)
             clips = self._make_clips(frames)
-
+            if not clips:
+                self.logger.debug("Трек %s не дал клипов после _make_clips()", tid)
+                continue
             all_clips.extend(clips)
-            meta.extend([track_id]*len(clips))
+            clip_owner.extend([tid] * len(clips))
 
         if not all_clips:
+            self.logger.warning("Нет клипов для обработки")
             return {}
 
-        raw_embeddings_all, normed_embeddings_all = self._extract_embeddings(all_clips)
+        # извлекаем эмбеддинги для всех клипов
+        embeddings = self._extract_embeddings(all_clips)  # numpy [N_clips, embedding_dim]
 
-        per_track_raw = defaultdict(list)
-        per_track_normed = defaultdict(list)
-        for tid, raw_emb, normed_emb in zip(meta, raw_embeddings_all, normed_embeddings_all):
-            per_track_raw[tid].append(raw_emb)
-            per_track_normed[tid].append(normed_emb)
+        # агрегируем по трекам
+        per_track_embeddings: Dict[int, List[np.ndarray]] = defaultdict(list)
+        for owner_tid, emb in zip(clip_owner, embeddings):
+            per_track_embeddings[owner_tid].append(emb)
 
-        results = {}
-        for tid in per_track_raw:
-            raw_embeddings = np.array(per_track_raw[tid])
-            normed_embeddings = np.array(per_track_normed[tid])
-            
-            aggregate_features = self._aggregate(raw_embeddings, normed_embeddings)
-            
-            sequence_features = self._extract_sequence_features(normed_embeddings)
-            
-            results[tid] = aggregate_features
-            results[tid]['sequence_features'] = {
-                'embedding_normed_256d': sequence_features['embedding_normed_256d'].tolist(),
-                'temporal_diff_normalized': sequence_features['temporal_diff_normalized'].tolist()
-            }
+        results: Dict[int, Dict[str, Any]] = {}
+        for tid, embs in per_track_embeddings.items():
+            embs_arr = np.stack(embs, axis=0) if len(embs) else np.zeros((0, self.embedding_dim), dtype=np.float32)
+            metrics = self._aggregate(embs_arr)
+            # сохраняем эмбеддинги как numpy массив (для совместимости с save_results)
+            metrics["embedding_normed_256d"] = embs_arr
+            results[tid] = metrics
 
-        if len(results) >= 2:
-            multi_person = self._analyze_multi_person_actions(results)
-            for tid in results:
-                results[tid].update(multi_person)
+        self.logger.info("Обработано треков: %d", len(results))
 
         return results
-
+    
+    def _prepare_tracks(
+        self,
+        frame_indices: List[int],
+        config: Dict[str, Any]
+    ) -> Dict[int, List[int]]:
+        """
+        Подготавливает треки для обработки.
+        
+        Поддерживает несколько источников треков:
+        1. tracks_json - явно указанный JSON файл
+        2. object_detection - треки из модуля object_detection (если доступны)
+        3. fallback - single-track режим
+        
+        Args:
+            frame_indices: Список индексов кадров
+            config: Конфигурация с tracks_json, max_tracks, total_frames, use_object_detection_tracks
+            
+        Returns:
+            Dict[track_id, List[frame_indices]]
+        """
+        tracks_json = config.get("tracks_json")
+        max_tracks = config.get("max_tracks")
+        total_frames = config.get("total_frames", len(frame_indices))
+        use_object_detection_tracks = config.get("use_object_detection_tracks", False)
+        
+        frame_indices_per_person: Dict[int, List[int]] = {}
+        
+        # Приоритет 1: tracks_json (явно указанный файл)
+        if tracks_json and os.path.exists(tracks_json):
+            try:
+                with open(tracks_json, "r", encoding="utf-8") as f:
+                    tracks_data = json.load(f)
+                
+                if isinstance(tracks_data, dict):
+                    frame_indices_per_person = {int(k): v for k, v in tracks_data.items()}
+                elif isinstance(tracks_data, list):
+                    frame_indices_per_person = {
+                        i + 1: item.get("frames", []) 
+                        for i, item in enumerate(tracks_data)
+                    }
+                else:
+                    raise ValueError("Неожиданный формат tracks_json")
+                
+                self.logger.info(
+                    "Загружены треки из %s (tracks=%d)", 
+                    tracks_json, 
+                    len(frame_indices_per_person)
+                )
+            except Exception:
+                self.logger.exception(
+                    "Не удалось загрузить tracks_json, пробуем другие источники"
+                )
+                frame_indices_per_person = {}
+        
+        # Приоритет 2: треки из object_detection
+        if not frame_indices_per_person and use_object_detection_tracks:
+            try:
+                object_detection_results = self.load_dependency_results("object_detection")
+                if object_detection_results:
+                    # Извлекаем треки из результатов object_detection
+                    # Формат: {frame_index: [detections]}
+                    # Нужно сгруппировать по tracking_id если он есть
+                    tracks_by_id: Dict[int, List[int]] = {}
+                    
+                    for frame_idx, detections in object_detection_results.items():
+                        if isinstance(detections, list):
+                            for det in detections:
+                                # Проверяем наличие tracking_id
+                                tracking_id = det.get("tracking_id") or det.get("track_id")
+                                if tracking_id is not None:
+                                    track_id = int(tracking_id)
+                                    if track_id not in tracks_by_id:
+                                        tracks_by_id[track_id] = []
+                                    if int(frame_idx) not in tracks_by_id[track_id]:
+                                        tracks_by_id[track_id].append(int(frame_idx))
+                    
+                    if tracks_by_id:
+                        frame_indices_per_person = tracks_by_id
+                        self.logger.info(
+                            "Загружены треки из object_detection (tracks=%d)", 
+                            len(frame_indices_per_person)
+                        )
+            except Exception:
+                self.logger.debug(
+                    "Не удалось загрузить треки из object_detection: %s",
+                    exc_info=True
+                )
+        
+        # Fallback: single-track режим
+        if not frame_indices_per_person:
+            frame_indices_per_person = {1: frame_indices}
+            self.logger.info(
+                "tracks_json не задан и object_detection недоступен — "
+                "используем single-track (%d кадров)", 
+                len(frame_indices)
+            )
+        
+        # Ограничение количества треков
+        if max_tracks is not None:
+            items_sorted = sorted(
+                frame_indices_per_person.items(), 
+                key=lambda kv: -len(kv[1])
+            )
+            frame_indices_per_person = dict(items_sorted[:max_tracks])
+            self.logger.info(
+                "Ограничиваем обработку до %d треков (max_tracks)", 
+                max_tracks
+            )
+        
+        return frame_indices_per_person

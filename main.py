@@ -4,14 +4,6 @@ import sys
 
 _path = os.path.dirname(__file__)
 
-if _path not in sys.path:
-    sys.path.append(_path)
-
-import time
-
-from utils.logger import get_logger
-logger = get_logger("DataProcessor")
-
 if __name__ == "__main__":
     import argparse
 
@@ -32,8 +24,6 @@ if __name__ == "__main__":
     # ]
 
     # subprocess.run(cmd)
-
-    logger.info("DataProcessor | main | Запуск main VisualProcessor")
 
     cmd = [
         f"{_path}/VisualProcessor/.vp_venv/bin/python",

@@ -10,8 +10,6 @@ import cv2              # type: ignore
 import numpy as np      # type: ignore
 import mediapipe as mp 
 
-print(mp.__file__)
-
 _path = os.path.dirname(os.path.dirname(os.path.dirname(os.path.dirname(__file__))))
 if _path not in sys.path:
     sys.path.append(_path)

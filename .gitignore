@@ -17,6 +17,7 @@ build/
 .data_venv/
 .vp_venv/
 .model_process_venv/
+.core_face_landmarks_venv/
 venv/
 env/
 ENV/

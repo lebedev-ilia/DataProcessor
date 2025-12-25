@@ -1,3 +1,5 @@
+import os
+import sys
 import json
 
 def load_metadata(meta_path: str, name) -> dict:

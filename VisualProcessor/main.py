@@ -161,9 +161,7 @@ if __name__ == "__main__":
 
     g_config = config["global"]
 
-    # -----------------------------
-    # Фаза 1 — core‑провайдеры
-    # -----------------------------
+
     current_core = get_current_core_providers(config)
     if current_core:
         logger.info("VisualProcessor | main | Текущие core_providers:")
@@ -181,27 +179,25 @@ if __name__ == "__main__":
             if not status:
                 logger.error(f"VisualProcessor | main | core_provider {provider} failed")
 
-    # # -----------------------------
-    # # Фаза 2 — модульные анализаторы
-    # # -----------------------------
-    # current_modules = get_current_modules(config)
 
-    # logger.info(f"VisualProcessor | main | Текущие модули:")
+    current_modules = get_current_modules(config)
 
-    # for module in current_modules:
-    #     logger.info(f"            {module}")
+    logger.info(f"VisualProcessor | main | Текущие модули:")
 
-    # for module in current_modules:
-    #     logger.info(f"VisualProcessor | main | {module} start")
+    for module in current_modules:
+        logger.info(f"            {module}")
 
-    #     module_cfg = config.get(module)
+    for module in current_modules:
+        logger.info(f"VisualProcessor | main | {module} start")
 
-    #     logger.info(f"VisualProcessor | main | {module} config:")
+        module_cfg = config.get(module)
 
-    #     for k, v in module_cfg.items():
-    #         logger.info(f"            {k}: {v}")
+        logger.info(f"VisualProcessor | main | {module} config:")
 
-    #     if module_cfg is None:
-    #         raise ValueError(f"❌ Config entry for module '{module}' not found in YAML")
+        for k, v in module_cfg.items():
+            logger.info(f"            {k}: {v}")
 
-    #     status = run_module(g_config, module, module_cfg)
+        if module_cfg is None:
+            raise ValueError(f"❌ Config entry for module '{module}' not found in YAML")
+
+        status = run_module(g_config, module, module_cfg)
