@@ -1,0 +1,237 @@
+# -----------------------------
+# PYTHON
+# -----------------------------
+__pycache__/
+*.py[cod]
+*.pyo
+*.pyd
+*.so
+*.egg-info/
+.eggs/
+dist/
+build/
+*.spec
+
+Interpret/
+
+# Virtual environments
+.venv/
+.data_venv/
+.vp_venv/
+.model_process_venv/
+.core_face_landmarks_venv/
+venv/
+env/
+ENV/
+*.env
+*.python-version
+
+# Jupyter
+.ipynb_checkpoints/
+*.ipynb_save
+
+# -----------------------------
+# ML / AI / MODELS
+# -----------------------------
+# PyTorch weights
+*.pt
+*.pth
+*.ckpt
+*.bin
+.artifacts/
+
+# Model caches
+models/
+checkpoints/
+outputs/
+runs/
+
+# HuggingFace cache
+huggingface/
+hf_cache/
+~/.cache/huggingface/
+*/transformers/cache*
+*/transformers/*.lock
+
+# CLIP / OpenCLIP weights
+open_clip/
+clip_cache/
+
+# Tokenizers
+*.jsonl
+*.tiktoken
+tokenizers_cache/
+
+# ONNX / TensorRT
+*.onnx
+*.trt
+*.engine
+
+# BLIP / EVA / VideoMAE caches
+*.safetensors
+safetensors/
+
+# Embeddings
+embeddings/
+*.npy
+*.npz
+*.pkl
+
+# -----------------------------
+# LOCAL RUN OUTPUTS (LARGE)
+# -----------------------------
+# BatchRunner local caches / packs / state logs
+BatchRunner/_cache_videos/
+BatchRunner/_packs/
+BatchRunner/state.jsonl
+
+# Local result store for mass runs
+result_store_runs/
+
+# Feature caches
+features_cache/
+cache/
+tmp/
+temp/
+
+# -----------------------------
+# VIDEO / AUDIO PROCESSING
+# -----------------------------
+# extracted frames
+frames/
+frames_tmp/
+scenes/
+scene_cache/
+
+# video downloads
+*.mp4
+*.mov
+*.avi
+*.mkv
+*.webm
+
+# thumbnails / previews
+thumbs/
+previews/
+
+# audio extractions
+*.wav
+*.mp3
+*.ogg
+audio_cache/
+
+# OCR data
+ocr_outputs/
+text_boxes/
+ocr_cache/
+
+# ASR outputs
+asr/
+transcripts/
+
+# -----------------------------
+# LOGS / DEBUG
+# -----------------------------
+logs/
+*.log
+*.out
+*.err
+debug/
+profile/
+*.profile
+*.trace
+
+# Hydra / Lightning logs
+multirun/
+lightning_logs/
+wandb/
+tensorboard/
+
+# -----------------------------
+# DATA / DATASETS
+# -----------------------------
+data/
+dataset/
+datasets/
+private_data/
+*.csv
+*.tsv
+*.parquet
+
+# Automatically generated metadata
+*.meta
+
+# -----------------------------
+# CONFIGS / SECRETS
+# -----------------------------
+# Secrets
+*.key
+*.pem
+*.pub
+*.pfx
+*.p12
+*.crt
+*.csr
+
+# Environment configs
+.env
+.env.*
+*.ini
+config/local/
+
+# API keys (just in case)
+api_keys/
+*.token
+
+# -----------------------------
+# EDITORS / SYSTEM
+# -----------------------------
+# VSCode
+.vscode/
+.history/
+.code/
+*.code-workspace
+
+# PyCharm
+.idea/
+
+# macOS
+.DS_Store
+.AppleDouble
+.LSOverride
+
+# Windows
+Thumbs.db
+ehthumbs.db
+Desktop.ini
+
+# Linux
+*~
+.cache/
+
+# -----------------------------
+# PROJECT-SPECIFIC PIPELINE
+# -----------------------------
+# Processed feature dirs
+video_features/
+audio_features/
+text_features/
+multimodal_features/
+highlevel_semantics/
+
+# charts / exports
+reports/
+plots/
+exports/
+
+# Temporary runtime files
+*.lock
+*.pid
+*.tmp
+*.temp
+*.json
+*.png
+*.jpg
+*.pt
+
+OpenFace/

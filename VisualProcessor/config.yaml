@@ -1,0 +1,210 @@
+core_providers:
+    core_clip: false
+    core_face_landmarks: false
+    core_depth_midas: false
+    core_object_detections: true
+    core_optical_flow: false
+
+modules:
+    scene_classification: false
+    face_detection: false
+    detalize_face_modules: false
+    emotion_face: false
+    behavioral: false
+    optical_flow: false
+    action_recognition: false
+    color_light: false
+    frames_composition: false
+    shot_quality: false
+    cut_detection: false
+    video_pacing: false
+    story_structure: false
+    micro_emotion: false
+    similarity_metrics: false
+    text_scoring: false
+    uniqueness: false
+
+global:
+    # NOTE: Эти пути будут переопределяться orchestrator'ом (DataProcessor/main.py).
+    # Держим их как дефолтные/пример, но не полагаемся на конкретную ОС.
+    root_path: null
+    frames_dir: null
+    rs_path: null
+
+core_face_landmarks:
+    use_pose: true
+    use_hands: true
+    use_face_mesh: true
+    pose_static_image_mode: false
+    pose_model_complexity: 2
+    pose_enable_segmentation: true
+    pose_min_detection_confidence: 0.5
+    pose_min_tracking_confidence: 0.5
+    hands_static_image_mode: false
+    hands_max_num_hands: 2
+    hands_model_complexity: 1
+    hands_min_detection_confidence: 0.5
+    hands_min_tracking_confidence: 0.5
+    face_mesh_static_image_mode: false
+    face_mesh_max_num_faces: 1
+    face_mesh_refine_landmarks: true
+    face_mesh_min_detection_confidence: 0.5
+    face_mesh_min_tracking_confidence: 0.5
+
+core_object_detections:
+    model: "yolo11x.pt" # google/owlvit-base-patch32, google/owlvit-base-patch16, google/owlvit-large-patch14, google/owlv2-base-patch16, yolo11x.pt
+    model_family: null # owlv2, owlvit, null
+    batch_size: 16
+    use_queries: false
+    default_categories: null # "person,bus"
+    device: "cuda"
+    box_threshold: 0.6 # 0.3 для owl
+    iou-threshold: 0.3
+    sample-step: 10
+
+
+
+scene_classification:
+    model_arch: "resnet50" # DEFAULT: resnet18 resnet50 | TIMM: efficientnet_b0 efficientnet_b1 efficientnet_b2 efficientnet_b3 convnext_tiny convnext_small convnext_base vit_base_patch16_224 vit_large_patch16_224 regnetx_002 regnetx_004 regnetx_006 resnet50 resnet101
+    use_timm: false
+    batch_size: 1
+    min_scene_length: 20
+    device: "cuda"
+    categories_path: "VisualProcessor/modules/scene_classification/categories_places365.txt"
+    cache_dir: null
+    gpu_memory_threshold: 0.95
+    log_metrics_every_n_frames: 10
+    input_size: 224 # 256, 320 ...
+    use_tta: true
+    use_multi_crop: true
+    temporal_smoothing: true
+    smoothing_window: 5
+    enable_advanced_features: true
+    use_clip_for_semantics: true
+
+face_detection:
+    threshold: 0.5
+    det_size: "640,640"
+
+detalize_face_modules:
+    modules: "geometry,pose,quality,lighting,skin,accessories,eyes,motion,structure,professional,lip_reading,face_3d"
+    max_faces: 10
+    refine_landmarks: true
+    visualize: False
+    visualize_dir: null
+    show_landmarks: False
+    min_detection_confidence: 0.7
+    min_tracking_confidence: 0.7
+    min_face_size: 30
+    max_face_size_ratio: 0.8
+    min_aspect_ratio: 0.6
+    max_aspect_ratio: 1.4
+    no_validate_landmarks: false
+
+emotion_face:
+    target_length: 256
+    max_retries: 2
+    min_faces_threshold: 20
+    transition_threshold: 0.3
+    min_frames_ratio: 0.8
+    min_keyframes: 3
+    min_transitions: 2
+    min_diversity_threshold: 0.2
+    quality_threshold: 0.4
+    memory_threshold_low: 2000
+    batch_load_low: 20
+    batch_process_low: 8 
+    memory_threshold_medium: 4000 
+    batch_load_medium: 30
+    batch_process_medium: 12 
+    memory_threshold_high: 8000
+    batch_load_high: 50
+    batch_process_high: 16 
+    batch_load_very_high: 80
+    batch_process_very_high: 24 
+    max_gap_seconds: 0.5
+    max_samples_per_segment: 10
+    enable_structured_metrics: true
+    emo_path: null
+    device: "cuda"
+
+behavioral:
+    visualize: false
+    visualize_dir: ""
+
+# object_detections:
+#     model: "yolo11x.pt"
+#     batch_size: 16
+#     use_queries: false
+#     model_family: null
+#     box_threshold: 0.6
+#     device: "cuda"
+
+# Конфигурация для optical_flow (используется как core провайдер через fallback)
+optical_flow:
+    model: "small" # large
+    max_dim: 256
+    no_overlay: true
+    run_stats: true
+    grid_size: "4,4"
+    motion_thresholds: "0.5,1.0,2.0"
+    direction_bins: 36
+    spatial_sample_rate: 10
+    top_regions_count: 3
+    savgol_window: 11
+    min_frames_for_temporal: 10
+    peak_detection_height: 0.1
+    enable_camera_motion: true
+    enable_advanced_features: true
+    enable_mei: true
+    enable_fg_bg: true
+    enable_clusters: true
+    enable_smoothness: true
+    fg_bg_method: 'magnitude_threshold'  # 'magnitude_threshold', 'spatial_clustering', 'segmentation'
+    fg_bg_threshold: 0.5
+    motion_clusters_n: 5
+
+# Canonical core provider config (torchvision RAFT). Output: rs_path/core_optical_flow/flow.npz
+core_optical_flow:
+    model: "small" # small | large
+    max_dim: 256
+    device: "auto" # auto | cpu | cuda
+
+action_recognition:
+    clip_len: 16
+    batch_size: 4
+    max_tracks: 30
+
+color_light:
+    max_frames_per_scene: 350
+    stride: 9
+
+frames_composition:
+    device: "cuda"
+    yolo_model_path: 'yolo11n.pt'
+    yolo_conf_threshold: 0.3
+    max_num_faces: 5
+    min_detection_confidence: 0.5
+    use_midas: true
+    num_depth_layers: 3
+    slic_n_segments: 100
+    slic_compactness: 10
+    brightness_weight: 0.65
+    object_weight: 0.35
+
+shot_quality:
+    device: "cuda"
+
+cut_detection:
+    device: "cuda"
+    use_clip: true
+    use_deep_features: true
+
+video_pacing:
+    batch_size: 6
+    downscale_factor: 0.5
+
+story_structure:
+    clip_model: "ViT-B/32"
+    sentence_model: "all-MiniLM-L6-v2"
+    subtitles: "Hello everyone,Welcome to my vlog,Today we will..."
