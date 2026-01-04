@@ -73,7 +73,21 @@ def validate_npz(path: str, required_meta_keys: Optional[List[str]] = None) -> T
             issues.append(ValidationIssue("error", "missing or invalid `meta` in npz"))
         else:
             meta = dict(meta_dict)
-            keys = required_meta_keys or ["producer", "created_at"]
+            # Baseline contract (strict-by-default).
+            # Note: values may be None; we only require presence of keys.
+            keys = required_meta_keys or [
+                "producer",
+                "producer_version",
+                "schema_version",
+                "created_at",
+                "platform_id",
+                "video_id",
+                "run_id",
+                "config_hash",
+                "sampling_policy_version",
+                "status",
+                "empty_reason",
+            ]
             for k in keys:
                 if k not in meta:
                     issues.append(ValidationIssue("error", f"meta missing required key: {k}"))

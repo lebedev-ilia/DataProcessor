@@ -53,18 +53,20 @@ def _load_core_clip_embeddings(rs_path: Optional[str], frame_index: int) -> Opti
         return None
     
     try:
-        # Fallback path: avoid full read when possible.
-        data = np.load(core_path, mmap_mode="r")
-        emb = data.get("frame_embeddings")
-        if emb is None:
+        # Strict alignment by frame_indices (union-domain) — no positional assumptions.
+        data = np.load(core_path, allow_pickle=True)
+        core_idx = data.get("frame_indices")
+        core_emb = data.get("frame_embeddings")
+        if core_idx is None or core_emb is None:
             return None
-        emb = np.asarray(emb, dtype=np.float32)
-        
-        # Проверяем, что frame_index в пределах массива
-        if frame_index < 0 or frame_index >= emb.shape[0]:
+        core_idx = np.asarray(core_idx, dtype=np.int32)
+        core_emb = np.asarray(core_emb, dtype=np.float32)
+
+        mapping = {int(fi): i for i, fi in enumerate(core_idx.tolist())}
+        pos = mapping.get(int(frame_index), None)
+        if pos is None:
             return None
-        
-        return emb[frame_index]
+        return core_emb[int(pos)]
     except Exception as e:
         logger.warning(f"Places365SceneClassifier | _load_core_clip_embeddings | Error loading core data: {e}")
         return None
@@ -186,6 +188,8 @@ class Places365SceneClassifier(BaseModule):
         # core_clip integration (cache provider output once, not per-frame)
         self._core_clip_path: Optional[str] = None
         self._core_clip_frame_embeddings: Optional[np.ndarray] = None  # may be memmap
+        self._core_clip_frame_indices: Optional[np.ndarray] = None
+        self._core_clip_index_map: Optional[Dict[int, int]] = None
         self._use_core_clip = False
         if rs_path:
             core_path = os.path.join(rs_path, "core_clip", "embeddings.npz")
@@ -193,11 +197,16 @@ class Places365SceneClassifier(BaseModule):
                 self._use_core_clip = True
                 self._core_clip_path = core_path
                 try:
-                    # Memory-map to avoid loading whole array into RAM.
-                    data = np.load(core_path, mmap_mode="r")
+                    # Load and build strict index map (union-domain frame_indices → row)
+                    data = np.load(core_path, allow_pickle=True)
+                    idx = data.get("frame_indices")
                     emb = data.get("frame_embeddings")
-                    if emb is not None:
+                    if idx is not None and emb is not None:
+                        idx = np.asarray(idx, dtype=np.int32)
+                        emb = np.asarray(emb, dtype=np.float32)
+                        self._core_clip_frame_indices = idx
                         self._core_clip_frame_embeddings = emb
+                        self._core_clip_index_map = {int(fi): i for i, fi in enumerate(idx.tolist())}
                 except Exception as e:
                     logger.warning(
                         f"Places365SceneClassifier | core_clip preload failed: {e}. "
@@ -296,11 +305,13 @@ class Places365SceneClassifier(BaseModule):
 
     def _get_core_clip_embedding(self, frame_index: int) -> Optional[np.ndarray]:
         """Fast path: use cached core_clip embeddings when available."""
-        if self._core_clip_frame_embeddings is not None:
+        if self._core_clip_frame_embeddings is not None and self._core_clip_index_map is not None:
             try:
-                if 0 <= frame_index < int(self._core_clip_frame_embeddings.shape[0]):
-                    emb = np.asarray(self._core_clip_frame_embeddings[frame_index], dtype=np.float32)
-                    return emb
+                pos = self._core_clip_index_map.get(int(frame_index), None)
+                if pos is None:
+                    return None
+                emb = np.asarray(self._core_clip_frame_embeddings[int(pos)], dtype=np.float32)
+                return emb
             except Exception:
                 return None
         # Fallback to legacy per-frame loader
@@ -526,13 +537,19 @@ class Places365SceneClassifier(BaseModule):
             logger.warning("Frame is not a numpy array – skipping")
             return None
 
+        # FrameManager.get() contract: RGB
         if frame.ndim == 2:
-            frame = cv2.cvtColor(frame, cv2.COLOR_GRAY2BGR)
+            rgb = cv2.cvtColor(frame, cv2.COLOR_GRAY2RGB)
         elif frame.ndim == 3 and frame.shape[2] == 4:
-            frame = cv2.cvtColor(frame, cv2.COLOR_BGRA2BGR)
+            # Most likely RGBA; keep robust fallback for BGRA just in case.
+            try:
+                rgb = cv2.cvtColor(frame, cv2.COLOR_RGBA2RGB)
+            except Exception:
+                rgb = cv2.cvtColor(frame, cv2.COLOR_BGRA2RGB)
+        else:
+            rgb = frame  # assume already RGB
 
-        rgb = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
-        image = Image.fromarray(rgb)
+        image = Image.fromarray(rgb.astype(np.uint8))
 
         # Multi-crop: 5 crops (center + 4 corners)
         if self.use_multi_crop:
@@ -932,18 +949,15 @@ class Places365SceneClassifier(BaseModule):
         """
         Detect time of day from frame brightness and color analysis.
         
-        :param frame: BGR frame
+        :param frame: RGB frame (FrameManager.get contract)
         :return: Dictionary with time of day probabilities
         """
-        # Convert to RGB
-        rgb = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
-        
         # Calculate brightness
-        gray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
+        gray = cv2.cvtColor(frame, cv2.COLOR_RGB2GRAY)
         mean_brightness = np.mean(gray) / 255.0
         
         # Analyze color distribution (warm vs cool)
-        hsv = cv2.cvtColor(frame, cv2.COLOR_BGR2HSV)
+        hsv = cv2.cvtColor(frame, cv2.COLOR_RGB2HSV)
         hue = hsv[:, :, 0].flatten()
         
         # Warm colors (sunset/sunrise): hue 0-30, 150-180
@@ -979,26 +993,27 @@ class Places365SceneClassifier(BaseModule):
         """
         Calculate aesthetic score for the scene.
         
-        :param frame: BGR frame
+        :param frame: RGB frame (FrameManager.get contract)
         :param scene_label: Scene label
         :param frame_index: Frame index for core_clip lookup
         :return: Aesthetic score (0-1)
         """
         if not self.use_clip_for_semantics:
             return self._calculate_aesthetic_score_heuristic(frame, scene_label)
-            if self._use_core_clip and frame_index is not None:
-                return self._calculate_aesthetic_score_core_clip(frame_index)
+        if self._use_core_clip and frame_index is not None:
+            return self._calculate_aesthetic_score_core_clip(frame_index)
         if self._clip_model is not None:
-                return self._calculate_aesthetic_score_clip(frame)
-            return self._calculate_aesthetic_score_heuristic(frame, scene_label)
+            return self._calculate_aesthetic_score_clip(frame)
+        raise RuntimeError(
+            "Places365SceneClassifier | use_clip_for_semantics=True but neither core_clip nor transformers CLIP is available"
+        )
     
     def _calculate_aesthetic_score_core_clip(self, frame_index: int) -> float:
         """Calculate aesthetic score using core_clip embeddings."""
         try:
             img_feat = self._get_core_clip_embedding(frame_index)
             if img_feat is None:
-                logger.warning(f"Places365SceneClassifier | _calculate_aesthetic_score_core_clip | core_clip not found for frame {frame_index}, using heuristic")
-                return 0.5  # Fallback to neutral score
+                raise RuntimeError(f"core_clip embedding not found for frame_index={frame_index}")
             
             img_feat = np.asarray(img_feat, dtype=np.float32)
             img_feat = img_feat / (np.linalg.norm(img_feat) + 1e-9)
@@ -1006,8 +1021,7 @@ class Places365SceneClassifier(BaseModule):
             self._maybe_prepare_core_text_embeddings()
             text_emb = self._core_text_embeddings.get("aesthetic")
             if text_emb is None:
-                # Fallback heuristic: stable neutral
-                return 0.5
+                raise RuntimeError("core_clip semantic prompts not available (transformers CLIP missing?)")
 
             logits = img_feat @ text_emb.T  # (4,)
             logits = logits - float(np.max(logits))
@@ -1015,14 +1029,12 @@ class Places365SceneClassifier(BaseModule):
             # Positive prompts: [0,1]
             return float(np.clip(float(probs[0] + probs[1]), 0.0, 1.0))
         except Exception as e:
-            logger.warning(f"Places365SceneClassifier | _calculate_aesthetic_score_core_clip | Error: {e}, using heuristic")
-            return 0.5
+            raise
     
     def _calculate_aesthetic_score_clip(self, frame: np.ndarray) -> float:
         """Calculate aesthetic score using CLIP."""
         try:
-            rgb = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
-            image = Image.fromarray(rgb)
+            image = Image.fromarray(frame.astype(np.uint8))
             
             texts = [
                 "aesthetic beautiful scene",
@@ -1047,13 +1059,12 @@ class Places365SceneClassifier(BaseModule):
             aesthetic_score = (probs[0][0] + probs[0][1]).item()
             return float(aesthetic_score)
         except Exception as e:
-            logger.warning(f"CLIP aesthetic score failed: {e}, using heuristic")
-            return self._calculate_aesthetic_score_heuristic(frame, "")
+            raise
     
     def _calculate_aesthetic_score_heuristic(self, frame: np.ndarray, scene_label: str) -> float:
         """Calculate aesthetic score using heuristics."""
         # Analyze image quality metrics
-        gray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
+        gray = cv2.cvtColor(frame, cv2.COLOR_RGB2GRAY)
         
         # Sharpness (Laplacian variance)
         laplacian_var = cv2.Laplacian(gray, cv2.CV_64F).var()
@@ -1063,8 +1074,7 @@ class Places365SceneClassifier(BaseModule):
         contrast = np.std(gray) / 255.0
         
         # Colorfulness
-        rgb = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
-        rgb_flat = rgb.reshape(-1, 3)
+        rgb_flat = frame.reshape(-1, 3).astype(np.float32)
         std_r = np.std(rgb_flat[:, 0])
         std_g = np.std(rgb_flat[:, 1])
         std_b = np.std(rgb_flat[:, 2])
@@ -1082,26 +1092,27 @@ class Places365SceneClassifier(BaseModule):
         """
         Calculate luxury score for the scene.
         
-        :param frame: BGR frame
+        :param frame: RGB frame (FrameManager.get contract)
         :param scene_label: Scene label
         :param frame_index: Frame index for core_clip lookup
         :return: Luxury score (0-1)
         """
         if not self.use_clip_for_semantics:
             return self._calculate_luxury_score_heuristic(frame, scene_label)
-            if self._use_core_clip and frame_index is not None:
-                return self._calculate_luxury_score_core_clip(frame_index)
+        if self._use_core_clip and frame_index is not None:
+            return self._calculate_luxury_score_core_clip(frame_index)
         if self._clip_model is not None:
-                return self._calculate_luxury_score_clip(frame)
-            return self._calculate_luxury_score_heuristic(frame, scene_label)
+            return self._calculate_luxury_score_clip(frame)
+        raise RuntimeError(
+            "Places365SceneClassifier | use_clip_for_semantics=True but neither core_clip nor transformers CLIP is available"
+        )
     
     def _calculate_luxury_score_core_clip(self, frame_index: int) -> float:
         """Calculate luxury score using core_clip embeddings."""
         try:
             img_feat = self._get_core_clip_embedding(frame_index)
             if img_feat is None:
-                logger.warning(f"Places365SceneClassifier | _calculate_luxury_score_core_clip | core_clip not found for frame {frame_index}, using heuristic")
-                return 0.5
+                raise RuntimeError(f"core_clip embedding not found for frame_index={frame_index}")
 
             img_feat = np.asarray(img_feat, dtype=np.float32)
             img_feat = img_feat / (np.linalg.norm(img_feat) + 1e-9)
@@ -1109,21 +1120,19 @@ class Places365SceneClassifier(BaseModule):
             self._maybe_prepare_core_text_embeddings()
             text_emb = self._core_text_embeddings.get("luxury")
             if text_emb is None:
-                return 0.5
+                raise RuntimeError("core_clip semantic prompts not available (transformers CLIP missing?)")
 
             logits = img_feat @ text_emb.T
             logits = logits - float(np.max(logits))
             probs = np.exp(logits) / (np.sum(np.exp(logits)) + 1e-9)
             return float(np.clip(float(probs[0] + probs[1]), 0.0, 1.0))
         except Exception as e:
-            logger.warning(f"Places365SceneClassifier | _calculate_luxury_score_core_clip | Error: {e}, using heuristic")
-            return 0.5
+            raise
     
     def _calculate_luxury_score_clip(self, frame: np.ndarray) -> float:
         """Calculate luxury score using CLIP."""
         try:
-            rgb = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
-            image = Image.fromarray(rgb)
+            image = Image.fromarray(frame.astype(np.uint8))
             
             texts = [
                 "luxury expensive high-end scene",
@@ -1147,8 +1156,7 @@ class Places365SceneClassifier(BaseModule):
             luxury_score = (probs[0][0] + probs[0][1]).item()
             return float(luxury_score)
         except Exception as e:
-            logger.warning(f"CLIP luxury score failed: {e}, using heuristic")
-            return self._calculate_luxury_score_heuristic(frame, "")
+            raise
     
     def _calculate_luxury_score_heuristic(self, frame: np.ndarray, scene_label: str) -> float:
         """Calculate luxury score using heuristics."""
@@ -1159,13 +1167,12 @@ class Places365SceneClassifier(BaseModule):
         label_score = 0.3 if any(kw in label_lower for kw in luxury_keywords) else 0.0
         
         # Analyze image quality (luxury scenes often have high quality)
-        gray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
+        gray = cv2.cvtColor(frame, cv2.COLOR_RGB2GRAY)
         sharpness = cv2.Laplacian(gray, cv2.CV_64F).var()
         quality_score = min(1.0, sharpness / 500.0) * 0.4
         
         # Color richness
-        rgb = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
-        std_colors = np.std(rgb.reshape(-1, 3), axis=0)
+        std_colors = np.std(frame.reshape(-1, 3).astype(np.float32), axis=0)
         color_score = np.mean(std_colors) / 255.0 * 0.3
         
         return float(np.clip(label_score + quality_score + color_score, 0.0, 1.0))
@@ -1174,25 +1181,26 @@ class Places365SceneClassifier(BaseModule):
         """
         Detect atmosphere sentiment (cozy, scary, epic, neutral).
         
-        :param frame: BGR frame
+        :param frame: RGB frame (FrameManager.get contract)
         :param frame_index: Frame index for core_clip lookup
         :return: Dict with atmosphere probabilities
         """
         if not self.use_clip_for_semantics:
             return self._detect_atmosphere_heuristic(frame)
-            if self._use_core_clip and frame_index is not None:
-                return self._detect_atmosphere_core_clip(frame_index)
+        if self._use_core_clip and frame_index is not None:
+            return self._detect_atmosphere_core_clip(frame_index)
         if self._clip_model is not None:
-                return self._detect_atmosphere_clip(frame)
-            return self._detect_atmosphere_heuristic(frame)
+            return self._detect_atmosphere_clip(frame)
+        raise RuntimeError(
+            "Places365SceneClassifier | use_clip_for_semantics=True but neither core_clip nor transformers CLIP is available"
+        )
     
     def _detect_atmosphere_core_clip(self, frame_index: int) -> Dict[str, float]:
         """Detect atmosphere using core_clip embeddings."""
         try:
             img_feat = self._get_core_clip_embedding(frame_index)
             if img_feat is None:
-                logger.warning(f"Places365SceneClassifier | _detect_atmosphere_core_clip | core_clip not found for frame {frame_index}, using heuristic")
-                return {"cozy": 0.25, "scary": 0.25, "epic": 0.25, "neutral": 0.25}
+                raise RuntimeError(f"core_clip embedding not found for frame_index={frame_index}")
 
             img_feat = np.asarray(img_feat, dtype=np.float32)
             img_feat = img_feat / (np.linalg.norm(img_feat) + 1e-9)
@@ -1200,7 +1208,7 @@ class Places365SceneClassifier(BaseModule):
             self._maybe_prepare_core_text_embeddings()
             text_emb = self._core_text_embeddings.get("atmosphere")
             if text_emb is None:
-            return {"cozy": 0.25, "scary": 0.25, "epic": 0.25, "neutral": 0.25}
+                raise RuntimeError("core_clip semantic prompts not available (transformers CLIP missing?)")
 
             logits = img_feat @ text_emb.T
             logits = logits - float(np.max(logits))
@@ -1212,14 +1220,12 @@ class Places365SceneClassifier(BaseModule):
                 "neutral": float(probs[3]),
             }
         except Exception as e:
-            logger.warning(f"Places365SceneClassifier | _detect_atmosphere_core_clip | Error: {e}, using heuristic")
-            return {"cozy": 0.25, "scary": 0.25, "epic": 0.25, "neutral": 0.25}
+            raise
     
     def _detect_atmosphere_clip(self, frame: np.ndarray) -> Dict[str, float]:
         """Detect atmosphere using CLIP."""
         try:
-            rgb = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
-            image = Image.fromarray(rgb)
+            image = Image.fromarray(frame.astype(np.uint8))
             
             texts = [
                 "cozy warm comfortable scene",
@@ -1247,16 +1253,15 @@ class Places365SceneClassifier(BaseModule):
                 "neutral": float(probs[0][3].item())
             }
         except Exception as e:
-            logger.warning(f"CLIP atmosphere detection failed: {e}, using heuristic")
-            return self._detect_atmosphere_heuristic(frame)
+            raise
     
     def _detect_atmosphere_heuristic(self, frame: np.ndarray) -> Dict[str, float]:
         """Detect atmosphere using heuristics."""
-        gray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
+        gray = cv2.cvtColor(frame, cv2.COLOR_RGB2GRAY)
         mean_brightness = np.mean(gray) / 255.0
         
         # Cozy: medium brightness, warm colors
-        hsv = cv2.cvtColor(frame, cv2.COLOR_BGR2HSV)
+        hsv = cv2.cvtColor(frame, cv2.COLOR_RGB2HSV)
         hue = hsv[:, :, 0].flatten()
         warm_ratio = np.sum((hue < 30) | (hue > 150)) / len(hue) if len(hue) > 0 else 0
         cozy_score = mean_brightness * 0.6 * (1 + warm_ratio * 0.5)
@@ -1285,10 +1290,10 @@ class Places365SceneClassifier(BaseModule):
         """
         Calculate geometric features: openness, clutter, depth cues.
         
-        :param frame: BGR frame
+        :param frame: RGB frame (FrameManager.get contract)
         :return: Dictionary with geometric features
         """
-        gray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
+        gray = cv2.cvtColor(frame, cv2.COLOR_RGB2GRAY)
         height, width = gray.shape
         
         # Openness: measure of visible sky/horizon

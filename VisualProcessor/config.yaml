@@ -30,8 +30,17 @@ global:
     root_path: null
     frames_dir: null
     rs_path: null
+    # Intra-video parallelism:
+    # - modules may run in parallel, but GPU-heavy tasks are gated by gpu_max_concurrent.
+    # - for 6GB GPUs keep gpu_max_concurrent=1 (auto will do that); for 20GB+ you may try 2.
+    max_parallel_modules: 1
+    gpu_max_concurrent: "auto"
 
 core_face_landmarks:
+    # NOTE: core_face_landmarks may require an isolated venv due to mediapipe conflicts.
+    # If you have such env, set it here (absolute path preferred).
+    # Example:
+    # venv_path: "/abs/path/to/VisualProcessor/core/model_process/core_face_landmarks/.core_face_landmarks_venv"
     use_pose: true
     use_hands: true
     use_face_mesh: true

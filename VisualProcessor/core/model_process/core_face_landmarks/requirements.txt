@@ -1,0 +1,16 @@
+# Isolated venv requirements for core_face_landmarks.
+#
+# Rationale:
+# - Newer mediapipe versions (>0.10.14) removed/changed `mp.solutions` API used by this core.
+# - mediapipe often conflicts with other heavy ML deps in the shared VisualProcessor venv.
+#
+# This core is intended to run inside:
+#   VisualProcessor/core/model_process/core_face_landmarks/.core_face_landmarks_venv
+#
+# Pin mediapipe to the last known-compatible line for `mp.solutions`.
+mediapipe==0.10.14
+
+# Runtime deps used by core_face_landmarks/main.py
+opencv-python>=4.8
+numpy>=1.23
+

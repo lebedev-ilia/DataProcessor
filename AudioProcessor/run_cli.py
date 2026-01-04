@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import argparse
+import json
 import os
 import sys
 import time
@@ -16,6 +17,10 @@ import numpy as np
 
 def _utc_iso_now() -> str:
     return time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime())
+
+def _sha256_text(s: str) -> str:
+    import hashlib
+    return hashlib.sha256(s.encode("utf-8")).hexdigest()
 
 
 def _timestamp_now() -> str:
@@ -148,7 +153,7 @@ def _save_component_npz(
                 extra={
                     **(extra_meta or {}),
                     **({"error": error} if error else {}),
-                    **({"empty_reason": empty_reason} if empty_reason else {}),
+                    "empty_reason": empty_reason,
                 },
             ),
         )
@@ -184,7 +189,7 @@ def _save_component_npz(
                 extra={
                     **(extra_meta or {}),
                     **({"error": error} if error else {}),
-                    **({"empty_reason": empty_reason} if empty_reason else {}),
+                    "empty_reason": empty_reason,
                 },
             ),
         )
@@ -224,7 +229,7 @@ def _save_component_npz(
                 extra={
                     **(extra_meta or {}),
                     **({"error": error} if error else {}),
-                    **({"empty_reason": empty_reason} if empty_reason else {}),
+                    "empty_reason": empty_reason,
                 },
             ),
         )
@@ -247,7 +252,7 @@ def _save_component_npz(
             extra={
                 **(extra_meta or {}),
                 **({"error": error} if error else {}),
-                **({"empty_reason": empty_reason} if empty_reason else {}),
+                "empty_reason": empty_reason,
             },
         ),
     )
@@ -300,6 +305,12 @@ def main() -> int:
     parser.add_argument("--video-id", type=str, default=None)
     parser.add_argument("--run-id", type=str, default=None)
     parser.add_argument("--sampling-policy-version", type=str, default="v1")
+    parser.add_argument(
+        "--config-hash",
+        type=str,
+        default=None,
+        help="Optional config hash propagated by DataProcessor (for idempotency). If not provided, will be derived from CLI args.",
+    )
 
     parser.add_argument("--device", type=str, default="auto", choices=["auto", "cpu", "cuda"])
     parser.add_argument("--extractors", type=str, default="clap,tempo,loudness", help="Comma-separated keys: clap,tempo,loudness")
@@ -308,6 +319,20 @@ def main() -> int:
 
     video_id = args.video_id or os.path.splitext(os.path.basename(args.video_path))[0]
     run_id = args.run_id or uuid.uuid4().hex[:12]
+
+    config_hash = args.config_hash
+    if not config_hash:
+        # Best-effort: stabilize idempotency for audio-only runs.
+        cfg_dump = json.dumps(
+            {
+                "device": args.device,
+                "extractors": args.extractors,
+                "sampling_policy_version": args.sampling_policy_version,
+            },
+            sort_keys=True,
+            ensure_ascii=False,
+        )
+        config_hash = _sha256_text(cfg_dump)[:16]
 
     run_rs_path = os.path.join(os.path.abspath(args.rs_base), args.platform_id, video_id, run_id)
     os.makedirs(run_rs_path, exist_ok=True)
@@ -319,6 +344,7 @@ def main() -> int:
             "platform_id": args.platform_id,
             "video_id": video_id,
             "run_id": run_id,
+            "config_hash": config_hash,
             "sampling_policy_version": args.sampling_policy_version,
             "created_at": _utc_iso_now(),
         },
@@ -383,6 +409,12 @@ def main() -> int:
             producer_version=str(producer_version),
             schema_version="audio_npz_v1",
             extra_meta={
+                # Required run identity fields (baseline contract)
+                "platform_id": args.platform_id,
+                "video_id": video_id,
+                "run_id": run_id,
+                "config_hash": config_hash,
+                "sampling_policy_version": args.sampling_policy_version,
                 "device_used": r.get("device_used", args.device),
                 "source_video_path": os.path.abspath(args.video_path),
                 "audio_present": audio_present,

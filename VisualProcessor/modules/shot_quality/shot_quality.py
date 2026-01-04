@@ -260,7 +260,10 @@ def compression_metrics(gray: np.ndarray) -> Dict[str, float]:
     blur = cv2.GaussianBlur(g, (9, 9), 0)
     band = float(np.clip(1.0 - (np.mean(np.abs(g - blur)) / 50.0), 0.0, 1.0))
     # ringing: std of Laplacian-of-Gaussian response
-    log = cv2.Laplacian(cv2.GaussianBlur(g, (3, 3), 0), cv2.CV_64F)
+    # OpenCV (SIMD backend) may not support src=CV_32F -> dst=CV_64F for linear filters.
+    # Use float64 for the LoG branch to keep it portable across builds.
+    g64 = gray.astype(np.float64)
+    log = cv2.Laplacian(cv2.GaussianBlur(g64, (3, 3), 0), cv2.CV_64F)
     ringing = float(np.clip(np.std(log) / 20.0, 0.0, 1.0))
     bitrate = float(np.clip(1.0 - (block / 50.0 + band) / 2.0, 0.0, 1.0))
     # codec entropy: entropy of block stds
@@ -410,8 +413,8 @@ class _ShotBoundaries:
 
 class ShotQualityModule(BaseModule):
     def __init__(self, rs_path: Optional[str] = None, device: str = "cuda", **kwargs: Any):
-        super().__init__(rs_path=rs_path, logger_name=MODULE_NAME, **kwargs)
         self.device = device
+        super().__init__(rs_path=rs_path, logger_name=MODULE_NAME, **kwargs)
 
     @property
     def module_name(self) -> str:
@@ -437,8 +440,11 @@ class ShotQualityModule(BaseModule):
             raise ValueError(f"{MODULE_NAME} | frame_indices is empty")
 
         frame_indices_np = np.asarray([int(i) for i in frame_indices], dtype=np.int32)
+        n = int(frame_indices_np.shape[0])
+        self.logger.info(f"{MODULE_NAME} | process | Начало обработки: frames={n}, device={self.device}")
 
         deps = self.load_all_dependencies()
+        self.logger.info(f"{MODULE_NAME} | process | Загружены зависимости: {len(deps)}")
 
         core_clip = deps.get("core_clip")
         core_depth = deps.get("core_depth_midas")
@@ -449,20 +455,33 @@ class ShotQualityModule(BaseModule):
         if core_clip is None or core_depth is None or core_det is None or core_lm is None or cut_det is None:
             raise RuntimeError(f"{MODULE_NAME} | missing required dependency results (None)")
 
+        self.logger.info(
+            f"{MODULE_NAME} | process | Зависимости найдены: "
+            f"core_clip={core_clip is not None}, core_depth={core_depth is not None}, "
+            f"core_det={core_det is not None}, core_lm={core_lm is not None}, cut_det={cut_det is not None}"
+        )
+
         # --- Validate + align indices across core providers ---
+        self.logger.info(f"{MODULE_NAME} | process | Валидация frame_indices для всех core providers")
         clip_idx = _as_int32(_require_npz_key(core_clip, "frame_indices", "core_clip"))
         clip_emb = _as_float32(_require_npz_key(core_clip, "frame_embeddings", "core_clip"))
         _ensure_same_indices(frame_indices_np, clip_idx, "core_clip")
+        self.logger.debug(f"{MODULE_NAME} | process | core_clip: embeddings shape={clip_emb.shape}")
 
         depth_idx = _as_int32(_require_npz_key(core_depth, "frame_indices", "core_depth_midas"))
         depth_maps = _as_float32(_require_npz_key(core_depth, "depth_maps", "core_depth_midas"))
         _ensure_same_indices(frame_indices_np, depth_idx, "core_depth_midas")
+        self.logger.debug(f"{MODULE_NAME} | process | core_depth_midas: depth_maps shape={depth_maps.shape}")
 
         det_idx = _as_int32(_require_npz_key(core_det, "frame_indices", "core_object_detections"))
         boxes = _as_float32(_require_npz_key(core_det, "boxes", "core_object_detections"))
         valid_mask = np.asarray(_require_npz_key(core_det, "valid_mask", "core_object_detections"), dtype=bool)
         class_ids = _as_int32(_require_npz_key(core_det, "class_ids", "core_object_detections"))
         _ensure_same_indices(frame_indices_np, det_idx, "core_object_detections")
+        self.logger.debug(
+            f"{MODULE_NAME} | process | core_object_detections: boxes shape={boxes.shape}, "
+            f"valid_detections={np.sum(valid_mask)}/{valid_mask.size}"
+        )
 
         lm_idx = _as_int32(_require_npz_key(core_lm, "frame_indices", "core_face_landmarks"))
         face = _as_float32(_require_npz_key(core_lm, "face_landmarks", "core_face_landmarks"))
@@ -470,8 +489,13 @@ class ShotQualityModule(BaseModule):
         has_any_face = bool(np.asarray(_require_npz_key(core_lm, "has_any_face", "core_face_landmarks")).item())
         empty_reason_faces = _require_npz_key(core_lm, "empty_reason", "core_face_landmarks")
         _ensure_same_indices(frame_indices_np, lm_idx, "core_face_landmarks")
+        self.logger.info(
+            f"{MODULE_NAME} | process | core_face_landmarks: has_any_face={has_any_face}, "
+            f"faces_detected={np.sum(face_present)}/{face_present.size if face_present.size > 0 else 0}"
+        )
 
         # --- CLIP-based shot-quality probabilities (from core_clip outputs) ---
+        self.logger.info(f"{MODULE_NAME} | process | Вычисление CLIP-based quality probabilities")
         prompts = _require_npz_key(core_clip, "shot_quality_prompts", "core_clip")
         txt_emb = _as_float32(_require_npz_key(core_clip, "shot_quality_text_embeddings", "core_clip"))
         if txt_emb.ndim != 2 or clip_emb.ndim != 2 or txt_emb.shape[1] != clip_emb.shape[1]:
@@ -497,21 +521,30 @@ class ShotQualityModule(BaseModule):
         chunk = 2048
         if self.device == "cuda":
             try:
-                free_b, _total_b = torch.cuda.mem_get_info()
+                free_b, total_b = torch.cuda.mem_get_info()
                 # heuristic: allow ~256MB for activations
                 if free_b < 2_000_000_000:
                     chunk = 512
                 elif free_b < 6_000_000_000:
                     chunk = 1024
+                self.logger.debug(
+                    f"{MODULE_NAME} | process | GPU memory: free={free_b/1e9:.2f}GB, "
+                    f"total={total_b/1e9:.2f}GB, chunk_size={chunk}"
+                )
             except Exception:
                 pass
 
+        self.logger.info(
+            f"{MODULE_NAME} | process | CLIP matmul: frames={n}, prompts={p}, "
+            f"chunk_size={chunk}, device={self.device}"
+        )
         with torch.no_grad():
             for start in range(0, n, chunk):
                 end = min(n, start + chunk)
                 logits = img_t[start:end] @ txt_t.T
                 probs = torch.softmax(logits, dim=-1)
                 quality_probs[start:end] = probs.detach().cpu().to(torch.float16).numpy()
+        self.logger.info(f"{MODULE_NAME} | process | CLIP quality probabilities вычислены: shape={quality_probs.shape}")
 
         # --- Per-frame feature extraction (pixels + depth + detections + face ROI) ---
         feature_names: List[str] = []
@@ -579,11 +612,42 @@ class ShotQualityModule(BaseModule):
         cast_map = {"red": 0, "green": 1, "blue": 2}
         distortion_map = {"none": 0}
 
+        self.logger.info(
+            f"{MODULE_NAME} | process | Начало извлечения per-frame features: "
+            f"frames={n}"
+        )
+        import time
+        tik_frame = time.time()
+        log_interval = max(1, n // 10)  # log every 10% progress
+
+        # Performance: compute most image-quality metrics on downscaled frames.
+        # This keeps baseline smoke runs fast while preserving stable signals.
+        ANALYSIS_MAX_DIM = 320
+
         for i, frame_idx in enumerate(frame_indices_np.tolist()):
+            if (i + 1) % log_interval == 0 or (i + 1) == n:
+                elapsed = time.time() - tik_frame
+                rate = (i + 1) / elapsed if elapsed > 0 else 0
+                self.logger.info(
+                    f"{MODULE_NAME} | process | Обработка кадров: {i+1}/{n} "
+                    f"({100*(i+1)/n:.1f}%), rate={rate:.1f} fps, elapsed={elapsed:.1f}s"
+                )
             frame_rgb = frame_manager.get(int(frame_idx))
             if frame_rgb.ndim != 3 or frame_rgb.shape[2] != 3:
                 raise RuntimeError(f"{MODULE_NAME} | invalid frame shape at idx={frame_idx}: {frame_rgb.shape}")
-            frame_bgr = cv2.cvtColor(frame_rgb, cv2.COLOR_RGB2BGR)
+            orig_h, orig_w = frame_rgb.shape[:2]
+
+            # Downscale RGB first, then compute BGR/GRAY for metrics
+            max_dim = max(orig_h, orig_w)
+            if max_dim > ANALYSIS_MAX_DIM:
+                scale = float(ANALYSIS_MAX_DIM) / float(max_dim)
+                new_w = max(1, int(round(orig_w * scale)))
+                new_h = max(1, int(round(orig_h * scale)))
+                rgb_small = cv2.resize(frame_rgb, (new_w, new_h), interpolation=cv2.INTER_AREA)
+            else:
+                rgb_small = frame_rgb
+
+            frame_bgr = cv2.cvtColor(rgb_small, cv2.COLOR_RGB2BGR)
             gray = cv2.cvtColor(frame_bgr, cv2.COLOR_BGR2GRAY)
 
             feats["sharpness_tenengrad"][i] = sharpness_tenengrad(gray)
@@ -648,20 +712,21 @@ class ShotQualityModule(BaseModule):
                 x1y1 = bxs[:, :2]
                 x2y2 = bxs[:, 2:4]
                 wh = np.clip(x2y2 - x1y1, 0.0, None)
-                areas = wh[:, 0] * wh[:, 1] / float(frame_bgr.shape[0] * frame_bgr.shape[1] + 1e-9)
+                areas = wh[:, 0] * wh[:, 1] / float(orig_h * orig_w + 1e-9)
                 feats["objects_area_mean"][i] = float(np.mean(areas))
             else:
                 feats["objects_area_mean"][i] = 0.0
 
             # face ROI metrics (use first face only). Valid empty output is allowed:
             # if no faces detected -> keep NaN for face_* features.
-            h, w = frame_bgr.shape[:2]
+            h, w = orig_h, orig_w
             if face_present.ndim >= 2 and face_present[i, 0]:
                 face_lm = face[i, 0]  # (468,3)
                 bb = _bbox_from_landmarks(face_lm, w=w, h=h)
                 if bb is not None:
                     x1, y1, x2, y2 = bb
-                    roi = gray[y1:y2, x1:x2]
+                    gray_full = cv2.cvtColor(frame_rgb, cv2.COLOR_RGB2GRAY)
+                    roi = gray_full[y1:y2, x1:x2]
                     feats["face_sharpness_tenengrad"][i] = sharpness_tenengrad(roi) if roi.size else np.nan
                     feats["face_noise_level_luma"][i] = noise_level_luma(roi) if roi.size else np.nan
                 else:
@@ -670,6 +735,12 @@ class ShotQualityModule(BaseModule):
             else:
                 feats["face_sharpness_tenengrad"][i] = np.nan
                 feats["face_noise_level_luma"][i] = np.nan
+
+        tok_frame = time.time() - tik_frame
+        self.logger.info(
+            f"{MODULE_NAME} | process | Per-frame features извлечены: "
+            f"frames={n}, elapsed={tok_frame:.2f}s, avg={tok_frame/n*1000:.1f}ms/frame"
+        )
 
         # Build frame feature matrix in stable order
         ordered_keys: List[str] = [
@@ -709,6 +780,7 @@ class ShotQualityModule(BaseModule):
         )
 
         # --- Shot segmentation from cut_detection results ---
+        self.logger.info(f"{MODULE_NAME} | process | Построение shot boundaries из cut_detection")
         # cut_detection returns indices as positions in its own frame_indices list.
         detections = cut_det.get("detections")
         if not isinstance(detections, dict):
@@ -717,6 +789,8 @@ class ShotQualityModule(BaseModule):
         hard_pos = detections.get("hard_cut_indices")
         if not isinstance(hard_pos, list):
             raise RuntimeError(f"{MODULE_NAME} | cut_detection.detections.hard_cut_indices missing/invalid")
+
+        self.logger.debug(f"{MODULE_NAME} | process | cut_detection: hard_cut_indices count={len(hard_pos)}")
 
         # Reconstruct cut_detection frame_indices from metadata (Segmenter contract)
         meta_full = getattr(frame_manager, "meta", None)
@@ -728,6 +802,11 @@ class ShotQualityModule(BaseModule):
         cd_indices = np.asarray([int(x) for x in cd_block.get("frame_indices")], dtype=np.int32)
         if cd_indices.size == 0:
             raise RuntimeError(f"{MODULE_NAME} | cut_detection.frame_indices empty")
+
+        self.logger.debug(
+            f"{MODULE_NAME} | process | cut_detection alignment: "
+            f"cd_indices count={cd_indices.size}, hard_cut_positions={len(hard_pos)}"
+        )
 
         # Convert cut positions -> global frame indices (cut at cd_indices[pos])
         cut_frames = []
@@ -757,8 +836,16 @@ class ShotQualityModule(BaseModule):
             shot_ids[i] = int(max(0, sid))
 
         s = int(shot_start_frames.shape[0])
+        self.logger.info(
+            f"{MODULE_NAME} | process | Shot segmentation: shots={s}, "
+            f"cuts={len(cut_frames)}, frames_per_shot_avg={n/s:.1f}"
+        )
 
         # per-shot aggregates over frame_features
+        self.logger.info(
+            f"{MODULE_NAME} | process | Агрегация per-shot features: "
+            f"shots={s}, feature_dim={frame_features.shape[1]}"
+        )
         shot_mean = np.zeros((s, frame_features.shape[1]), dtype=np.float32)
         shot_std = np.zeros((s, frame_features.shape[1]), dtype=np.float32)
         shot_min = np.zeros((s, frame_features.shape[1]), dtype=np.float32)
@@ -774,6 +861,12 @@ class ShotQualityModule(BaseModule):
             shot_std[sid] = np.nanstd(seg, axis=0)
             shot_min[sid] = np.nanmin(seg, axis=0)
             shot_max[sid] = np.nanmax(seg, axis=0)
+        self.logger.debug(
+            f"{MODULE_NAME} | process | Shot aggregates: "
+            f"min_frames_per_shot={int(np.min(shot_counts))}, "
+            f"max_frames_per_shot={int(np.max(shot_counts))}, "
+            f"mean_frames_per_shot={float(np.mean(shot_counts)):.1f}"
+        )
 
         meta_out = {
             "producer": MODULE_NAME,
@@ -789,6 +882,12 @@ class ShotQualityModule(BaseModule):
             "faces_empty_reason": None if empty_reason_faces is None else str(np.asarray(empty_reason_faces, dtype=object).item()),
             "note_empty_faces": "If no faces detected, face_* features are NaN and face_present is False. This is a valid output (provider ran successfully).",
         }
+
+        self.logger.info(
+            f"{MODULE_NAME} | process | Обработка завершена: "
+            f"frames={n}, shots={s}, features={len(feature_names)}, "
+            f"quality_prompts={p}, faces_available={has_any_face}"
+        )
 
         return {
             # index

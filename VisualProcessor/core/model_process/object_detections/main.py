@@ -47,11 +47,14 @@ if _path not in sys.path:
     sys.path.append(_path)
 
 from utils.frame_manager import FrameManager
+from utils.batching import auto_batch_size
 from utils.logger import get_logger
+from utils.resource_probe import pick_device
 from utils.utilites import load_metadata
 
 NAME = "core_object_detections"
 VERSION = "2.1"
+SCHEMA_VERSION = "core_object_detections_npz_v1"
 LOGGER = get_logger(NAME)
 
 MAX_DETECTIONS = 100
@@ -165,11 +168,13 @@ class OWLModule:
         self,
         frame: np.ndarray,
         text_queries: Optional[List[str]] = None,
+        frames_are_bgr: bool = False,
     ) -> Tuple[List[Dict[str, Any]], float]:
         """
         Detect objects in a single frame.
 
-        :param frame: BGR numpy array (OpenCV format)
+        :param frame: numpy array frame from FrameManager.get(); by contract it's RGB uint8 HxWx3.
+        :param frames_are_bgr: set True only for legacy callers if their frames are BGR.
         :param text_queries: list of text queries (strings)
         :return: tuple of (list of detections {bbox, score, label, ...}, processing_time)
         """
@@ -179,9 +184,9 @@ class OWLModule:
         # ensure model is loaded
         self._load_model()
 
-        # Convert to RGB (from BGR OpenCV)
+        # Ensure RGB for PIL/processor.
         if frame.ndim == 3:
-            rgb = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
+            rgb = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB) if frames_are_bgr else frame
         else:
             # grayscale? convert to 3-channel
             rgb = cv2.cvtColor(frame, cv2.COLOR_GRAY2RGB)
@@ -275,7 +280,7 @@ class OWLModule:
         """
         Main execution method.
 
-        :param frame_manager: object with .fps and .get(index) -> numpy frame (BGR)
+        :param frame_manager: object with .fps and .get(index) -> numpy frame (RGB by contract)
         :param frame_indices: list of frame indices to process
         :return: result dictionary containing per-frame detections and summary
         """
@@ -306,7 +311,7 @@ class OWLModule:
 
             try:
                 tik = time.time()
-                detections, pred_time = self._detect_objects_in_frame(frame, text_queries=queries)
+                detections, pred_time = self._detect_objects_in_frame(frame, text_queries=queries, frames_are_bgr=False)
                 det_tok = round(time.time() - tik, 2)
 
                 LOGGER.debug(f"pred_time: {pred_time} | det_tok: {det_tok}")
@@ -417,7 +422,9 @@ def run_yolo(
 
     for start in range(0, n, batch_size):
         batch_idx = frame_indices[start : start + batch_size]
-        batch_frames = [frame_manager.get(i) for i in batch_idx]
+        # FrameManager.get() returns RGB; ultralytics accepts numpy images, but many CV pipelines assume BGR.
+        # Convert RGB->BGR for stability with OpenCV-based preprocessing.
+        batch_frames = [cv2.cvtColor(frame_manager.get(i), cv2.COLOR_RGB2BGR) for i in batch_idx]
 
         try:
             results = model(batch_frames, device=device, verbose=False)
@@ -558,9 +565,14 @@ def run_tracking(
         LOGGER.exception("ByteTrack import failed: %s", e)
         raise
 
+    class args:
+        track_thresh=tracker_cfg.get("track_thresh", 0.25)
+        match_thresh=tracker_cfg.get("match_thresh", 0.8)
+        track_buffer=5
+        mot20=True
+
     tracker = BYTETracker(
-        track_thresh=tracker_cfg.get("track_thresh", 0.25),
-        match_thresh=tracker_cfg.get("match_thresh", 0.8),
+        args,
         frame_rate=tracker_cfg.get("frame_rate", 30),
     )
 
@@ -659,7 +671,9 @@ def atomic_save_npz(path: str, **kwargs) -> None:
     Атомарно сохраняет np.savez_compressed через временный файл.
     """
     os.makedirs(os.path.dirname(path), exist_ok=True)
-    fd, tmp = tempfile.mkstemp(prefix=os.path.basename(path), dir=os.path.dirname(path))
+    # IMPORTANT: tmp must have .npz suffix, otherwise numpy will write to tmp + ".npz"
+    # leaving tmp empty and corrupting the final artifact on os.replace().
+    fd, tmp = tempfile.mkstemp(prefix=os.path.basename(path) + ".", suffix=".npz", dir=os.path.dirname(path))
     os.close(fd)
     try:
         np.savez_compressed(tmp, **kwargs)
@@ -677,12 +691,12 @@ def main():
     parser.add_argument("--frames-dir", required=True)
     parser.add_argument("--rs-path", required=True)
     parser.add_argument("--model", default="yolov8n.pt")
-    parser.add_argument("--batch-size", type=int, default=16)
+    parser.add_argument("--batch-size", type=str, default="16", help="Integer batch size or 'auto' (or 0)")
     parser.add_argument("--box-threshold", type=float, default=0.6)
     parser.add_argument("--use-queries", action="store_true")
     parser.add_argument("--default-categories", type=str, default=None)
     parser.add_argument("--model-family", type=str, default="owlv2")
-    parser.add_argument("--device", type=str, default="cuda")
+    parser.add_argument("--device", type=str, default="auto", help="'auto'|'cpu'|'cuda'")
     parser.add_argument("--iou-threshold", type=float, default=0.3)
     # NOTE: frame sampling is owned by Segmenter/DataProcessor.
     # We keep sample-step for backward compatibility, but production uses metadata[NAME].frame_indices.
@@ -712,6 +726,30 @@ def main():
     )
 
     try:
+        device = pick_device(args.device)
+        bs_raw = (args.batch_size or "").strip().lower()
+        if bs_raw in ("auto", "0", ""):
+            decision = auto_batch_size(
+                device=device,
+                frame_shape=(int(frame_manager.height), int(frame_manager.width), int(frame_manager.channels)),
+                model_hint="yolo" if not args.use_queries else "owl",
+                max_batch_cap=32,
+                reserve_ratio=0.25,
+                cpu_default=1,
+            )
+            batch_size = int(decision.batch_size)
+            LOGGER.info(
+                "%s | auto batch_size=%d | reason=%s | free=%s total=%s per_sample_est=%s",
+                NAME,
+                batch_size,
+                decision.reason,
+                decision.free_bytes,
+                decision.total_bytes,
+                decision.per_sample_bytes_est,
+            )
+        else:
+            batch_size = max(1, int(bs_raw))
+
         if args.use_queries:
             default_categories = (
                 args.default_categories.split(",") if args.default_categories else None
@@ -721,7 +759,7 @@ def main():
                 frame_indices=frame_indices,
                 model=args.model,
                 model_family=args.model_family,
-                device=args.device,
+                device=device,
                 default_categories=default_categories,
                 box_threshold=args.box_threshold,
             )
@@ -732,14 +770,14 @@ def main():
                 frame_indices=frame_indices,
                 model_path=args.model,
                 box_threshold=args.box_threshold,
-                batch_size=args.batch_size,
-                device=args.device,
+                batch_size=batch_size,
+                device=device,
             )
             impl = "yolo"
 
         # run tracking (ByteTrack) on raw detections
         try:
-            tracker_cfg = {"track_thresh": 0.25, "match_thresh": 0.8, "frame_rate": meta.fps}
+            tracker_cfg = {"track_thresh": 0.25, "match_thresh": 0.8, "frame_rate": int(getattr(frame_manager, "fps", meta.get("fps", 30)))}
             tracks_arr, tracks_map = run_tracking(
                 raw_per_frame=raw_per_frame,
                 frame_indices=frame_indices,
@@ -772,6 +810,7 @@ def main():
         meta_info = {
             "producer": NAME,
             "producer_version": VERSION,
+            "schema_version": SCHEMA_VERSION,
             "created_at": created_at,
             "status": "ok" if len(frame_indices) > 0 else "empty",
             "empty_reason": None if len(frame_indices) > 0 else "no_frames",
@@ -779,12 +818,17 @@ def main():
             "model": args.model,
             "model_family": args.model_family if impl == "owl" else "yolo",
             "box_threshold": args.box_threshold,
+            "batch_size": int(batch_size),
+            "device": str(device),
             "total_frames": int(total_frames),
             "sample_step": None,
         }
-        for k in ["platform_id", "video_id", "run_id", "sampling_policy_version", "config_hash"]:
-            if k in meta:
-                meta_info[k] = meta.get(k)
+        required_run_keys = ["platform_id", "video_id", "run_id", "sampling_policy_version", "config_hash"]
+        missing = [k for k in required_run_keys if not meta.get(k)]
+        if missing:
+            raise RuntimeError(f"{NAME} | frames metadata missing required run identity keys: {missing}")
+        for k in required_run_keys:
+            meta_info[k] = meta.get(k)
 
         atomic_save_npz(
             out_path,

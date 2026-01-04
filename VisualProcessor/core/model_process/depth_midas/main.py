@@ -30,11 +30,14 @@ if _path not in sys.path:
     sys.path.append(_path)
 
 from utils.frame_manager import FrameManager
+from utils.batching import auto_batch_size
 from utils.logger import get_logger
+from utils.resource_probe import pick_device
 from utils.utilites import load_metadata
 
 VERSION = "2.0"
 NAME = "core_depth_midas"
+SCHEMA_VERSION = "core_depth_midas_npz_v1"
 LOGGER = get_logger(NAME)
 
 
@@ -204,17 +207,17 @@ def main():
     parser = argparse.ArgumentParser(description="Production MiDaS depth extractor")
     parser.add_argument("--frames-dir", type=str, required=True, help="Path to frames directory")
     parser.add_argument("--rs-path", type=str, required=True, help="Path to VisualProcessor result_store")
-    parser.add_argument("--device", type=str, choices=["cuda", "cpu"], default="cuda", help="Preferred device")
+    parser.add_argument("--device", type=str, choices=["auto", "cuda", "cpu"], default="auto", help="Preferred device")
     parser.add_argument("--out-width", type=int, default=256, help="Output width of saved depth maps (downsampled) to store in NPZ")
     parser.add_argument("--out-height", type=int, default=256, help="Output height of saved depth maps (downsampled) to store in NPZ")
-    parser.add_argument("--batch-size", type=int, default=4, help="Batch size for MiDaS inference (memory sensitive)")
+    parser.add_argument("--batch-size", type=str, default="4", help="Integer batch size or 'auto' (or 0)")
     parser.add_argument("--frames-bgr", action="store_true", help="Set if FrameManager returns BGR images instead of RGB")
     parser.add_argument("--save-full-res", action="store_true", help="Also save full-resolution per-frame .npy depth maps under maps/")
     parser.add_argument("--model-name", type=str, default="MiDaS_small", help="MiDaS model name to load from intel-isl/MiDaS")
     args = parser.parse_args()
 
     # Choose device: prefer cuda if available and requested
-    device = args.device if (args.device == "cpu" or torch.cuda.is_available()) else "cpu"
+    device = pick_device(args.device)
     LOGGER.info(f"{NAME} | main | device selected: {device}")
 
     # Load model
@@ -245,6 +248,26 @@ def main():
     )
     LOGGER.info(f"{NAME} | main | FrameManager initialized (chunk_size={meta.get('chunk_size', 32)}, cache_size={meta.get('cache_size', 2)})")
 
+    # Resolve batch size
+    batch_size = 4
+    bs_raw = (args.batch_size or "").strip().lower()
+    if bs_raw in ("auto", "0", ""):
+        decision = auto_batch_size(
+            device=device,
+            frame_shape=(int(frame_manager.height), int(frame_manager.width), int(frame_manager.channels)),
+            model_hint="midas",
+            max_batch_cap=8,
+            reserve_ratio=0.35,
+            cpu_default=1,
+        )
+        batch_size = int(decision.batch_size)
+        LOGGER.info(
+            f"{NAME} | auto batch_size={batch_size} | reason={decision.reason} | "
+            f"free={decision.free_bytes} total={decision.total_bytes} per_sample_est={decision.per_sample_bytes_est}"
+        )
+    else:
+        batch_size = max(1, int(bs_raw))
+
     # Prepare output dirs
     core_dir = os.path.join(args.rs_path, NAME)
     maps_dir = os.path.join(core_dir, "maps")
@@ -262,7 +285,7 @@ def main():
             midas_transform=midas_transform,
             device=device,
             out_size=out_size,
-            batch_size=max(1, int(args.batch_size)),
+            batch_size=int(batch_size),
             frames_are_bgr=args.frames_bgr,
             save_full_res=args.save_full_res,
             maps_dir=maps_dir if args.save_full_res else None,
@@ -286,6 +309,7 @@ def main():
     meta_out: Dict[str, Any] = {
         "producer": NAME,
         "producer_version": VERSION,
+        "schema_version": SCHEMA_VERSION,
         "created_at": created_at,
         "status": "ok" if len(frame_indices) > 0 else "empty",
         "empty_reason": None if len(frame_indices) > 0 else "no_frames",
@@ -293,11 +317,14 @@ def main():
         "total_frames": int(total_frames),
         "out_width": int(args.out_width),
         "out_height": int(args.out_height),
-        "batch_size": int(args.batch_size),
+        "batch_size": int(batch_size),
         "device": str(device),
     }
-    for k in ["platform_id", "video_id", "run_id", "sampling_policy_version", "config_hash"]:
-        if k in meta:
+    required_run_keys = ["platform_id", "video_id", "run_id", "sampling_policy_version", "config_hash"]
+    missing = [k for k in required_run_keys if not meta.get(k)]
+    if missing:
+        raise RuntimeError(f"{NAME} | frames metadata missing required run identity keys: {missing}")
+    for k in required_run_keys:
             meta_out[k] = meta.get(k)
 
     np.savez_compressed(

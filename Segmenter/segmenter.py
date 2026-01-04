@@ -130,13 +130,31 @@ def _build_visual_extractor_configs_from_visual_cfg(
     extractor_configs: List[Dict[str, Any]] = []
     for comp in enabled_unique:
         b = budgets.get(comp, {"min": 120, "target": 250, "max": 600})
+
+        # Optional per-component overrides from VisualProcessor config.
+        # Supports either:
+        #   <component>:
+        #     sampling:
+        #       min_frames: ...
+        #       target_frames: ...
+        #       max_frames: ...
+        # or direct keys on the component config for convenience.
+        comp_cfg = cfg.get(comp) or {}
+        sampling_cfg = (comp_cfg.get("sampling") or {}) if isinstance(comp_cfg, dict) else {}
+        def _pick_int(key: str, default: int) -> int:
+            if isinstance(sampling_cfg, dict) and key in sampling_cfg and sampling_cfg[key] is not None:
+                return int(sampling_cfg[key])
+            if isinstance(comp_cfg, dict) and key in comp_cfg and comp_cfg[key] is not None:
+                return int(comp_cfg[key])
+            return int(default)
+
         extractor_configs.append(
             {
                 "name": comp,
                 "modality": "video",
-                "min_frames": int(b["min"]),
-                "target_frames": int(b["target"]),
-                "max_frames": int(b["max"]),
+                "min_frames": _pick_int("min_frames", int(b["min"])),
+                "target_frames": _pick_int("target_frames", int(b["target"])),
+                "max_frames": _pick_int("max_frames", int(b["max"])),
             }
         )
     _log(logger, f"[Segmenter] built {len(extractor_configs)} video extractor configs from {visual_cfg_path}")
@@ -764,6 +782,7 @@ if __name__ == "__main__":
     parser.add_argument("--video-id", type=str, default=None)
     parser.add_argument("--run-id", type=str, default=None)
     parser.add_argument("--sampling-policy-version", type=str, default="v1")
+    parser.add_argument("--config-hash", type=str, default=None, help="Optional config hash propagated by DataProcessor")
     args = parser.parse_args()
 
     seg = Segmenter(out_dir=args.output, chunk_size=int(args.chunk_size), logger=None)
@@ -786,6 +805,7 @@ if __name__ == "__main__":
         "video_id": _vid,
         "run_id": _run_id,
         "sampling_policy_version": args.sampling_policy_version,
+        "config_hash": args.config_hash,
     }
 
     seg.run(

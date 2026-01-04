@@ -1,5 +1,7 @@
 #!/VisualProcessor/core/model_process/.model_process_venv python3
 
+
+
 import argparse
 import os
 import sys
@@ -21,6 +23,7 @@ from utils.utilites import load_metadata
 
 VERSION = "2.0"
 NAME = "core_face_landmarks"
+SCHEMA_VERSION = "core_face_landmarks_npz_v1"
 LOGGER = get_logger(NAME)
 
 
@@ -174,20 +177,20 @@ def main():
     parser.add_argument("--use-hands", action="store_true")
     parser.add_argument("--use-face-mesh", action="store_true")
     parser.add_argument("--pose-static-image-mode", action="store_true")
-    parser.add_argument("--pose-model-complexity", type=int)
+    parser.add_argument("--pose-model-complexity", type=int, default=2)
     parser.add_argument("--pose-enable-segmentation", action="store_true")
-    parser.add_argument("--pose-min-detection-confidence", type=float)
-    parser.add_argument("--pose-min-tracking-confidence", type=float)
+    parser.add_argument("--pose-min-detection-confidence", type=float, default=0.5)
+    parser.add_argument("--pose-min-tracking-confidence", type=float, default=0.5)
     parser.add_argument("--hands-static-image-mode", action="store_true")
-    parser.add_argument("--hands-max-num-hands", type=int)
-    parser.add_argument("--hands-model-complexity", type=int)
-    parser.add_argument("--hands-min-detection-confidence", type=float)
-    parser.add_argument("--hands-min-tracking-confidence", type=float)
+    parser.add_argument("--hands-max-num-hands", type=int, default=2)
+    parser.add_argument("--hands-model-complexity", type=int, default=1)
+    parser.add_argument("--hands-min-detection-confidence", type=float, default=0.5)
+    parser.add_argument("--hands-min-tracking-confidence", type=float, default=0.5)
     parser.add_argument("--face-mesh-static-image-mode", action="store_true")
-    parser.add_argument("--face-mesh-max-num-faces", type=int)
+    parser.add_argument("--face-mesh-max-num-faces", type=int, default=1)
     parser.add_argument("--face-mesh-refine-landmarks", action="store_true")
-    parser.add_argument("--face-mesh-min-detection-confidence", type=float)
-    parser.add_argument("--face-mesh-min-tracking-confidence", type=float)
+    parser.add_argument("--face-mesh-min-detection-confidence", type=float, default=0.5)
+    parser.add_argument("--face-mesh-min-tracking-confidence", type=float, default=0.5)
     args = parser.parse_args()
 
     meta = load_metadata(os.path.join(args.frames_dir, "metadata.json"), NAME)
@@ -236,15 +239,19 @@ def main():
     meta_out = {
         "producer": NAME,
         "producer_version": VERSION,
+        "schema_version": SCHEMA_VERSION,
         "created_at": datetime.utcnow().isoformat(),
-        "status": "ok",
+        "status": "empty" if empty_reason else "ok",
         "empty_reason": empty_reason,
         "model_name": "mediapipe",
         "total_frames": int(total_frames),
     }
-    for k in ["platform_id", "video_id", "run_id", "sampling_policy_version", "config_hash"]:
-        if k in meta:
-            meta_out[k] = meta.get(k)
+    required_run_keys = ["platform_id", "video_id", "run_id", "sampling_policy_version", "config_hash"]
+    missing = [k for k in required_run_keys if not meta.get(k)]
+    if missing:
+        raise RuntimeError(f"{NAME} | frames metadata missing required run identity keys: {missing}")
+    for k in required_run_keys:
+        meta_out[k] = meta.get(k)
 
     np.savez_compressed(
         out_path,

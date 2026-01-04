@@ -13,12 +13,15 @@ if _path not in sys.path:
     sys.path.append(_path)
 
 from utils.frame_manager import FrameManager
+from utils.batching import auto_batch_size
 from utils.logger import get_logger
+from utils.resource_probe import pick_device
 from utils.utilites import load_metadata
 
 
 NAME = "core_clip"
 VERSION = "2.0"
+SCHEMA_VERSION = "core_clip_npz_v1"
 LOGGER = get_logger(NAME)
 
 SHOT_QUALITY_PROMPTS: List[str] = [
@@ -63,10 +66,10 @@ def compute_text_embeddings(
     return emb.detach().cpu().numpy().astype(np.float32)
 
 
-def init_clip(model_name: str) -> Tuple[torch.nn.Module, callable, str]:
+def init_clip(model_name: str, preferred_device: str = "auto") -> Tuple[torch.nn.Module, callable, str]:
     import clip # type: ignore
 
-    device = "cuda" if torch.cuda.is_available() else "cpu"
+    device = pick_device(preferred_device)
     model, preprocess = clip.load(model_name, device=device)
 
     model.eval()
@@ -138,7 +141,7 @@ def main():
     parser.add_argument("--frames-dir", required=True)
     parser.add_argument("--rs-path", required=True)
     parser.add_argument("--model-name", default="ViT-B/32")
-    parser.add_argument("--batch-size", type=int, default=32)
+    parser.add_argument("--batch-size", type=str, default="32", help="Integer batch size or 'auto' (or 0)")
     args = parser.parse_args()
 
     meta_path = os.path.join(args.frames_dir, "metadata.json")
@@ -156,15 +159,36 @@ def main():
     )
 
     # Init CLIP once and reuse for both image + text embeddings.
-    model, preprocess, device = init_clip(args.model_name)
+    model, preprocess, device = init_clip(args.model_name, preferred_device="auto")
+    # Safe default; may be overridden by auto selection below.
+    batch_size = 32
     try:
+        # Resolve batch size (strictly: number or 'auto'/0)
+        bs_raw = (args.batch_size or "").strip().lower()
+        if bs_raw in ("auto", "0", ""):
+            decision = auto_batch_size(
+                device=device,
+                frame_shape=(int(frame_manager.height), int(frame_manager.width), int(frame_manager.channels)),
+                model_hint="clip",
+                max_batch_cap=64,
+                reserve_ratio=0.25,
+                cpu_default=1,
+            )
+            batch_size = int(decision.batch_size)
+            LOGGER.info(
+                f"{NAME} | auto batch_size={batch_size} | reason={decision.reason} | "
+                f"free={decision.free_bytes} total={decision.total_bytes} per_sample_est={decision.per_sample_bytes_est}"
+            )
+        else:
+            batch_size = max(1, int(bs_raw))
+
         # --- image embeddings ---
         n_frames = len(frame_indices)
         embeddings_out = None
         embed_dim = None
         with torch.no_grad():
-            for start in range(0, n_frames, args.batch_size):
-                batch_ids = frame_indices[start : start + args.batch_size]
+            for start in range(0, n_frames, batch_size):
+                batch_ids = frame_indices[start : start + batch_size]
                 images = []
                 for idx in batch_ids:
                     frame = frame_manager.get(idx)
@@ -178,7 +202,7 @@ def main():
                     embed_dim = int(emb_np.shape[1])
                     embeddings_out = np.zeros((n_frames, embed_dim), dtype=np.float32)
                 embeddings_out[start : start + len(batch_ids)] = emb_np
-                if start % (args.batch_size * 10) == 0:
+                if start % (batch_size * 10) == 0:
                     LOGGER.info(f"{NAME} | processed {start + len(batch_ids)}/{n_frames}")
 
         embeddings = embeddings_out if embeddings_out is not None else np.zeros((0, 0), dtype=np.float32)
@@ -211,14 +235,19 @@ def main():
     meta_out = {
         "producer": NAME,
         "producer_version": VERSION,
+        "schema_version": SCHEMA_VERSION,
         "created_at": created_at,
         "status": "ok" if len(frame_indices) > 0 else "empty",
         "empty_reason": None if len(frame_indices) > 0 else "no_frames",
         "model_name": args.model_name,
         "total_frames": int(total_frames),
+        "batch_size": int(batch_size),
     }
-    for k in ["platform_id", "video_id", "run_id", "sampling_policy_version", "config_hash"]:
-        if k in meta:
+    required_run_keys = ["platform_id", "video_id", "run_id", "sampling_policy_version", "config_hash"]
+    missing = [k for k in required_run_keys if not meta.get(k)]
+    if missing:
+        raise RuntimeError(f"{NAME} | frames metadata missing required run identity keys: {missing}")
+    for k in required_run_keys:
             meta_out[k] = meta.get(k)
 
     np.savez_compressed(

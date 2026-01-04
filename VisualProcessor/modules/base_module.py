@@ -26,6 +26,7 @@ from utils.logger import get_logger
 from utils.utilites import load_metadata
 import json
 import uuid
+import re
 
 
 class BaseModule(ABC):
@@ -54,6 +55,7 @@ class BaseModule(ABC):
             **kwargs: Дополнительные параметры для конкретных модулей
         """
         self.rs_path = rs_path
+        self._explicit_logger_name = logger_name is not None
         self.logger_name = logger_name or self.__class__.__name__
         self.logger = get_logger(self.logger_name)
         self._results_store: Optional[ResultsStore] = None
@@ -67,14 +69,24 @@ class BaseModule(ABC):
         Имя модуля (используется для сохранения результатов).
         По умолчанию - имя класса в нижнем регистре без суффикса "Module".
         """
+        # 1) Explicit override by subclasses
+        forced = getattr(self, "MODULE_NAME", None)
+        if isinstance(forced, str) and forced:
+            return forced
+
+        # 2) If caller explicitly provided logger_name, treat it as canonical module name (common in this repo).
+        if self._explicit_logger_name and isinstance(self.logger_name, str) and self.logger_name:
+            return self.logger_name
+
+        # 3) Otherwise: derive snake_case from class name (ShotQualityModule -> shot_quality).
         name = self.__class__.__name__
-        if name.endswith("Module"):
-            name = name[:-6]
-        elif name.endswith("Processor"):
-            name = name[:-9]
-        elif name.endswith("Analyzer"):
-            name = name[:-8]
-        return name.lower()
+        for suffix in ("Module", "Processor", "Analyzer", "Pipeline"):
+            if name.endswith(suffix):
+                name = name[: -len(suffix)]
+                break
+        s1 = re.sub("(.)([A-Z][a-z]+)", r"\1_\2", name)
+        snake = re.sub("([a-z0-9])([A-Z])", r"\1_\2", s1).lower()
+        return snake
     
     @property
     def results_store(self) -> ResultsStore:
@@ -240,9 +252,12 @@ class BaseModule(ABC):
             result: Dict[str, Any] = {}
             for key in loaded.files:
                 value = loaded[key]
-                # Для object массивов возвращаем как есть
-                if isinstance(value, np.ndarray) and value.dtype == object:
-                    result[key] = value
+                # Unbox scalar object arrays (common for dict-like payloads: detections/features/meta)
+                if isinstance(value, np.ndarray) and value.dtype == object and value.shape == ():
+                    try:
+                        result[key] = value.item()
+                    except Exception:
+                        result[key] = value
                 else:
                     result[key] = value
             self.logger.debug(f"{self.module_name} | Загружен npz: {path}")
@@ -392,11 +407,14 @@ class BaseModule(ABC):
             raise ValueError(f"{self.module_name} | rs_path не указан для сохранения результатов")
         
         # Подготовка метаданных
-        save_meta = {
-            "producer": self.module_name,
-            "created_at": datetime.utcnow().isoformat(),
-            **(metadata or {})
-        }
+        save_meta = dict(metadata or {})
+        save_meta.setdefault("producer", self.module_name)
+        save_meta.setdefault("created_at", datetime.utcnow().isoformat())
+        # Baseline meta contract fields (best-effort defaults; run() should populate the identity keys).
+        save_meta.setdefault("producer_version", getattr(self, "VERSION", None) or getattr(self, "producer_version", None) or "unknown")
+        save_meta.setdefault("schema_version", getattr(self, "SCHEMA_VERSION", None) or f"{self.module_name}_npz_v1")
+        save_meta.setdefault("status", "ok")
+        save_meta.setdefault("empty_reason", None)
         
         # Определяем, нужно ли использовать store_compressed
         # (для per-track результатов с эмбеддингами)
@@ -458,28 +476,31 @@ class BaseModule(ABC):
         
         # Атомарное сохранение
         import tempfile
+        tmp_path = None
         try:
-            fd, tmp_path = tempfile.mkstemp(prefix=f"{Path(npz_path).name}.", suffix=".npz", dir=core_dir)
+            fd, tmp_path = tempfile.mkstemp(
+                prefix=f"{Path(npz_path).name}.",
+                suffix=".npz",
+                dir=core_dir,
+            )
             os.close(fd)
-        try:
             np.savez_compressed(tmp_path, **npz_dict)
             os.replace(tmp_path, npz_path)
-            finally:
-                # cleanup tmp if something went wrong before replace
-                try:
-                    if os.path.exists(tmp_path) and tmp_path != npz_path:
-                        os.remove(tmp_path)
-                except Exception:
-                    pass
-            self.logger.info(
-                f"{self.module_name} | Результаты сохранены: {npz_path}"
-            )
-            return npz_path
         except Exception as e:
             self.logger.exception(
                 f"{self.module_name} | Ошибка сохранения результатов: {e}"
             )
             raise
+        finally:
+            # cleanup tmp if something went wrong before replace
+            try:
+                if tmp_path and os.path.exists(tmp_path) and tmp_path != npz_path:
+                    os.remove(tmp_path)
+            except Exception:
+                pass
+
+        self.logger.info(f"{self.module_name} | Результаты сохранены: {npz_path}")
+        return npz_path
     
     def load_metadata(self, frames_dir: str) -> Dict[str, Any]:
         """
@@ -620,6 +641,12 @@ class BaseModule(ABC):
         # Загрузка метаданных
         if metadata is None:
             metadata = self.load_metadata(frames_dir)
+
+        # Enforce run identity fields for baseline reproducibility (Segmenter writes these).
+        required_run_keys = ["platform_id", "video_id", "run_id", "sampling_policy_version", "config_hash"]
+        missing = [k for k in required_run_keys if not metadata.get(k)]
+        if missing:
+            raise RuntimeError(f"{self.module_name} | frames metadata missing required run identity keys: {missing}")
         
         # Получение индексов кадров
         frame_indices = self.get_frame_indices(metadata, fallback_to_all=False)
@@ -649,6 +676,12 @@ class BaseModule(ABC):
                 "total_frames": metadata.get("total_frames"),
                 "processed_frames": len(frame_indices),
                 "frames_dir": frames_dir,
+            # Baseline run identity (copied into NPZ meta)
+            "platform_id": metadata.get("platform_id"),
+            "video_id": metadata.get("video_id"),
+            "run_id": metadata.get("run_id"),
+            "sampling_policy_version": metadata.get("sampling_policy_version"),
+            "config_hash": metadata.get("config_hash"),
             }
             
             # Сохранение результатов

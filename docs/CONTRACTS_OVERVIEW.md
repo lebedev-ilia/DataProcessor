@@ -22,9 +22,36 @@
 7) **Storage per-run**:
    - `result_store/<platform_id>/<video_id>/<run_id>/<component_name>/...`
    - `manifest.json` рядом с артефактами.
-8) **Idempotency**: компонент уникально идентифицируется ключом `(platform_id, video_id, run_id, component, config_hash, sampling_policy_version, versions)`.
+8) **Idempotency**: компонент уникально идентифицируется ключом `(platform_id, video_id, run_id, component, config_hash, sampling_policy_version, dataprocessor_version, versions)`.
+   - `config_hash` должен быть **единым для всего run** и прокидываться во все под-процессоры (Segmenter/Visual/Audio/Text).
+   - `dataprocessor_version` обязателен в `manifest.run` и в `meta` каждого NPZ (baseline может быть `"unknown"`).
 9) **Targets**: multi-target (views+likes) + multi-horizon (14/21 обязательно, 7 с mask), считаем **дельты** и `log1p`.
-10) **Reproducibility**: в каждом NPZ фиксируем producer/schema версии, config_hash, sampling_policy_version и model versions.
+10) **Reproducibility**: в каждом NPZ фиксируем producer/schema версии, config_hash, sampling_policy_version, dataprocessor_version и model versions.
+
+Дополнения (Round 1, полуфинал):
+- **Платформа v1**: только YouTube (`platform_id="youtube"`).
+- **Запрет JSON артефактов**: в `result_store` разрешён только `manifest.json` (остальное — NPZ, JSON генерируется только на выдаче во фронт).
+- **Retention**:
+  - `frames_dir` (union кадры) храним 7 дней (см. `ORCHESTRATION_AND_CACHING.md`).
+  - raw OCR/comments: `hard_cap_days=60` (см. `PRIVACY_AND_RETENTION.md`).
+
+## Текущий baseline execution path (референс)
+
+На текущем этапе (baseline v0) минимальный “сквозной” путь выглядит так:
+
+- `DataProcessor/main.py`:
+  - вычисляет `platform_id/video_id/run_id/config_hash/sampling_policy_version`
+  - запускает `Segmenter/segmenter.py` → создаёт `frames_dir` с `metadata.json` (union sampling)
+  - опционально запускает:
+    - `AudioProcessor/run_cli.py` → пишет per-run NPZ + апдейтит `manifest.json`
+    - `TextProcessor/run_cli.py` → пишет per-run NPZ + апдейтит `manifest.json`
+  - запускает `VisualProcessor/main.py` → пишет core/modules NPZ + апдейтит `manifest.json`
+
+## Параллелизм (baseline v0)
+
+- Baseline-режим: видео обрабатываются последовательно (1 video = 1 job).
+- Внутри одного видео допускается параллельный запуск модулей VisualProcessor, но:
+  - GPU-тяжёлые задачи ограничиваются лимитом `gpu_max_concurrent` (по умолчанию 1 на малой VRAM).
 
 ## Что считается MVP по моделям
 

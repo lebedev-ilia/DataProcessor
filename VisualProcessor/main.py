@@ -14,11 +14,14 @@ import json
 import hashlib
 import uuid
 import time
+from concurrent.futures import ThreadPoolExecutor, as_completed
+import threading
 
 from utils.logger import get_logger
 from utils.results_store import ResultsStore
 from utils.manifest import RunManifest, ManifestComponent
 from utils.artifact_validator import validate_npz
+from utils.resource_probe import get_cuda_mem_info
 
 logger = get_logger("VisualProcessor")
 
@@ -95,7 +98,22 @@ def _build_subprocess_cmd(root_path, name, target, frames_dir, rs_path, cfg):
     vp_root = os.path.join(root_path, "VisualProcessor")
 
     if target == "core/model_process":
-        venv = os.path.join(vp_root, target, ".model_process_venv")
+        # Allow per-core venv overrides (some cores have conflicting deps).
+        # 1) Explicit override from config (recommended for special cases)
+        cfg_venv = None
+        try:
+            cfg_venv = (cfg or {}).get("venv_path")
+        except Exception:
+            cfg_venv = None
+
+        if isinstance(cfg_venv, str) and cfg_venv.strip():
+            venv = cfg_venv.strip()
+        else:
+            # 2) Built-in override for known isolated environments
+            if name == "core_face_landmarks":
+                venv = os.path.join(vp_root, target, "core_face_landmarks", ".core_face_landmarks_venv")
+            else:
+                venv = os.path.join(vp_root, target, ".model_process_venv")
     else:
         venv = os.path.join(vp_root, ".vp_venv")
 
@@ -120,6 +138,12 @@ def _build_subprocess_cmd(root_path, name, target, frames_dir, rs_path, cfg):
 
     kwargs = []
     for k, v in cfg.items():
+        # Orchestrator-only keys (must NOT be forwarded to component CLI).
+        if k in ("venv_path", "sampling"):
+            continue
+        # Nested objects are config-only (e.g., sampling dicts); do not forward to CLI.
+        if isinstance(v, dict):
+            continue
         if v is None or v == "False" or v is False:
             continue
         key = f"--{k.replace('_', '-')}"
@@ -147,10 +171,63 @@ def _build_subprocess_cmd(root_path, name, target, frames_dir, rs_path, cfg):
     return cmd
 
 
-def run_module(global_cfg, module_name, module_cfg):
+def _component_uses_gpu(name: str, cfg: dict) -> bool:
     """
-    Запуск модульного анализатора через subprocess.
-    module_cfg — словарь с параметрами модуля из YAML.
+    Conservative heuristic:
+    - if config has device in {"cuda","gpu","auto"} -> treat as GPU task (serialize by default)
+    - else if component name suggests GPU-heavy core -> GPU task
+    """
+    try:
+        dev = str((cfg or {}).get("device", "")).strip().lower()
+    except Exception:
+        dev = ""
+    if dev in ("cuda", "gpu", "auto"):
+        return True
+    # Fallback: cores are usually GPU-bound unless explicitly cpu
+    if name in ("core_clip", "core_depth_midas", "core_object_detections", "core_face_landmarks", "core_optical_flow"):
+        return True
+    return False
+
+
+def _resolve_gpu_slots(global_cfg: dict) -> int:
+    """
+    Resolve max concurrent GPU tasks.
+    Supported:
+    - int (>=1)
+    - "auto": 1 for small GPUs, 2 for >= ~20GB (best-effort)
+    """
+    raw = (global_cfg or {}).get("gpu_max_concurrent", "auto")
+    if isinstance(raw, int):
+        return max(1, int(raw))
+    try:
+        s = str(raw).strip().lower()
+    except Exception:
+        s = "auto"
+    if s not in ("auto", ""):
+        try:
+            return max(1, int(s))
+        except Exception:
+            return 1
+    mem = get_cuda_mem_info()
+    if mem is None or mem.total_bytes <= 0:
+        return 1
+    # Very conservative: allow 2 concurrent GPU tasks only on big VRAM.
+    total_gb = float(mem.total_bytes) / (1024.0 ** 3)
+    return 2 if total_gb >= 19.0 else 1
+
+
+def _run_component_subprocess(
+    *,
+    kind: str,  # "module"|"core"
+    global_cfg: dict,
+    name: str,
+    cfg: dict,
+    run_rs_path: str,
+    gpu_sem: threading.Semaphore,
+) -> tuple:
+    """
+    Run component in a subprocess with resource gating.
+    Returns tuple: (ok, err, artifacts, status, notes, schema_version, producer_version, duration_ms)
     """
     root_path = global_cfg["root_path"]
     frames_dir = global_cfg["frames_dir"]
@@ -158,59 +235,85 @@ def run_module(global_cfg, module_name, module_cfg):
 
     os.makedirs(rs_path, exist_ok=True)
 
-    cmd = _build_subprocess_cmd(
-        root_path=root_path,
+    target = "modules" if kind == "module" else "core/model_process"
+    cmd = _build_subprocess_cmd(root_path=root_path, name=name, target=target, frames_dir=frames_dir, rs_path=rs_path, cfg=cfg)
+
+    needs_gpu = _component_uses_gpu(name, cfg)
+    acquired = False
+    started_at = _utc_iso_now()
+    t0 = time.time()
+    try:
+        if needs_gpu:
+            gpu_sem.acquire()
+            acquired = True
+            logger.info(f"VisualProcessor | main | {kind} {name} | GPU slot acquired")
+
+        subprocess.run(cmd, check=True)
+        ok, err = True, None
+    except Exception as e:
+        logger.error(f"VisualProcessor | main | {kind} {name} | Error: {e}")
+        ok, err = False, str(e)
+    finally:
+        duration_ms = int((time.time() - t0) * 1000)
+        finished_at = _utc_iso_now()
+        if acquired:
+            try:
+                gpu_sem.release()
+            except Exception:
+                pass
+            logger.info(f"VisualProcessor | main | {kind} {name} | GPU slot released")
+
+    # Collect artifacts + validate
+    comp_dir = os.path.join(run_rs_path, name)
+    artifacts = [{"path": p, "type": os.path.splitext(p)[1].lstrip(".")} for p in _find_latest_artifact(comp_dir)]
+
+    status = "ok" if ok else "error"
+    notes = None
+    schema_version = None
+    producer_version = None
+
+    npz_files = [a["path"] for a in artifacts if a["path"].lower().endswith(".npz")]
+    if ok and npz_files:
+        v_ok, issues, meta = validate_npz(npz_files[0])
+        if not v_ok:
+            status = "error"
+            notes = "artifact validation failed: " + "; ".join(i.message for i in issues[:5])
+        schema_version = meta.get("schema_version") if isinstance(meta, dict) else None
+        producer_version = meta.get("producer_version") if isinstance(meta, dict) else None
+
+    return (
+        ok,
+        err,
+        artifacts,
+        status,
+        notes,
+        schema_version,
+        producer_version,
+        started_at,
+        finished_at,
+        duration_ms,
+    )
+
+def run_module(global_cfg, module_name, module_cfg, run_rs_path: str, gpu_sem: threading.Semaphore):
+    return _run_component_subprocess(
+        kind="module",
+        global_cfg=global_cfg,
         name=module_name,
-        target="modules",
-        frames_dir=frames_dir,
-        rs_path=rs_path,
         cfg=module_cfg,
+        run_rs_path=run_rs_path,
+        gpu_sem=gpu_sem,
     )
 
-    logger.info(f"VisualProcessor | main | run_module | ▶ Running module: {module_name}")
 
-    try:
-        subprocess.run(cmd, check=True)
-        return True, None
-    except Exception as e:
-        logger.error(f"VisualProcessor | main | run_module | Error: {e}")
-        return False, str(e)
-
-
-def run_core_provider(global_cfg, provider_name, provider_cfg):
-    """
-    Запуск core‑провайдера моделей через subprocess.
-
-    MVP‑реализация:
-    - если есть отдельный скрипт в `core/model_process/<provider_name>/main.py` — используем его;
-    - иначе для совместимости пробуем запустить одноимённый модуль из `modules/<provider_name>`.
-    """
-    root_path = global_cfg["root_path"]
-    frames_dir = global_cfg["frames_dir"]
-    rs_path = global_cfg["rs_path"]
-
-    impl_kind = "core"
-
-    cmd = _build_subprocess_cmd(
-        root_path=root_path,
+def run_core_provider(global_cfg, provider_name, provider_cfg, run_rs_path: str, gpu_sem: threading.Semaphore):
+    return _run_component_subprocess(
+        kind="core",
+        global_cfg=global_cfg,
         name=provider_name,
-        target="core/model_process",
-        frames_dir=frames_dir,
-        rs_path=rs_path,
         cfg=provider_cfg,
+        run_rs_path=run_rs_path,
+        gpu_sem=gpu_sem,
     )
-
-    logger.info(
-        f"VisualProcessor | main | run_core_provider | ▶ Running core provider "
-        f"{provider_name} (impl={impl_kind})"
-    )
-
-    try:
-        subprocess.run(cmd, check=True)
-        return True, None
-    except Exception as e:
-        logger.error(f"VisualProcessor | main | run_core_provider | Error: {e}")
-        return False, str(e)
 
 
 def load_config(cfg_path):
@@ -232,8 +335,60 @@ def get_current_core_providers(config):
 
 
 def get_current_modules(config):
-    """ Возвращает список активных модулей (modules.<name>: true) """
-    return [name for name, enabled in config["modules"].items() if enabled]
+    """Возвращает список активных модулей (modules.<name>: true) в корректном порядке зависимостей."""
+    enabled = [name for name, on in (config.get("modules") or {}).items() if on]
+    return order_modules_by_deps(enabled)
+
+
+# Module dependency graph (module -> required modules)
+# This enforces strict "no-fallback": if a module consumes another module's outputs, it must run after it.
+MODULE_DEPS = {
+    "shot_quality": ["cut_detection"],
+}
+
+
+def order_modules_by_deps(enabled_modules):
+    enabled_set = set(enabled_modules)
+
+    # validate required deps are enabled
+    missing = []
+    for m in enabled_modules:
+        for dep in MODULE_DEPS.get(m, []):
+            if dep not in enabled_set:
+                missing.append((m, dep))
+    if missing:
+        msg = ", ".join([f"{m} requires {dep}" for m, dep in missing])
+        raise ValueError(f"❌ Module dependency missing (enable required module): {msg}")
+
+    # topo sort (stable-ish: preserves original ordering where possible)
+    order = []
+    visiting = set()
+    visited = set()
+
+    def dfs(m):
+        if m in visited:
+            return
+        if m in visiting:
+            raise ValueError(f"❌ Cycle in module dependencies at: {m}")
+        visiting.add(m)
+        for dep in MODULE_DEPS.get(m, []):
+            if dep in enabled_set:
+                dfs(dep)
+        visiting.remove(m)
+        visited.add(m)
+        order.append(m)
+
+    for m in enabled_modules:
+        dfs(m)
+
+    # dedupe while preserving topo order
+    out = []
+    seen = set()
+    for m in order:
+        if m not in seen:
+            out.append(m)
+            seen.add(m)
+    return out
 
 
 
@@ -280,6 +435,13 @@ if __name__ == "__main__":
         },
     )
 
+    # Resource limits for intra-video parallelism
+    max_parallel_modules = int(g_config.get("max_parallel_modules", 1) or 1)
+    gpu_slots = _resolve_gpu_slots(g_config)
+    gpu_sem = threading.Semaphore(value=max(1, int(gpu_slots)))
+    logger.info(
+        f"VisualProcessor | main | parallelism: max_parallel_modules={max_parallel_modules} gpu_max_concurrent={gpu_slots}"
+    )
 
     current_core = get_current_core_providers(config)
     if current_core:
@@ -294,29 +456,18 @@ if __name__ == "__main__":
             for k, v in provider_cfg.items():
                 logger.info(f"            {k}: {v}")
 
-            started_at = _utc_iso_now()
-            t0 = time.time()
-            ok, err = run_core_provider(g_config, provider, provider_cfg)
-            duration_ms = int((time.time() - t0) * 1000)
-            finished_at = _utc_iso_now()
-
-            comp_dir = os.path.join(run_rs_path, provider)
-            artifacts = [{"path": p, "type": os.path.splitext(p)[1].lstrip(".")} for p in _find_latest_artifact(comp_dir)]
-
-            status = "ok" if ok else "error"
-            notes = None
-            schema_version = None
-            producer_version = None
-
-            # Validate latest npz if present
-            npz_files = [a["path"] for a in artifacts if a["path"].lower().endswith(".npz")]
-            if ok and npz_files:
-                v_ok, issues, meta = validate_npz(npz_files[0])
-                if not v_ok:
-                    status = "error"
-                    notes = "artifact validation failed: " + "; ".join(i.message for i in issues[:5])
-                schema_version = meta.get("schema_version") if isinstance(meta, dict) else None
-                producer_version = meta.get("producer_version") if isinstance(meta, dict) else None
+            (
+                ok,
+                err,
+                artifacts,
+                status,
+                notes,
+                schema_version,
+                producer_version,
+                started_at,
+                finished_at,
+                duration_ms,
+            ) = run_core_provider(g_config, provider, provider_cfg, run_rs_path=run_rs_path, gpu_sem=gpu_sem)
 
             manifest.upsert_component(
                 ManifestComponent(
@@ -345,57 +496,100 @@ if __name__ == "__main__":
     for module in current_modules:
         logger.info(f"            {module}")
 
-    for module in current_modules:
-        logger.info(f"VisualProcessor | main | {module} start")
+    # Modules can be run in parallel (intra-video), with GPU gating.
+    if current_modules:
+        has_deps = any((MODULE_DEPS.get(m) or []) for m in current_modules)
+        if has_deps:
+            # Important: dependency modules must NOT run concurrently (no-fallback contract).
+            logger.info("VisualProcessor | main | module deps detected → running modules sequentially")
+            for module in current_modules:
+                module_cfg = config.get(module)
+                if module_cfg is None:
+                    raise ValueError(f"❌ Config entry for module '{module}' not found in YAML")
+                logger.info(f"VisualProcessor | main | scheduling module: {module}")
+                (
+                    ok,
+                    err,
+                    artifacts,
+                    status,
+                    notes,
+                    schema_version,
+                    producer_version,
+                    started_at,
+                    finished_at,
+                    duration_ms,
+                ) = run_module(g_config, module, module_cfg, run_rs_path, gpu_sem)
 
-        module_cfg = config.get(module)
+                manifest.upsert_component(
+                    ManifestComponent(
+                        name=module,
+                        kind="module",
+                        status=status,
+                        started_at=started_at,
+                        finished_at=finished_at,
+                        duration_ms=duration_ms,
+                        artifacts=artifacts,
+                        error=err,
+                        notes=notes,
+                        producer_version=producer_version,
+                        schema_version=schema_version,
+                    )
+                )
+                if not ok:
+                    logger.error(f"VisualProcessor | main | module {module} failed")
+        else:
+            max_workers = max(1, int(max_parallel_modules))
+            with ThreadPoolExecutor(max_workers=max_workers) as ex:
+                fut_by_name = {}
+                for module in current_modules:
+                    module_cfg = config.get(module)
+                    if module_cfg is None:
+                        raise ValueError(f"❌ Config entry for module '{module}' not found in YAML")
+                    logger.info(f"VisualProcessor | main | scheduling module: {module}")
+                    fut = ex.submit(run_module, g_config, module, module_cfg, run_rs_path, gpu_sem)
+                    fut_by_name[fut] = module
 
-        logger.info(f"VisualProcessor | main | {module} config:")
+                for fut in as_completed(list(fut_by_name.keys())):
+                    module = fut_by_name[fut]
+                    try:
+                        (
+                            ok,
+                            err,
+                            artifacts,
+                            status,
+                            notes,
+                            schema_version,
+                            producer_version,
+                            started_at,
+                            finished_at,
+                            duration_ms,
+                        ) = fut.result()
+                    except Exception as e:
+                        ok = False
+                        err = str(e)
+                        artifacts = []
+                        status = "error"
+                        notes = "scheduler exception"
+                        schema_version = None
+                        producer_version = None
+                        started_at = _utc_iso_now()
+                        finished_at = _utc_iso_now()
+                        duration_ms = 0
 
-        for k, v in module_cfg.items():
-            logger.info(f"            {k}: {v}")
-
-        if module_cfg is None:
-            raise ValueError(f"❌ Config entry for module '{module}' not found in YAML")
-
-        started_at = _utc_iso_now()
-        t0 = time.time()
-        ok, err = run_module(g_config, module, module_cfg)
-        duration_ms = int((time.time() - t0) * 1000)
-        finished_at = _utc_iso_now()
-
-        comp_dir = os.path.join(run_rs_path, module)
-        artifacts = [{"path": p, "type": os.path.splitext(p)[1].lstrip(".")} for p in _find_latest_artifact(comp_dir)]
-
-        status = "ok" if ok else "error"
-        notes = None
-        schema_version = None
-        producer_version = None
-
-        npz_files = [a["path"] for a in artifacts if a["path"].lower().endswith(".npz")]
-        if ok and npz_files:
-            v_ok, issues, meta = validate_npz(npz_files[0])
-            if not v_ok:
-                status = "error"
-                notes = "artifact validation failed: " + "; ".join(i.message for i in issues[:5])
-            schema_version = meta.get("schema_version") if isinstance(meta, dict) else None
-            producer_version = meta.get("producer_version") if isinstance(meta, dict) else None
-
-        manifest.upsert_component(
-            ManifestComponent(
-                name=module,
-                kind="module",
-                status=status,
-                started_at=started_at,
-                finished_at=finished_at,
-                duration_ms=duration_ms,
-                artifacts=artifacts,
-                error=err,
-                notes=notes,
-                producer_version=producer_version,
-                schema_version=schema_version,
-            )
-        )
-
-        if not ok:
-            logger.error(f"VisualProcessor | main | module {module} failed")
+                    manifest.upsert_component(
+                        ManifestComponent(
+                            name=module,
+                            kind="module",
+                            status=status,
+                            started_at=started_at,
+                            finished_at=finished_at,
+                            duration_ms=duration_ms,
+                            artifacts=artifacts,
+                            error=err,
+                            notes=notes,
+                            producer_version=producer_version,
+                            schema_version=schema_version,
+                        )
+                    )
+                    if not ok:
+                        logger.error(f"VisualProcessor | main | module {module} failed")

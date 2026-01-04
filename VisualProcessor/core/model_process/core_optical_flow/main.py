@@ -49,6 +49,7 @@ from utils.utilites import load_metadata
 
 NAME = "core_optical_flow"
 VERSION = "2.0"
+SCHEMA_VERSION = "core_optical_flow_npz_v1"
 LOGGER = get_logger(NAME)
 
 
@@ -206,6 +207,7 @@ def main() -> None:
     meta_out: Dict[str, Any] = {
         "producer": NAME,
         "producer_version": VERSION,
+        "schema_version": SCHEMA_VERSION,
         "created_at": datetime.utcnow().isoformat(),
         "status": "ok" if n > 0 else "empty",
         "empty_reason": None if n > 0 else "no_frames",
@@ -214,9 +216,11 @@ def main() -> None:
         "max_dim": int(args.max_dim),
         "total_frames": int(total_frames),
     }
-    # attach run context if present in frames_dir metadata (Segmenter writes these fields)
-    for k in ["platform_id", "video_id", "run_id", "sampling_policy_version", "config_hash"]:
-        if k in meta:
+    required_run_keys = ["platform_id", "video_id", "run_id", "sampling_policy_version", "config_hash"]
+    missing = [k for k in required_run_keys if not meta.get(k)]
+    if missing:
+        raise RuntimeError(f"{NAME} | frames metadata missing required run identity keys: {missing}")
+    for k in required_run_keys:
             meta_out[k] = meta.get(k)
 
     np.savez_compressed(

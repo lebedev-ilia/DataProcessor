@@ -105,9 +105,6 @@ def compute_optical_flow(frame_manager, frames, rs_path: str = None):
         )
     
     return core_curve
-        flows.append(np.mean(mag))
-        prev_gray = gray
-    return np.array(flows)
 
 def embedding_diff(embeddings):
     """Compute frame-to-frame embedding difference (cosine distance)"""

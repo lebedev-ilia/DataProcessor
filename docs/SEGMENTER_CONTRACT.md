@@ -49,12 +49,25 @@ Mapping к исходнику:
 - `analysis_fps`
 - `analysis_width`, `analysis_height`
 - `color_space="RGB"`
+- `platform_id`, `video_id`, `run_id`, `sampling_policy_version`, `config_hash` (run identity)
 
 Все модули опираются на эти параметры, и это считается частью воспроизводимости.
+
+**Полуфинальные дефолты для MVP (Round 2)**:
+- `analysis_fps = 12` (по умолчанию)
+- `analysis_height = 320` (width вычисляется по аспекту исходного видео)
+- Максимальная длительность видео: **20 минут**
+- Ограничение входного разрешения: если исходное видео больше 1080p, выполняется downscale до 1080p **до начала анализа** (не в Segmenter, а на этапе pre-processing/downloading).
 
 ## 7) Цветовое пространство (RGB)
 
 - Кадры, доступные через `FrameManager.get()`, должны быть **RGB**.
 - Если модулю нужен OpenCV BGR — модуль делает conversion локально и явно.
+
+## 8) Привязка директорий к video_id (важно для оркестратора)
+
+- При наличии `video_id` Segmenter должен создавать output folder, следуя **каноническому `video_id`**, а не basename файла.
+- Это гарантирует стабильность путей:
+  - `frames_dir = <output>/<video_id>/video`
 
 

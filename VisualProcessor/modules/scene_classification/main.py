@@ -71,7 +71,7 @@ def main(argv: Optional[List[str]] = None) -> int:
         logger.warning("Не удалось установить log-level: %s", args.log_level)
 
     try:
-    classifier = Places365SceneClassifier(
+        classifier = Places365SceneClassifier(
             model_arch=args.model_arch,
             use_timm=args.use_timm,
             min_scene_length=args.min_scene_length,

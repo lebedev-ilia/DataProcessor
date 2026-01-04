@@ -147,6 +147,12 @@ def ImageFromRGB(frame_rgb):
     except ImportError:
         return frame_rgb
 
+
+# helper convert "cv image" (np.ndarray) -> PIL Image
+# IMPORTANT (project contract): FrameManager.get() returns RGB, so we must NOT assume BGR here.
+def ImageFromCV(frame: np.ndarray):
+    return ImageFromRGB(frame)
+
 def optical_flow_magnitude(prev_gray, gray):
     """Farneback optical flow average magnitude."""
     try:
@@ -1729,6 +1735,11 @@ class CutDetectionPipeline(BaseModule):
             ]
         else:
             shot_boundaries_frame_indices = []
+
+        # Downstream helpers expect shot boundaries in "frame index" domain (timestamps via /fps).
+        # Use sampled frame_indices mapping (Segmenter contract: frame_indices are source-frame indices).
+        # Fallback to positions if something is off (best-effort, but should not happen with valid sampling).
+        shot_boundaries = shot_boundaries_frame_indices if shot_boundaries_frame_indices else shot_boundaries_pos
 
         tok = round(time.time() - tik, 2)
         logger.info(f"Shots segmentation success | Time: {tok}")
