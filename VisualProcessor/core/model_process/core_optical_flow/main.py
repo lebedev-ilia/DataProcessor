@@ -2,21 +2,20 @@
 """
 core_optical_flow
 
-Core provider: RAFT optical flow (torchvision) → lightweight motion curves for downstream modules.
+Tier-0 core provider: optical flow motion curve via Triton.
 
 Contract:
 - Segmenter provides `metadata["core_optical_flow"]["frame_indices"]` (union-domain indices).
-- This provider MUST NOT invent sampling.
+- No sampling fallback is allowed.
 - Frames from FrameManager.get(idx) are RGB uint8 (HxWx3).
 
 Output:
 - <rs_path>/core_optical_flow/flow.npz
   Keys:
     - frame_indices: int32 (N,)
-    - motion_px_mean: float32 (N,)        # mean magnitude in pixels (0 for first frame)
-    - motion_px_per_sec_mean: float32 (N,)# motion_px_mean / dt_seconds (NaN for first frame)
-    - dt_seconds: float32 (N,)            # NaN for first frame
-    - meta: object(dict)                  # at least {producer, created_at}
+    - motion_norm_per_sec_mean: float32 (N,)  # mean flow magnitude / dt / max(H,W); 0 for first frame
+    - dt_seconds: float32 (N,)                # NaN for first frame
+    - meta: object(dict)
 """
 
 from __future__ import annotations
@@ -29,28 +28,47 @@ from typing import Any, Dict, List, Optional, Tuple
 
 import numpy as np  # type: ignore
 
-try:
-    import torch  # type: ignore
-    import torch.nn.functional as F  # type: ignore
-    import torchvision.models.optical_flow as tv_flow  # type: ignore
-except Exception as e:  # pragma: no cover
-    torch = None  # type: ignore
-    F = None  # type: ignore
-    tv_flow = None  # type: ignore
-    _TORCH_IMPORT_ERR = e
-
 _path = os.path.dirname(os.path.dirname(os.path.dirname(os.path.dirname(__file__))))
 if _path not in sys.path:
     sys.path.append(_path)
+# repo root (needed for dp_triton)
+_root = os.path.dirname(_path)
+if _root not in sys.path:
+    sys.path.append(_root)
 
 from utils.frame_manager import FrameManager
 from utils.logger import get_logger
 from utils.utilites import load_metadata
+from utils.meta_builder import apply_models_meta, model_used
 
 NAME = "core_optical_flow"
 VERSION = "2.0"
 SCHEMA_VERSION = "core_optical_flow_npz_v1"
 LOGGER = get_logger(NAME)
+
+
+def _load_triton_spec_via_model_manager(model_spec_name: str) -> dict:
+    """
+    Resolve Triton model spec via dp_models.ModelManager (no-network, reproducible).
+    Returns dict with keys:
+      - client: TritonHttpClient
+      - rp: runtime_params
+      - models_used_entry: dict (model_used)
+    """
+    from dp_models import get_global_model_manager  # type: ignore
+
+    mm = get_global_model_manager()
+    rm = mm.get(model_name=str(model_spec_name))
+    rp = rm.spec.runtime_params or {}
+    handle = rm.handle or {}
+    client = None
+    if isinstance(handle, dict):
+        client = handle.get("client")
+    if client is None:
+        raise RuntimeError(f"{NAME} | ModelManager returned empty Triton client handle for: {model_spec_name}")
+    if not isinstance(rp, dict) or not rp:
+        raise RuntimeError(f"{NAME} | ModelManager returned empty runtime_params for: {model_spec_name}")
+    return {"client": client, "rp": rp, "models_used_entry": rm.models_used_entry}
 
 
 def _require_frame_indices(meta: dict, name: str) -> List[int]:
@@ -79,70 +97,102 @@ def _get_union_timestamps_sec(frame_manager: FrameManager) -> Optional[np.ndarra
         return None
 
 
-def _resize_torch(img: torch.Tensor, max_dim: int) -> torch.Tensor:
-    # img: (3,H,W) float32 in [0,1]
-    _, h, w = img.shape
-    if max(h, w) <= max_dim:
-        return img
-    if h >= w:
-        new_h = int(max_dim)
-        new_w = int(round(w * (max_dim / float(h))))
-    else:
-        new_w = int(max_dim)
-        new_h = int(round(h * (max_dim / float(w))))
-    new_h = max(new_h, 8)
-    new_w = max(new_w, 8)
-    out = F.interpolate(img.unsqueeze(0), size=(new_h, new_w), mode="bilinear", align_corners=False).squeeze(0)
-    return out
+def _preset_to_input_size(preset: str) -> int:
+    p = str(preset or "").strip().lower()
+    if p in ("raft_256", "256"):
+        return 256
+    if p in ("raft_384", "384"):
+        return 384
+    if p in ("raft_512", "512"):
+        return 512
+    raise ValueError(f"{NAME} | unknown triton_preprocess_preset: {preset!r}")
 
 
-def _pad_to_8(img: torch.Tensor) -> Tuple[torch.Tensor, Tuple[int, int]]:
-    # RAFT expects H,W divisible by 8
-    _, h, w = img.shape
-    pad_h = (8 - (h % 8)) % 8
-    pad_w = (8 - (w % 8)) % 8
-    if pad_h == 0 and pad_w == 0:
-        return img, (h, w)
-    img = F.pad(img, (0, pad_w, 0, pad_h), mode="constant", value=0.0)
-    return img, (h, w)
+def _prep_batch_rgb_uint8(frames: List[np.ndarray], *, input_size: int) -> np.ndarray:
+    """
+    Minimal client-side formatting for Triton (NOT full preprocessing):
+    - resize to (S,S)
+    - keep UINT8 NHWC (baseline GPU contract)
 
+    Full preprocessing (normalize/layout conversion to model FP32 NCHW) lives in Triton ensemble.
+    """
+    import cv2  # type: ignore
 
-def _flow_mean_magnitude(flow: torch.Tensor) -> float:
-    # flow: (2,H,W)
-    mag = torch.sqrt(flow[0] ** 2 + flow[1] ** 2)
-    return float(mag.mean().item())
+    s = int(input_size)
+    if s <= 0:
+        raise ValueError(f"{NAME} | invalid input_size={input_size}")
+    out: List[np.ndarray] = []
+    for fr in frames:
+        fr_r = cv2.resize(fr, (s, s), interpolation=cv2.INTER_AREA)
+        out.append(np.asarray(fr_r, dtype=np.uint8))
+    if not out:
+        return np.zeros((0, s, s, 3), dtype=np.uint8)
+    return np.stack(out, axis=0).astype(np.uint8)
 
 
 def main() -> None:
-    parser = argparse.ArgumentParser(description="core_optical_flow (RAFT/torchvision) motion curve extractor")
+    parser = argparse.ArgumentParser(description="core_optical_flow (Triton) motion curve extractor")
     parser.add_argument("--frames-dir", required=True)
     parser.add_argument("--rs-path", required=True)
-    parser.add_argument("--device", type=str, choices=["auto", "cpu", "cuda"], default="auto")
-    parser.add_argument("--model", type=str, choices=["small", "large"], default="small")
-    parser.add_argument("--max-dim", type=int, default=256, help="Max side for RAFT input (trade speed vs accuracy)")
+    # Triton-only policy (prod): local torch engine is removed.
+    parser.add_argument("--runtime", type=str, default="triton", choices=["triton"], help="Runtime (prod: triton only)")
+    parser.add_argument("--triton-http-url", type=str, default=None)
+    # Preferred: resolve Triton params via ModelManager specs (recommended; overrides explicit triton_* args when provided).
+    parser.add_argument("--triton-model-spec", type=str, default=None, help="dp_models spec name (e.g., raft_256_triton)")
+    parser.add_argument("--triton-model-name", type=str, default=None)
+    parser.add_argument("--triton-model-version", type=str, default=None)
+    parser.add_argument("--triton-input0-name", type=str, default="INPUT0__0")
+    parser.add_argument("--triton-input1-name", type=str, default="INPUT1__0")
+    parser.add_argument("--triton-output-name", type=str, default="OUTPUT__0")
+    # Triton ensemble expects UINT8 NHWC inputs.
+    parser.add_argument("--triton-datatype", type=str, default="UINT8")
+    parser.add_argument(
+        "--triton-preprocess-preset",
+        type=str,
+        default="raft_256",
+        choices=["raft_256", "raft_384", "raft_512"],
+        help="Input preset (square size) for Triton optical-flow model.",
+    )
+    parser.add_argument("--model-version", type=str, default="unknown")
+    parser.add_argument("--weights-digest", type=str, default="unknown")
+    parser.add_argument("--precision", type=str, default="fp32")
     args = parser.parse_args()
 
-    if torch is None or tv_flow is None or F is None:  # pragma: no cover
-        raise RuntimeError(f"{NAME} | torch/torchvision not available: {_TORCH_IMPORT_ERR}")
+    runtime = str(args.runtime or "triton").strip().lower()
+    if runtime != "triton":
+        raise RuntimeError(f"{NAME} | runtime must be triton (no-fallback), got: {runtime}")
 
     meta = load_metadata(os.path.join(args.frames_dir, "metadata.json"), NAME)
     total_frames = int(meta.get("total_frames", 0))
     frame_indices = _require_frame_indices(meta, NAME)
     LOGGER.info(f"{NAME} | sampled frames: {len(frame_indices)} / total={total_frames}")
 
-    device = args.device
-    if device == "auto":
-        device = "cuda" if torch.cuda.is_available() else "cpu"
-    if device == "cuda" and not torch.cuda.is_available():
-        device = "cpu"
-    dev = torch.device(device)
-    LOGGER.info(f"{NAME} | device={device} model={args.model} max_dim={args.max_dim}")
+    if len(frame_indices) < 2:
+        raise RuntimeError(f"{NAME} | frame_indices must contain at least 2 frames (no-fallback)")
 
-    if args.model == "large":
-        model = tv_flow.raft_large(weights=tv_flow.Raft_Large_Weights.DEFAULT, progress=True).to(dev)
+    # Triton client (repo-local)
+    from dp_triton import TritonHttpClient, TritonError  # type: ignore
+
+    mm_entry = None
+    if args.triton_model_spec:
+        mm_entry = _load_triton_spec_via_model_manager(str(args.triton_model_spec))
+        client = mm_entry["client"]
+        rp = mm_entry["rp"]
+        args.triton_http_url = str(rp.get("triton_http_url") or args.triton_http_url or "")
+        args.triton_model_name = str(rp.get("triton_model_name") or args.triton_model_name or "")
+        args.triton_model_version = str(rp.get("triton_model_version") or "") or None
+        args.triton_input0_name = str(rp.get("triton_input0_name") or args.triton_input0_name)
+        args.triton_input1_name = str(rp.get("triton_input1_name") or args.triton_input1_name)
+        args.triton_output_name = str(rp.get("triton_output_name") or args.triton_output_name)
+        args.triton_datatype = str(rp.get("triton_input_datatype") or args.triton_datatype)
     else:
-        model = tv_flow.raft_small(weights=tv_flow.Raft_Small_Weights.DEFAULT, progress=True).to(dev)
-    model.eval()
+        if not args.triton_http_url or not str(args.triton_http_url).strip():
+            raise RuntimeError(f"{NAME} | runtime=triton requires --triton-http-url or --triton-model-spec (no-fallback)")
+        if not args.triton_model_name or not str(args.triton_model_name).strip():
+            raise RuntimeError(f"{NAME} | runtime=triton requires --triton-model-name or --triton-model-spec (no-fallback)")
+    client = TritonHttpClient(base_url=str(args.triton_http_url), timeout_sec=10.0)
+    if not client.ready():
+        raise TritonError(f"{NAME} | Triton is not ready at {args.triton_http_url}", error_code="triton_unavailable")
 
     frame_manager = FrameManager(
         frames_dir=args.frames_dir,
@@ -154,46 +204,73 @@ def main() -> None:
     idx_np = np.asarray(frame_indices, dtype=np.int32)
     n = int(idx_np.size)
 
-    motion_px = np.zeros((n,), dtype=np.float32)
     dt_seconds = np.full((n,), np.nan, dtype=np.float32)
-    motion_px_per_sec = np.full((n,), np.nan, dtype=np.float32)
+    motion_norm_per_sec = np.full((n,), np.nan, dtype=np.float32)
 
     try:
-        with torch.no_grad():
-            prev_img: Optional[torch.Tensor] = None
-            prev_t: Optional[float] = None
-            for i, fi in enumerate(idx_np.tolist()):
-                frame_rgb = frame_manager.get(int(fi))  # RGB uint8
-                img = torch.from_numpy(frame_rgb).to(dev).permute(2, 0, 1).float() / 255.0
-                img = _resize_torch(img, int(args.max_dim))
-                img, _ = _pad_to_8(img)
+        input_size = _preset_to_input_size(str(args.triton_preprocess_preset))
 
-                if prev_img is None:
-                    prev_img = img
-                    prev_t = float(union_ts[int(fi)]) if union_ts is not None and int(fi) < union_ts.size else None
-                    continue
+        prev_frame: Optional[np.ndarray] = None
+        prev_t: Optional[float] = None
+        for i, fi in enumerate(idx_np.tolist()):
+            frame_rgb = frame_manager.get(int(fi))  # RGB uint8
+            cur_t = float(union_ts[int(fi)]) if union_ts is not None and int(fi) < union_ts.size else None
 
-                # dt
-                cur_t = float(union_ts[int(fi)]) if union_ts is not None and int(fi) < union_ts.size else None
-                if prev_t is not None and cur_t is not None:
-                    dt = max(cur_t - prev_t, 1e-6)
-                else:
-                    fps = float(getattr(frame_manager, "fps", 30.0) or 30.0)
-                    dt = 1.0 / max(fps, 1e-6)
+            if prev_frame is None:
+                prev_frame = frame_rgb
+                prev_t = cur_t
+                motion_norm_per_sec[i] = 0.0
+                continue
 
-                flows = model(prev_img.unsqueeze(0), img.unsqueeze(0))
-                flow = flows[-1].squeeze(0)  # (2,H,W)
-                mag_mean = _flow_mean_magnitude(flow)
+            # dt
+            if prev_t is not None and cur_t is not None:
+                dt = max(cur_t - prev_t, 1e-6)
+            else:
+                fps = float(getattr(frame_manager, "fps", 30.0) or 30.0)
+                dt = 1.0 / max(fps, 1e-6)
 
-                motion_px[i] = float(mag_mean)
-                dt_seconds[i] = float(dt)
-                motion_px_per_sec[i] = float(mag_mean / dt)
+            dt_seconds[i] = float(dt)
 
-                prev_img = img
-                prev_t = cur_t if cur_t is not None else (prev_t + dt if prev_t is not None else None)
+            # Triton infer: 2-image inputs (UINT8 NHWC)
+            inp0 = _prep_batch_rgb_uint8([prev_frame], input_size=input_size)
+            inp1 = _prep_batch_rgb_uint8([frame_rgb], input_size=input_size)
+            try:
+                out0 = client.infer_two_inputs(
+                    model_name=str(args.triton_model_name),
+                    model_version=str(args.triton_model_version) if args.triton_model_version else None,
+                    input0_name=str(args.triton_input0_name),
+                    input0_tensor=inp0,
+                    input1_name=str(args.triton_input1_name),
+                    input1_tensor=inp1,
+                    output_name=str(args.triton_output_name),
+                    datatype=str(args.triton_datatype),
+                )
+            except AttributeError:
+                raise RuntimeError(
+                    f"{NAME} | dp_triton client missing infer_two_inputs(). "
+                    f"Please update dp_triton to support 2-input models."
+                )
+            except Exception as e:
+                raise RuntimeError(f"{NAME} | Triton infer failed: {e}") from e
 
-                if i % 50 == 0:
-                    LOGGER.info(f"{NAME} | processed {i+1}/{n}")
+            flow = np.asarray(out0.output, dtype=np.float32)
+            # Expect (B,2,H,W) with B==1
+            if flow.ndim != 4 or flow.shape[0] != 1 or flow.shape[1] != 2:
+                raise RuntimeError(f"{NAME} | Triton output has invalid shape: {flow.shape}")
+            flow = flow[0]  # (2,H,W)
+            mag = np.sqrt(np.square(flow[0]) + np.square(flow[1]))
+            mag_mean = float(np.mean(mag))
+            norm = float(max(flow.shape[1], flow.shape[2], 1))
+            val = float((mag_mean / dt) / norm)
+            if not np.isfinite(val):
+                raise RuntimeError(f"{NAME} | invalid motion value at frame_idx={int(fi)}")
+            motion_norm_per_sec[i] = val
+
+            prev_frame = frame_rgb
+            prev_t = cur_t if cur_t is not None else (prev_t + dt if prev_t is not None else None)
+
+            if i % 50 == 0:
+                LOGGER.info(f"{NAME} | processed {i+1}/{n}")
     finally:
         try:
             frame_manager.close()
@@ -209,11 +286,12 @@ def main() -> None:
         "producer_version": VERSION,
         "schema_version": SCHEMA_VERSION,
         "created_at": datetime.utcnow().isoformat(),
-        "status": "ok" if n > 0 else "empty",
-        "empty_reason": None if n > 0 else "no_frames",
-        "model_name": f"raft_{args.model}",
-        "device": str(device),
-        "max_dim": int(args.max_dim),
+        "status": "ok",
+        "empty_reason": None,
+        "model_name": str(args.triton_model_name),
+        "runtime": "triton-gpu",
+        "device": "cuda",
+        "triton_preprocess_preset": str(args.triton_preprocess_preset),
         "total_frames": int(total_frames),
     }
     required_run_keys = ["platform_id", "video_id", "run_id", "sampling_policy_version", "config_hash"]
@@ -221,13 +299,28 @@ def main() -> None:
     if missing:
         raise RuntimeError(f"{NAME} | frames metadata missing required run identity keys: {missing}")
     for k in required_run_keys:
-            meta_out[k] = meta.get(k)
+        meta_out[k] = meta.get(k)
+
+    # PR-3: model system baseline
+    meta_out = apply_models_meta(
+        meta_out,
+        models_used=[
+            model_used(
+                model_name=str(args.triton_model_name),
+                model_version=str(args.model_version or "unknown"),
+                weights_digest=str(args.weights_digest or "unknown"),
+                runtime="triton-gpu",
+                engine="onnx",
+                precision=str(args.precision or "unknown"),
+                device="cuda",
+            )
+        ],
+    )
 
     np.savez_compressed(
         out_path,
         frame_indices=idx_np,
-        motion_px_mean=motion_px,
-        motion_px_per_sec_mean=motion_px_per_sec,
+        motion_norm_per_sec_mean=motion_norm_per_sec,
         dt_seconds=dt_seconds,
         meta=np.asarray(meta_out, dtype=object),
     )

@@ -30,9 +30,12 @@ class ManifestComponent:
     duration_ms: Optional[int] = None
     artifacts: List[Dict[str, Any]] = field(default_factory=list)
     error: Optional[str] = None
+    error_code: Optional[str] = None
     notes: Optional[str] = None
+    warnings: Optional[List[str]] = None
     producer_version: Optional[str] = None
     schema_version: Optional[str] = None
+    device_used: Optional[str] = None
 
 
 class RunManifest:
@@ -71,9 +74,12 @@ class RunManifest:
                             duration_ms=c.get("duration_ms"),
                             artifacts=list(c.get("artifacts") or []),
                             error=c.get("error"),
+                            error_code=c.get("error_code"),
                             notes=c.get("notes"),
+                            warnings=list(c.get("warnings") or []) if c.get("warnings") is not None else None,
                             producer_version=c.get("producer_version"),
                             schema_version=c.get("schema_version"),
+                            device_used=c.get("device_used"),
                         )
             except Exception:
                 # If existing manifest is corrupted, ignore and allow overwrite.
@@ -100,7 +106,10 @@ class RunManifest:
                     "artifacts": c.artifacts,
                     "producer_version": c.producer_version,
                     "schema_version": c.schema_version,
+                    "device_used": c.device_used,
                     "error": c.error,
+                    "error_code": c.error_code,
+                    "warnings": c.warnings,
                     "notes": c.notes,
                 }
                 for c in sorted(self.components.values(), key=lambda x: (x.kind, x.name))

@@ -1,0 +1,21 @@
+version: "pr4_profile_v1"
+
+# MVP profile: required vs optional components.
+# - If `requirements` is present in Visual config, VisualProcessor enforces:
+#   any required component with status="error" => exit non-zero.
+
+processors:
+  audio:
+    enabled: false
+    required: false
+  text:
+    enabled: false
+    required: false
+
+visual:
+  cfg_path: "./VisualProcessor/config_pr2_min.yaml"
+  # required map: any missing key defaults to required=true for enabled components
+  requirements:
+    cut_detection: true
+
+

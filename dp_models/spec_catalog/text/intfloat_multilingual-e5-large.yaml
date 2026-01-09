@@ -1,0 +1,22 @@
+model_name: "intfloat/multilingual-e5-large"
+model_version: "unknown"
+role: "text_embedding"
+runtime: "inprocess"
+engine: "sentence-transformers"
+precision: "fp16"
+device_policy: "auto"
+
+# Local-only policy:
+# Place the model folder under:
+#   ${DP_MODELS_ROOT}/text/intfloat_multilingual-e5-large/
+#
+# The folder should contain a standard SentenceTransformers layout
+# (config.json, modules.json, pytorch_model.bin / model.safetensors, tokenizer files, etc.).
+local_artifacts:
+  - path: "text/intfloat_multilingual-e5-large"
+    kind: "dir"
+
+# In-process digest must be computed from local artifacts.
+weights_digest: "auto"
+
+

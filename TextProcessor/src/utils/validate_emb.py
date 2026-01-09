@@ -2,13 +2,25 @@
 import numpy as np
 import os
 from sklearn.metrics.pairwise import cosine_similarity
+from pathlib import Path
 
-FILES = [
-    "/home/ilya/Рабочий стол/DataProcessor/TextProcessor/.artifacts/title_embedding_bddb4dc824b703bf4e14a4435cf710b32f483cd93d87192e79ba1260b5d0efb9.npy",
-    "/home/ilya/Рабочий стол/DataProcessor/TextProcessor/.artifacts/description_embedding_d980b647fd1794bd8ffeea49cf9caba70dba325a1f25062b71e9080226f22afb.npy",
-    "/home/ilya/Рабочий стол/DataProcessor/TextProcessor/.artifacts/transcript_whisper_embedding_bc5d3fa9c0d68a3237c9347a9f838f4a5894417adfc65dcfe1d8f4b541b7204a.npy",
-    "/home/ilya/Рабочий стол/DataProcessor/TextProcessor/.artifacts/transcript_youtube_auto_embedding_9774d229f4ca95fdc60ff0f76499c8f22ddcf4c4a3b413ff1d8bb734e3e64893.npy"
+from src.core.path_utils import default_artifacts_dir
+
+FILE_PATTERNS = [
+    "title_embedding_*.npy",
+    "description_embedding_*.npy",
+    "transcript_whisper_embedding_*.npy",
+    "transcript_youtube_auto_embedding_*.npy",
 ]
+
+
+def _latest(pattern: str) -> str | None:
+    art = default_artifacts_dir()
+    files = list(art.glob(pattern))
+    if not files:
+        return None
+    files.sort(key=lambda p: p.stat().st_mtime, reverse=True)
+    return str(files[0])
 
 def load_and_check(path):
     print("\n=== Файл:", path)
@@ -72,10 +84,17 @@ def pairwise_cosines(list_of_arrays, names=None):
 
 def main():
     loaded = []
-    for fp in FILES:
+    files = []
+    for pat in FILE_PATTERNS:
+        p = _latest(pat)
+        files.append(p)
+    for fp in files:
+        if fp is None:
+            loaded.append(None)
+            continue
         a = load_and_check(fp)
         loaded.append(a)
-    pairwise_cosines(loaded, names=[os.path.basename(f) for f in FILES])
+    pairwise_cosines(loaded, names=[(os.path.basename(f) if f else "missing") for f in files])
 
 if __name__ == "__main__":
     main()

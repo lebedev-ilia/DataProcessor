@@ -1,11 +1,9 @@
 #!/usr/bin/env python3
-# core_object_detections.py
 """
 Production-ready object detection + tracking extractor.
 
 Поддерживает:
 - YOLO (ultralytics)
-- OWL (OWL-ViT via module)
 
 Выход:
 - detections.npz с фиксированными numpy-массивами:
@@ -31,26 +29,18 @@ from typing import Any, Dict, List, Optional, Tuple, Union
 from collections import defaultdict
 
 import cv2
-from PIL import Image
 import numpy as np
 import torch
-
-from transformers import (
-    OwlViTProcessor,
-    OwlViTForObjectDetection,
-    Owlv2Processor,
-    Owlv2ForObjectDetection,
-)
 
 _path = os.path.dirname(os.path.dirname(os.path.dirname(os.path.dirname(__file__))))
 if _path not in sys.path:
     sys.path.append(_path)
 
 from utils.frame_manager import FrameManager
-from utils.batching import auto_batch_size
 from utils.logger import get_logger
 from utils.resource_probe import pick_device
 from utils.utilites import load_metadata
+from utils.meta_builder import apply_models_meta, model_used
 
 NAME = "core_object_detections"
 VERSION = "2.1"
@@ -61,299 +51,123 @@ MAX_DETECTIONS = 100
 BBOX_DIMS = 4
 
 
-class OWLModule:
+def _load_triton_spec_via_model_manager(model_spec_name: str) -> dict:
     """
-    Object detection module using OWL-ViT / OWLv2.
-
-    Основные улучшения:
-      - стабильная работа с PIL (processor требует PIL)
-      - корректное вычисление target_sizes из numpy
-      - безопасный постпроцессинг и обрезка bbox по краям изображения
-      - fallback для извлечения цвета, если sklearn не установлен
+    Resolve Triton model spec via dp_models.ModelManager (no-network, reproducible).
+    Returns dict with keys:
+      - client: TritonHttpClient
+      - rp: runtime_params
+      - models_used_entry: dict (model_used)
     """
-    def __init__(
-        self,
-        model_name: str = "google/owlv2-large-patch14",
-        model_family: str = "owlv2",  # "owlvit" or "owlv2"
-        device: Optional[str] = None,
-        default_categories: Optional[List[str]] = None,
-        box_threshold: float = 0.1,
-        enable_tracking: bool = True,
-        enable_brand_detection: bool = True,
-        enable_semantic_tags: bool = True,
-        enable_attributes: bool = True,
-    ):
-        self.model_name = model_name
-        self.model_family = model_family.lower()
-        self.device = device or ("cuda" if torch.cuda.is_available() else "cpu")
-        self.box_threshold = float(box_threshold)
+    from dp_models import get_global_model_manager  # type: ignore
 
-        # Default COCO-like categories (kept from original)
-        self.default_categories = default_categories or [
-            "person", "car", "truck", "bicycle", "motorcycle", "bus", "train", "airplane",
-            "boat", "traffic light", "stop sign", "bench", "bird", "cat", "dog", "horse",
-            "sheep", "cow", "elephant", "bear", "zebra", "giraffe", "backpack", "umbrella",
-            "handbag", "tie", "suitcase", "frisbee", "skis", "snowboard", "sports ball",
-            "kite", "baseball bat", "baseball glove", "skateboard", "surfboard",
-            "tennis racket", "bottle", "wine glass", "cup", "fork", "knife", "spoon",
-            "bowl", "banana", "apple", "sandwich", "orange", "broccoli", "carrot",
-            "hot dog", "pizza", "donut", "cake", "chair", "couch", "potted plant",
-            "bed", "dining table", "toilet", "tv", "laptop", "mouse", "remote",
-            "keyboard", "cell phone", "microwave", "oven", "toaster", "sink",
-            "refrigerator", "book", "clock", "vase", "scissors", "teddy bear",
-            "hair drier", "toothbrush",
-        ]
+    mm = get_global_model_manager()
+    rm = mm.get(model_name=str(model_spec_name))
+    rp = rm.spec.runtime_params or {}
+    handle = rm.handle or {}
+    client = None
+    if isinstance(handle, dict):
+        client = handle.get("client")
+    if client is None:
+        raise RuntimeError(f"{NAME} | ModelManager returned empty Triton client handle for: {model_spec_name}")
+    if not isinstance(rp, dict) or not rp:
+        raise RuntimeError(f"{NAME} | ModelManager returned empty runtime_params for: {model_spec_name}")
+    return {"client": client, "rp": rp, "models_used_entry": rm.models_used_entry}
 
-        # Flags
-        self.enable_tracking = enable_tracking
-        self.enable_brand_detection = enable_brand_detection
-        self.enable_semantic_tags = enable_semantic_tags
-        self.enable_attributes = enable_attributes
 
-        # Lazy-loaded objects
-        self._model = None
-        self._processor = None
-        self._model_loaded = False
+def _letterbox_bgr_no_upscale(
+    img_bgr: np.ndarray,
+    *,
+    new_size: int,
+    color: Tuple[int, int, int] = (114, 114, 114),
+) -> Tuple[np.ndarray, float, Tuple[int, int]]:
+    """
+    Ultralytics-style letterbox to square (new_size x new_size), but with NO UPSCALE.
 
-        LOGGER.info(
-            "ObjectDetectionModule initialized: model=%s family=%s device=%s threshold=%s",
-            self.model_name, self.model_family, self.device, self.box_threshold
-        )
+    Returns:
+      - img_lb: (new_size, new_size, 3) uint8 BGR
+      - r: resize ratio applied (<=1.0)
+      - pad: (left, top) padding applied in pixels
+    """
+    if img_bgr.ndim != 3 or img_bgr.shape[2] != 3:
+        raise ValueError(f"{NAME} | invalid image shape: {img_bgr.shape}")
+    h0, w0 = int(img_bgr.shape[0]), int(img_bgr.shape[1])
+    s = int(new_size)
+    if s <= 0:
+        raise ValueError(f"{NAME} | invalid new_size={new_size}")
 
-    def _load_model(self) -> None:
-        """Lazy load the processor and the model. Safe to call multiple times."""
-        if self._model_loaded:
-            return
+    r = min(float(s) / float(h0), float(s) / float(w0))
+    r = min(r, 1.0)  # no upscale
 
-        LOGGER.info("Loading model %s (family=%s) on device=%s", self.model_name, self.model_family, self.device)
+    new_w, new_h = int(round(w0 * r)), int(round(h0 * r))
+    if (new_w, new_h) != (w0, h0):
+        img = cv2.resize(img_bgr, (new_w, new_h), interpolation=cv2.INTER_LINEAR)
+    else:
+        img = img_bgr
 
-        # Automatic model name mapping for common older name
-        if self.model_family == "owlv2":
-            # map old accidental name to owlv2 if necessary
-            if self.model_name == "google/owlvit-base-patch16":
-                self.model_name = "google/owlv2-base-patch16"
-            self._processor = Owlv2Processor.from_pretrained(self.model_name)
-            self._model = Owlv2ForObjectDetection.from_pretrained(self.model_name).to(self.device)
-        else:
-            self._processor = OwlViTProcessor.from_pretrained(self.model_name)
-            self._model = OwlViTForObjectDetection.from_pretrained(self.model_name).to(self.device)
+    dw = s - new_w
+    dh = s - new_h
+    left = int(round(dw / 2.0 - 0.1))
+    right = int(round(dw / 2.0 + 0.1))
+    top = int(round(dh / 2.0 - 0.1))
+    bottom = int(round(dh / 2.0 + 0.1))
 
-        self._model.eval()
-        self._model_loaded = True
-        LOGGER.info("Model loaded successfully")
+    img_lb = cv2.copyMakeBorder(img, top, bottom, left, right, cv2.BORDER_CONSTANT, value=color)
+    if img_lb.shape[0] != s or img_lb.shape[1] != s:
+        # Defensive: ensure exact shape
+        img_lb = cv2.resize(img_lb, (s, s), interpolation=cv2.INTER_LINEAR)
+        left, top = 0, 0
+        r = float(s) / float(max(h0, w0))
+        r = min(r, 1.0)
 
-    def _prepare_text_queries(self, text_queries: Optional[Union[str, List[str]]]) -> List[str]:
-        """Normalize text_queries into a list of trimmed strings."""
-        if text_queries is None:
-            return list(self.default_categories)
-        if isinstance(text_queries, str):
-            # allow comma-separated string
-            items = [q.strip() for q in text_queries.split(",") if q.strip()]
-            return items or list(self.default_categories)
-        # already a list
-        return [str(q).strip() for q in text_queries if str(q).strip()]
+    return img_lb, float(r), (int(left), int(top))
 
-    def _clamp_bbox(self, bbox: List[float], width: int, height: int) -> List[float]:
-        """Clamp bbox coordinates to image boundaries and ensure valid box."""
-        x_min, y_min, x_max, y_max = map(float, bbox)
-        x_min = max(0.0, min(x_min, width - 1.0))
-        x_max = max(0.0, min(x_max, width - 1.0))
-        y_min = max(0.0, min(y_min, height - 1.0))
-        y_max = max(0.0, min(y_max, height - 1.0))
-        if x_max <= x_min or y_max <= y_min:
-            return [0.0, 0.0, 0.0, 0.0]
-        return [x_min, y_min, x_max, y_max]
 
-    def _detect_objects_in_frame(
-        self,
-        frame: np.ndarray,
-        text_queries: Optional[List[str]] = None,
-        frames_are_bgr: bool = False,
-    ) -> Tuple[List[Dict[str, Any]], float]:
-        """
-        Detect objects in a single frame.
+def _prep_yolo_tensor_from_rgb_uint8(
+    frame_rgb_uint8: np.ndarray,
+    *,
+    input_size: int,
+) -> Tuple[np.ndarray, float, Tuple[int, int], Tuple[int, int]]:
+    """
+    Preprocess one RGB uint8 frame for Ultralytics-exported YOLO ONNX:
+      RGB -> BGR -> letterbox(no-upscale) -> RGB -> FP32 /255 -> NCHW
 
-        :param frame: numpy array frame from FrameManager.get(); by contract it's RGB uint8 HxWx3.
-        :param frames_are_bgr: set True only for legacy callers if their frames are BGR.
-        :param text_queries: list of text queries (strings)
-        :return: tuple of (list of detections {bbox, score, label, ...}, processing_time)
-        """
-        if frame is None:
-            return [], 0.0
+    Returns:
+      - x: (1,3,S,S) float32
+      - r: resize ratio
+      - pad: (left, top)
+      - orig_hw: (h0, w0)
+    """
+    bgr = cv2.cvtColor(frame_rgb_uint8, cv2.COLOR_RGB2BGR)
+    img_lb, r, pad = _letterbox_bgr_no_upscale(bgr, new_size=int(input_size))
+    rgb = cv2.cvtColor(img_lb, cv2.COLOR_BGR2RGB)
+    x = rgb.astype(np.float32) / 255.0
+    x = np.transpose(x, (2, 0, 1))[None, ...]  # (1,3,S,S)
+    return x.astype(np.float32), float(r), (int(pad[0]), int(pad[1])), (int(frame_rgb_uint8.shape[0]), int(frame_rgb_uint8.shape[1]))
 
-        # ensure model is loaded
-        self._load_model()
 
-        # Ensure RGB for PIL/processor.
-        if frame.ndim == 3:
-            rgb = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB) if frames_are_bgr else frame
-        else:
-            # grayscale? convert to 3-channel
-            rgb = cv2.cvtColor(frame, cv2.COLOR_GRAY2RGB)
-
-        # Keep original width/height from numpy to compute target_sizes
-        h, w = rgb.shape[:2]
-
-        # Use PIL Image for processor (this is critical)
-        image = Image.fromarray(rgb)
-
-        queries = self._prepare_text_queries(text_queries)
-        if not queries:
-            queries = list(self.default_categories)
-
-        # Run processor + model on device
-        tik = time.time()
-        try:
-            inputs = self._processor(text=queries, images=image, return_tensors="pt").to(self.device)
-        except Exception as e:
-            LOGGER.exception("Processor failed for the given image. Falling back to CPU processor call: %s", e)
-            # fallback: build inputs on CPU and then move tensors to device
-            inputs = self._processor(text=queries, images=image, return_tensors="pt")
-            inputs = {k: v.to(self.device) for k, v in inputs.items()}
-        tok = round(time.time() - tik, 2)
-
-        with torch.no_grad():
-            outputs = self._model(**inputs)
-
-        # target_sizes must be [height, width]
-        target_sizes = torch.tensor([[h, w]], dtype=torch.long).to(self.device)
-
-        # Post-process (returns list with dict per image)
-        results = self._processor.post_process_grounded_object_detection(
-            outputs=outputs,
-            target_sizes=target_sizes,
-            threshold=self.box_threshold
-        )
-
-        detections: List[Dict[str, Any]] = []
-
-        if not results or len(results) == 0:
-            return [], tok
-
-        result = results[0]
-        boxes = result.get("boxes", torch.tensor([]))
-        scores = result.get("scores", torch.tensor([]))
-        labels = result.get("labels", torch.tensor([]))
-
-        # Bring to CPU and numpy for iteration
-        if isinstance(boxes, torch.Tensor):
-            boxes = boxes.cpu().numpy()
-        if isinstance(scores, torch.Tensor):
-            scores = scores.cpu().numpy()
-        if isinstance(labels, torch.Tensor):
-            labels = labels.cpu().numpy()
-
-        # Iterate detections
-        for box, score, label_idx in zip(boxes, scores, labels):
-            score_val = float(score)
-            if score_val < float(self.box_threshold):
-                continue
-
-            # label_idx is index into queries (sometimes long)
-            try:
-                label_i = int(label_idx)
-                if 0 <= label_i < len(queries):
-                    label_name = queries[label_i]
-                else:
-                    label_name = f"class_{label_i}"
-            except Exception:
-                label_name = str(label_idx)
-
-            # clamp bbox
-            clamped = self._clamp_bbox(box.tolist(), width=w, height=h)
-            if clamped[2] <= clamped[0] or clamped[3] <= clamped[1]:
-                # invalid box after clamp
-                continue
-
-            x_min, y_min, x_max, y_max = clamped
-
-            det = {
-                "bbox": [float(x_min), float(y_min), float(x_max), float(y_max)],
-                "score": score_val,
-                "label": label_name,
-            }
-            detections.append(det)
-
-        return detections, tok
-
-    def run(self, frame_manager, frame_indices: List[int]) -> Dict[str, Any]:
-        """
-        Main execution method.
-
-        :param frame_manager: object with .fps and .get(index) -> numpy frame (RGB by contract)
-        :param frame_indices: list of frame indices to process
-        :return: result dictionary containing per-frame detections and summary
-        """
-        import time
-
-        if frame_manager is None:
-            raise ValueError("frame_manager is None")
-
-        self._load_model()
-
-        # Prepare text queries: base categories + brands if enabled
-        queries = list(self.default_categories)
-        if self.enable_brand_detection:
-            queries.extend(self.brand_queries)
-
-        all_detections: Dict[int, List[Dict[str, Any]]] = {}
-        skipped = 0
-
-        t = time.time()
-
-        for k, frame_idx in enumerate(frame_indices):
-            frame = frame_manager.get(frame_idx)
-
-            if frame is None:
-                all_detections[frame_idx] = []
-                skipped += 1
-                continue
-
-            try:
-                tik = time.time()
-                detections, pred_time = self._detect_objects_in_frame(frame, text_queries=queries, frames_are_bgr=False)
-                det_tok = round(time.time() - tik, 2)
-
-                LOGGER.debug(f"pred_time: {pred_time} | det_tok: {det_tok}")
-
-                all_detections[frame_idx] = detections
-
-                # Periodic log
-                if k % 20 == 0:
-                    processed_nonempty = sum(1 for v in all_detections.values() if v)
-                    c_t = time.time()
-                    LOGGER.info(
-                        "run | processed_frames=%d | current_index=%d | skipped=%d | nonempty_frames=%d | all_time:%d",
-                        k, frame_idx, skipped, processed_nonempty, round(c_t - t, 2)
-                    )
-                    t = c_t
-
-            except Exception as e:
-                LOGGER.exception("Error detecting objects in frame %s: %s", frame_idx, e)
-                all_detections[frame_idx] = []
-                skipped += 1
-
-        # Build summary
-        object_counts: Dict[str, int] = {}
-        total_detections = 0
-
-        for frame_idx, detections in all_detections.items():
-            for det in detections:
-                label = det.get("label", "unknown")
-                object_counts[label] = object_counts.get(label, 0) + 1
-                total_detections += 1
-
-        result = {
-            "frames": all_detections,
-            "summary": {
-                "total_detections": total_detections,
-                "unique_categories": len(object_counts),
-                "category_counts": object_counts,
-            },
-            "frame_count": len(frame_indices),
-        }
-
-        return result
+def _scale_boxes_back(
+    boxes_xyxy: np.ndarray,
+    *,
+    r: float,
+    pad: Tuple[int, int],
+    orig_hw: Tuple[int, int],
+) -> np.ndarray:
+    """
+    Reverse letterbox: boxes in letterboxed image coords -> original image coords.
+    """
+    if boxes_xyxy.size == 0:
+        return boxes_xyxy.astype(np.float32)
+    left, top = int(pad[0]), int(pad[1])
+    b = boxes_xyxy.astype(np.float32).copy()
+    b[:, [0, 2]] -= float(left)
+    b[:, [1, 3]] -= float(top)
+    rr = float(max(r, 1e-9))
+    b[:, :4] /= rr
+    h0, w0 = int(orig_hw[0]), int(orig_hw[1])
+    b[:, [0, 2]] = np.clip(b[:, [0, 2]], 0.0, float(w0 - 1))
+    b[:, [1, 3]] = np.clip(b[:, [1, 3]], 0.0, float(h0 - 1))
+    return b
 
 
 def iou_xyxy(a: np.ndarray, b: np.ndarray) -> np.ndarray:
@@ -426,20 +240,12 @@ def run_yolo(
         # Convert RGB->BGR for stability with OpenCV-based preprocessing.
         batch_frames = [cv2.cvtColor(frame_manager.get(i), cv2.COLOR_RGB2BGR) for i in batch_idx]
 
-        try:
-            results = model(batch_frames, device=device, verbose=False)
-        except Exception as e:
-            LOGGER.warning("%s | YOLO | batch failed %s: %s", NAME, batch_idx, e)
-            continue
+        results = model(batch_frames, device=device, verbose=False)
 
         for i_local, res in enumerate(results):
             out_i = start + i_local
             # res.boxes may be empty
-            try:
-                if res.boxes is None or len(res.boxes) == 0:
-                    continue
-            except Exception:
-                # ultralytics API sometimes differs by versions
+            if res.boxes is None or len(res.boxes) == 0:
                 continue
 
             detections = []
@@ -461,7 +267,7 @@ def run_yolo(
                         if conf < box_threshold:
                             continue
                     except Exception:
-                        continue
+                        raise RuntimeError(f"{NAME} | YOLO | cannot parse detection output (ultralytics API drift?)")
 
                 boxes[out_i, j] = xyxy
                 scores[out_i, j] = conf
@@ -482,66 +288,142 @@ def run_yolo(
     return boxes, scores, class_ids, valid_mask, class_names, raw_per_frame
 
 
-def run_owl(
+def run_yolo_triton(
+    *,
     frame_manager: FrameManager,
     frame_indices: List[int],
-    model: str,
-    model_family: str,
-    device: str,
-    default_categories: Optional[List[str]],
+    triton_client,
+    triton_model_name: str,
+    triton_model_version: Optional[str],
+    triton_input_name: str,
+    triton_output_name: str,
+    input_size: int,
     box_threshold: float,
+    iou_threshold: float,
+    class_names: Dict[int, str],
 ) -> Tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray, Dict[int, str], List[np.ndarray]]:
     """
-    Запускает OWL-based detector. Возвращаем те же структуры, что и run_yolo.
-    Требует реализации modules.object_detection.object_detection_owl.ObjectDetectionModule с методом run.
+    Triton-backed YOLO inference.
+
+    Notes:
+    - Fixed-shape baseline models are batch=1, so we process frames one-by-one.
+    - We implement NMS locally to avoid ultralytics API drift.
     """
+    def _xywh_to_xyxy(xywh: np.ndarray) -> np.ndarray:
+        # xywh: (N,4) with center x,y,w,h
+        x = xywh[:, 0]
+        y = xywh[:, 1]
+        w = xywh[:, 2]
+        h = xywh[:, 3]
+        x1 = x - w / 2.0
+        y1 = y - h / 2.0
+        x2 = x + w / 2.0
+        y2 = y + h / 2.0
+        return np.stack([x1, y1, x2, y2], axis=1).astype(np.float32)
 
-    detector = OWLModule(
-        model_name=model,
-        model_family=model_family,
-        device=device,
-        default_categories=default_categories,
-        box_threshold=box_threshold,
-    )
+    def _nms_single_class(boxes_xyxy: np.ndarray, scores_: np.ndarray, iou_th: float, max_det: int) -> List[int]:
+        if boxes_xyxy.size == 0:
+            return []
+        order = scores_.argsort()[::-1]
+        keep: List[int] = []
+        while order.size > 0 and len(keep) < int(max_det):
+            i = int(order[0])
+            keep.append(i)
+            if order.size == 1:
+                break
+            rest = order[1:]
+            ious = iou_xyxy(boxes_xyxy[i], boxes_xyxy[rest])
+            order = rest[ious <= float(iou_th)]
+        return keep
 
-    raw = detector.run(frame_manager=frame_manager, frame_indices=frame_indices)
-    # raw expected: {"frames": {frame_idx: [ {bbox, label, score, ...}, ... ]}, ...}
+    def _decode_and_nms_yolo(out_b84n: np.ndarray) -> np.ndarray:
+        """
+        out_b84n: (1,84,N)
+        returns det: (M,6) [x1,y1,x2,y2,conf,cls_id]
+        """
+        if out_b84n.ndim != 3 or out_b84n.shape[0] != 1 or out_b84n.shape[1] < 6:
+            raise RuntimeError(f"{NAME} | unexpected YOLO output shape: {out_b84n.shape}")
+        pred = out_b84n[0].T  # (N,84)
+        boxes_xywh = pred[:, :4].astype(np.float32)
+        cls_scores = pred[:, 4:].astype(np.float32)  # (N,nc)
+        cls_id = np.argmax(cls_scores, axis=1).astype(np.int32)
+        conf = np.max(cls_scores, axis=1).astype(np.float32)
+        m = conf >= float(box_threshold)
+        if not np.any(m):
+            return np.zeros((0, 6), dtype=np.float32)
+        boxes_xyxy = _xywh_to_xyxy(boxes_xywh[m])
+        conf_m = conf[m]
+        cls_m = cls_id[m]
+
+        dets: List[np.ndarray] = []
+        for c in np.unique(cls_m):
+            idx = np.where(cls_m == c)[0]
+            if idx.size == 0:
+                continue
+            keep = _nms_single_class(boxes_xyxy[idx], conf_m[idx], float(iou_threshold), int(MAX_DETECTIONS))
+            if not keep:
+                continue
+            kk = idx[np.asarray(keep, dtype=np.int64)]
+            cc = np.full((kk.size, 1), float(c), dtype=np.float32)
+            dets.append(np.concatenate([boxes_xyxy[kk], conf_m[kk, None], cc], axis=1))
+
+        if not dets:
+            return np.zeros((0, 6), dtype=np.float32)
+        det = np.concatenate(dets, axis=0)
+        # global top-k by conf
+        order = det[:, 4].argsort()[::-1]
+        det = det[order[: int(MAX_DETECTIONS)]]
+        return det.astype(np.float32)
 
     n = len(frame_indices)
     boxes = np.zeros((n, MAX_DETECTIONS, BBOX_DIMS), dtype=np.float32)
     scores = np.zeros((n, MAX_DETECTIONS), dtype=np.float32)
     class_ids = np.zeros((n, MAX_DETECTIONS), dtype=np.int32)
     valid_mask = np.zeros((n, MAX_DETECTIONS), dtype=bool)
-    class_names: Dict[int, str] = {}
     raw_per_frame: List[np.ndarray] = [np.zeros((0, 5), dtype=np.float32) for _ in frame_indices]
 
-    # Create label to class_id mapping
-    label_to_id: Dict[str, int] = {}
-    next_id = 0
+    for i_out, fi in enumerate(frame_indices):
+        fr_rgb = frame_manager.get(int(fi))  # RGB uint8
+        x, r, pad, orig_hw = _prep_yolo_tensor_from_rgb_uint8(fr_rgb, input_size=int(input_size))
+        try:
+            res = triton_client.infer(
+                model_name=str(triton_model_name),
+                model_version=str(triton_model_version) if triton_model_version else None,
+                input_name=str(triton_input_name),
+                input_tensor=x,
+                output_name=str(triton_output_name),
+                datatype="FP32",
+            )
+        except Exception as e:
+            raise RuntimeError(f"{NAME} | Triton infer failed: {e}") from e
 
-    frames_dict = raw.get("frames", {})
-    for i, fi in enumerate(frame_indices):
-        detections = frames_dict.get(fi, []) or []
-        dets_list = []
-        for j, det in enumerate(detections[:MAX_DETECTIONS]):
-            bb = np.array(det["bbox"], dtype=np.float32)
-            sc = float(det.get("score", 0.0))
-            label = det.get("label", "unknown")
-            
-            # Map label to class_id
-            if label not in label_to_id:
-                label_to_id[label] = next_id
-                class_names[next_id] = label
-                next_id += 1
-            cid = label_to_id[label]
-            
-            boxes[i, j] = bb
-            scores[i, j] = sc
-            class_ids[i, j] = cid
-            valid_mask[i, j] = True
-            dets_list.append([bb[0], bb[1], bb[2], bb[3], sc])
-        
-        raw_per_frame[i] = np.array(dets_list, dtype=np.float32)
+        out = np.asarray(res.output, dtype=np.float32)  # expected (1,84,N)
+        det_np = _decode_and_nms_yolo(out)
+        if det_np.size == 0:
+            continue
+        # scale boxes back to original
+        det_np[:, :4] = _scale_boxes_back(det_np[:, :4], r=float(r), pad=pad, orig_hw=orig_hw)
+
+        detections: List[List[float]] = []
+        for j in range(min(det_np.shape[0], MAX_DETECTIONS)):
+            xyxy = det_np[j, :4].astype(np.float32)
+            conf = float(det_np[j, 4])
+            cls_id = int(det_np[j, 5])
+            if conf < float(box_threshold):
+                continue
+            boxes[i_out, j] = xyxy
+            scores[i_out, j] = conf
+            class_ids[i_out, j] = cls_id
+            valid_mask[i_out, j] = True
+            detections.append([float(xyxy[0]), float(xyxy[1]), float(xyxy[2]), float(xyxy[3]), float(conf)])
+
+            if cls_id not in class_names:
+                class_names[cls_id] = f"class_{cls_id}"
+
+        raw_per_frame[i_out] = np.asarray(detections, dtype=np.float32)
+
+        if (i_out + 1) % 25 == 0:
+            LOGGER.info("%s | Triton YOLO | processed %d/%d", NAME, i_out + 1, n)
 
     return boxes, scores, class_ids, valid_mask, class_names, raw_per_frame
 
@@ -560,6 +442,10 @@ def run_tracking(
       - tracks_map: dict track_id -> sorted list of frame indices where track appears
     """
     try:
+        # Ensure local ByteTrack/yolox package is importable (vendored in this repo).
+        bt_root = os.path.join(os.path.dirname(__file__), "ByteTrack")
+        if bt_root not in sys.path:
+            sys.path.insert(0, bt_root)
         from yolox.tracker.byte_tracker import BYTETracker
     except Exception as e:
         LOGGER.exception("ByteTrack import failed: %s", e)
@@ -691,17 +577,23 @@ def main():
     parser.add_argument("--frames-dir", required=True)
     parser.add_argument("--rs-path", required=True)
     parser.add_argument("--model", default="yolov8n.pt")
-    parser.add_argument("--batch-size", type=str, default="16", help="Integer batch size or 'auto' (or 0)")
+    parser.add_argument("--runtime", type=str, default="ultralytics", choices=["ultralytics", "triton"])
+    # Triton (preferred via ModelManager specs)
+    parser.add_argument("--triton-model-spec", type=str, default=None, help="dp_models spec name (e.g., yolo11x_640_triton)")
+    parser.add_argument("--triton-http-url", type=str, default=None)
+    parser.add_argument("--triton-model-name", type=str, default=None)
+    parser.add_argument("--triton-model-version", type=str, default=None)
+    parser.add_argument("--triton-input-name", type=str, default="images")
+    parser.add_argument("--triton-output-name", type=str, default="output0")
+    parser.add_argument("--triton-preprocess-preset", type=str, default="yolo11x_640", choices=["yolo11x_320", "yolo11x_640", "yolo11x_960"])
+    parser.add_argument("--batch-size", type=int, required=True, help="Batch size (must be provided by scheduler/orchestrator)")
     parser.add_argument("--box-threshold", type=float, default=0.6)
-    parser.add_argument("--use-queries", action="store_true")
-    parser.add_argument("--default-categories", type=str, default=None)
-    parser.add_argument("--model-family", type=str, default="owlv2")
     parser.add_argument("--device", type=str, default="auto", help="'auto'|'cpu'|'cuda'")
     parser.add_argument("--iou-threshold", type=float, default=0.3)
-    # NOTE: frame sampling is owned by Segmenter/DataProcessor.
-    # We keep sample-step for backward compatibility, but production uses metadata[NAME].frame_indices.
-    parser.add_argument("--sample-step", type=int, default=None)
     args = parser.parse_args()
+    # Expand env vars in --model (so configs can use ${DP_MODELS_ROOT}/...).
+    if isinstance(args.model, str):
+        args.model = os.path.expandvars(str(args.model))
 
     meta = load_metadata(os.path.join(args.frames_dir, "metadata.json"), NAME)
     total_frames = int(meta["total_frames"])
@@ -718,6 +610,8 @@ def main():
         raise RuntimeError(f"{NAME} | metadata '{NAME}.frame_indices' is empty/invalid.")
     frame_indices = [int(x) for x in frame_indices_raw]
     LOGGER.info("%s | sampled frames: %d / total=%d", NAME, len(frame_indices), total_frames)
+    if len(frame_indices) <= 0:
+        raise RuntimeError(f"{NAME} | empty frame_indices is not allowed (no-fallback)")
 
     frame_manager = FrameManager(
         frames_dir=args.frames_dir,
@@ -727,68 +621,104 @@ def main():
 
     try:
         device = pick_device(args.device)
-        bs_raw = (args.batch_size or "").strip().lower()
-        if bs_raw in ("auto", "0", ""):
-            decision = auto_batch_size(
-                device=device,
-                frame_shape=(int(frame_manager.height), int(frame_manager.width), int(frame_manager.channels)),
-                model_hint="yolo" if not args.use_queries else "owl",
-                max_batch_cap=32,
-                reserve_ratio=0.25,
-                cpu_default=1,
-            )
-            batch_size = int(decision.batch_size)
-            LOGGER.info(
-                "%s | auto batch_size=%d | reason=%s | free=%s total=%s per_sample_est=%s",
-                NAME,
-                batch_size,
-                decision.reason,
-                decision.free_bytes,
-                decision.total_bytes,
-                decision.per_sample_bytes_est,
-            )
-        else:
-            batch_size = max(1, int(bs_raw))
+        batch_size = int(args.batch_size)
+        if batch_size <= 0:
+            raise RuntimeError(f"{NAME} | --batch-size must be > 0 (scheduler-controlled); got {batch_size}")
 
-        if args.use_queries:
-            default_categories = (
-                args.default_categories.split(",") if args.default_categories else None
-            )
-            boxes, scores, class_ids, valid_mask, class_names, raw_per_frame = run_owl(
+        class_names: Dict[int, str] = {}
+        if str(args.runtime).lower() == "triton":
+            # Load class names from local weights file (NO network).
+            if not os.path.exists(str(args.model)):
+                # If user passed a relative path and DP_MODELS_ROOT is set, try resolving from it.
+                mr = os.environ.get("DP_MODELS_ROOT")
+                if mr and not os.path.isabs(str(args.model)):
+                    cand = os.path.join(str(mr), str(args.model))
+                    if os.path.exists(cand):
+                        args.model = cand
+                if not os.path.exists(str(args.model)):
+                    raise RuntimeError(
+                        f"{NAME} | runtime=triton requires --model pointing to local weights (for class names). "
+                        f"File not found: {args.model}"
+                    )
+            try:
+                from ultralytics import YOLO  # type: ignore
+                y = YOLO(str(args.model))
+                class_names = {int(k): str(v) for k, v in getattr(y, "names", {}).items()}
+            except Exception:
+                class_names = {}
+
+            # Resolve Triton client/params
+            from dp_triton import TritonHttpClient, TritonError  # type: ignore
+
+            if args.triton_model_spec:
+                mm_entry = _load_triton_spec_via_model_manager(str(args.triton_model_spec))
+                client = mm_entry["client"]
+                rp = mm_entry["rp"]
+                args.triton_http_url = str(rp.get("triton_http_url") or args.triton_http_url or "")
+                args.triton_model_name = str(rp.get("triton_model_name") or args.triton_model_name or "")
+                args.triton_model_version = str(rp.get("triton_model_version") or "") or None
+                args.triton_input_name = str(rp.get("triton_input_name") or args.triton_input_name)
+                args.triton_output_name = str(rp.get("triton_output_name") or args.triton_output_name)
+            else:
+                if not args.triton_http_url or not str(args.triton_http_url).strip():
+                    raise RuntimeError(f"{NAME} | runtime=triton requires --triton-http-url or --triton-model-spec (no-fallback)")
+                if not args.triton_model_name or not str(args.triton_model_name).strip():
+                    raise RuntimeError(f"{NAME} | runtime=triton requires --triton-model-name or --triton-model-spec (no-fallback)")
+                client = TritonHttpClient(base_url=str(args.triton_http_url), timeout_sec=10.0)
+                if not client.ready():
+                    raise TritonError(f"{NAME} | Triton is not ready at {args.triton_http_url}", error_code="triton_unavailable")
+
+            if batch_size != 1:
+                LOGGER.info("%s | runtime=triton: forcing fixed batch=1 (was %d)", NAME, batch_size)
+
+            preset = str(args.triton_preprocess_preset).strip().lower()
+            if preset == "yolo11x_320":
+                input_size = 320
+            elif preset == "yolo11x_640":
+                input_size = 640
+            elif preset == "yolo11x_960":
+                input_size = 960
+            else:
+                raise RuntimeError(f"{NAME} | unknown triton_preprocess_preset: {preset}")
+
+            boxes, scores, class_ids, valid_mask, class_names, raw_per_frame = run_yolo_triton(
                 frame_manager=frame_manager,
                 frame_indices=frame_indices,
-                model=args.model,
-                model_family=args.model_family,
-                device=device,
-                default_categories=default_categories,
-                box_threshold=args.box_threshold,
+                triton_client=client,
+                triton_model_name=str(args.triton_model_name),
+                triton_model_version=str(args.triton_model_version) if args.triton_model_version else None,
+                triton_input_name=str(args.triton_input_name),
+                triton_output_name=str(args.triton_output_name),
+                input_size=int(input_size),
+                box_threshold=float(args.box_threshold),
+                iou_threshold=float(args.iou_threshold),
+                class_names=class_names,
             )
-            impl = "owl"
+            impl = f"triton:{args.triton_model_name}"
         else:
             boxes, scores, class_ids, valid_mask, class_names, raw_per_frame = run_yolo(
                 frame_manager=frame_manager,
                 frame_indices=frame_indices,
-                model_path=args.model,
-                box_threshold=args.box_threshold,
+                model_path=str(args.model),
+                box_threshold=float(args.box_threshold),
                 batch_size=batch_size,
                 device=device,
             )
             impl = "yolo"
 
-        # run tracking (ByteTrack) on raw detections
-        try:
-            tracker_cfg = {"track_thresh": 0.25, "match_thresh": 0.8, "frame_rate": int(getattr(frame_manager, "fps", meta.get("fps", 30)))}
-            tracks_arr, tracks_map = run_tracking(
-                raw_per_frame=raw_per_frame,
-                frame_indices=frame_indices,
-                frame_manager=frame_manager,
-                tracker_cfg=tracker_cfg,
-                iou_threshold=args.iou_threshold,
-            )
-        except Exception:
-            LOGGER.exception("%s | TRACKING failed; producing outputs without tracks", NAME)
-            tracks_arr = np.full((len(frame_indices), MAX_DETECTIONS), -1, dtype=np.int32)
-            tracks_map = {}
+        # Tracking is REQUIRED (per project decision).
+        tracker_cfg = {
+            "track_thresh": 0.25,
+            "match_thresh": 0.8,
+            "frame_rate": int(getattr(frame_manager, "fps", meta.get("fps", 30))),
+        }
+        tracks_arr, tracks_map = run_tracking(
+            raw_per_frame=raw_per_frame,
+            frame_indices=frame_indices,
+            frame_manager=frame_manager,
+            tracker_cfg=tracker_cfg,
+            iou_threshold=float(args.iou_threshold),
+        )
 
         class_names_arr = np.array([f"{k}:{v}" for k, v in sorted(class_names.items())], dtype="U")
 
@@ -812,16 +742,14 @@ def main():
             "producer_version": VERSION,
             "schema_version": SCHEMA_VERSION,
             "created_at": created_at,
-            "status": "ok" if len(frame_indices) > 0 else "empty",
-            "empty_reason": None if len(frame_indices) > 0 else "no_frames",
+            "status": "ok",
+            "empty_reason": None,
             "impl": impl,
             "model": args.model,
-            "model_family": args.model_family if impl == "owl" else "yolo",
             "box_threshold": args.box_threshold,
             "batch_size": int(batch_size),
             "device": str(device),
             "total_frames": int(total_frames),
-            "sample_step": None,
         }
         required_run_keys = ["platform_id", "video_id", "run_id", "sampling_policy_version", "config_hash"]
         missing = [k for k in required_run_keys if not meta.get(k)]
@@ -829,6 +757,41 @@ def main():
             raise RuntimeError(f"{NAME} | frames metadata missing required run identity keys: {missing}")
         for k in required_run_keys:
             meta_info[k] = meta.get(k)
+
+        # PR-3: model system baseline
+        if str(args.runtime).lower() == "triton":
+            model_name = str(args.triton_model_name or "triton")
+            meta_info = apply_models_meta(
+                meta_info,
+                models_used=[
+                    model_used(
+                        model_name=model_name,
+                        model_version=str(args.triton_model_version or "1"),
+                        weights_digest="provided_by_deploy",
+                        runtime="triton",
+                        engine="triton",
+                        precision="fp32",
+                        device="cuda",
+                    )
+                ],
+            )
+        else:
+            model_name = str(args.model)
+            engine = "ultralytics"
+            meta_info = apply_models_meta(
+                meta_info,
+                models_used=[
+                    model_used(
+                        model_name=model_name,
+                        model_version="unknown",
+                        weights_digest="unknown",
+                        runtime="inprocess",
+                        engine=engine,
+                        precision="fp32",
+                        device=str(device),
+                    )
+                ],
+            )
 
         atomic_save_npz(
             out_path,

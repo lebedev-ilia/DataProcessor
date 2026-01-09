@@ -1,0 +1,18 @@
+model_name: speaker_diarization_small_triton
+model_version: "1"
+role: speaker_diarization
+runtime: triton
+engine: triton
+precision: fp16
+device_policy: cuda
+weights_digest: provided_by_deploy
+local_artifacts: []
+runtime_params:
+  triton_http_url: "${TRITON_HTTP_URL}"
+  triton_model_name: "speaker_diarization_small"
+  triton_model_version: null
+  triton_input_name: "AUDIO__0"
+  triton_input_datatype: "FP32"
+  triton_output_embeddings_name: "EMB__0"
+  triton_output_embeddings_datatype: "FP32"
+

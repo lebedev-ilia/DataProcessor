@@ -87,6 +87,9 @@ def validate_npz(path: str, required_meta_keys: Optional[List[str]] = None) -> T
                 "sampling_policy_version",
                 "status",
                 "empty_reason",
+                # PR-3: model system baseline
+                "models_used",
+                "model_signature",
             ]
             for k in keys:
                 if k not in meta:

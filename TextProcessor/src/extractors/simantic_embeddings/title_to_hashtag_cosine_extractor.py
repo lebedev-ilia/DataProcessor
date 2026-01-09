@@ -9,6 +9,7 @@ import numpy as np
 
 from src.core.base_extractor import BaseExtractor
 from src.core.metrics import system_snapshot, process_memory_bytes
+from src.core.path_utils import default_artifacts_dir
 
 
 def _latest(artifacts_dir: Path, pattern: str) -> Optional[Path]:
@@ -29,8 +30,8 @@ def _l2n(v: np.ndarray) -> np.ndarray:
 class TitleToHashtagCosineExtractor(BaseExtractor):
     VERSION = "1.0.0"
 
-    def __init__(self, artifacts_dir: str = "/home/ilya/Рабочий стол/DataProcessor/TextProcessor/.artifacts") -> None:
-        self.artifacts_dir = Path(artifacts_dir)
+    def __init__(self, artifacts_dir: str | None = None) -> None:
+        self.artifacts_dir = Path(artifacts_dir).expanduser().resolve() if artifacts_dir else default_artifacts_dir()
 
     def _load_vector(self, pattern: str) -> Optional[np.ndarray]:
         p = _latest(self.artifacts_dir, pattern)

@@ -9,6 +9,7 @@ import numpy as np
 
 from src.core.base_extractor import BaseExtractor
 from src.core.metrics import system_snapshot, process_memory_bytes
+from src.core.path_utils import default_artifacts_dir, textprocessor_root
 
 
 class TitleEmbeddingClusterEntropyExtractor(BaseExtractor):
@@ -16,15 +17,16 @@ class TitleEmbeddingClusterEntropyExtractor(BaseExtractor):
 
     def __init__(
         self,
-        clusters_path: str = "/home/ilya/Рабочий стол/DataProcessor/TextProcessor/models/title_clusters.npy",
+        clusters_path: str | None = None,
         top_k: int = 5,
         temperature: float = 0.1,
-        artifacts_dir: str = "/home/ilya/Рабочий стол/DataProcessor/TextProcessor/.artifacts",
+        artifacts_dir: str | None = None,
     ) -> None:
-        self.clusters_path = Path(clusters_path)
+        default_clusters = textprocessor_root() / "models" / "title_clusters.npy"
+        self.clusters_path = Path(clusters_path).expanduser().resolve() if clusters_path else default_clusters
         self.top_k = int(top_k)
         self.temperature = float(temperature)
-        self.artifacts_dir = Path(artifacts_dir)
+        self.artifacts_dir = Path(artifacts_dir).expanduser().resolve() if artifacts_dir else default_artifacts_dir()
         self._centroids: Optional[np.ndarray] = None
 
     def _load_centroids(self) -> Optional[np.ndarray]:

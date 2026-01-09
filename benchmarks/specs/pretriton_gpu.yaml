@@ -1,0 +1,57 @@
+version: "bench_pretriton_v1"
+
+# Pre-Triton bench: run models in-process using local caches (torch/torchvision/clip).
+# Goal: get latency curves and decide which fixed-size branches to export to ONNX.
+
+defaults:
+  warmup: 5
+  repeats: 30
+  device: "cuda"   # "cpu" or "cuda"
+  dtype: "fp16"    # "fp16" or "fp32" (best-effort)
+
+models:
+  # MiDaS
+  - name: midas_small_256
+    kind: midas
+    model_name: MiDaS_small
+    input:
+      shape: [1, 256, 256, 3]   # UINT8 NHWC (raw)
+
+  - name: midas_hybrid_384
+    kind: midas
+    model_name: DPT_Hybrid
+    input:
+      shape: [1, 384, 384, 3]
+
+  - name: midas_hybrid_512
+    kind: midas
+    model_name: DPT_Hybrid
+    input:
+      shape: [1, 512, 512, 3]
+
+  # RAFT
+  - name: raft_small_256
+    kind: raft
+    model_name: raft_small
+    input0:
+      shape: [1, 256, 256, 3]
+    input1:
+      shape: [1, 256, 256, 3]
+
+  - name: raft_small_384
+    kind: raft
+    model_name: raft_small
+    input0:
+      shape: [1, 384, 384, 3]
+    input1:
+      shape: [1, 384, 384, 3]
+
+  - name: raft_small_512
+    kind: raft
+    model_name: raft_small
+    input0:
+      shape: [1, 512, 512, 3]
+    input1:
+      shape: [1, 512, 512, 3]
+
+

@@ -1,0 +1,57 @@
+version: "bench_spec_v1"
+
+# Grouped local baseline (GPU/Triton): CLIP + Places365 only.
+# Use this on small VRAM GPUs to avoid ORT CUDA OOM caused by running all models back-to-back.
+
+defaults:
+  warmup: 5
+  repeats: 30
+  timeout_sec: 10.0
+
+models:
+  # --- CLIP image ---
+  - name: clip_image_224
+    model_spec_name: clip_image_224_triton
+    kind: single_input
+    input: { dtype: UINT8, shape: [1, 224, 224, 3], layout: nhwc, value: random_int, int_range: [0, 256] }
+    output: { name: OUTPUT__0 }
+
+  - name: clip_image_336
+    model_spec_name: clip_image_336_triton
+    kind: single_input
+    input: { dtype: UINT8, shape: [1, 336, 336, 3], layout: nhwc, value: random_int, int_range: [0, 256] }
+    output: { name: OUTPUT__0 }
+
+  - name: clip_image_448
+    model_spec_name: clip_image_448_triton
+    kind: single_input
+    input: { dtype: UINT8, shape: [1, 448, 448, 3], layout: nhwc, value: random_int, int_range: [0, 256] }
+    output: { name: OUTPUT__0 }
+
+  # --- CLIP text ---
+  - name: clip_text
+    model_spec_name: clip_text_triton
+    kind: single_input
+    input: { dtype: INT64, shape: [1, 77], layout: tokens, value: random_int, int_range: [0, 49408] }
+    output: { name: OUTPUT__0 }
+
+  # --- Places365 ---
+  - name: places365_resnet50_224
+    model_spec_name: places365_resnet50_224_triton
+    kind: single_input
+    input: { dtype: UINT8, shape: [1, 224, 224, 3], layout: nhwc, value: random_int, int_range: [0, 256] }
+    output: { name: OUTPUT__0 }
+
+  - name: places365_resnet50_336
+    model_spec_name: places365_resnet50_336_triton
+    kind: single_input
+    input: { dtype: UINT8, shape: [1, 336, 336, 3], layout: nhwc, value: random_int, int_range: [0, 256] }
+    output: { name: OUTPUT__0 }
+
+  - name: places365_resnet50_448
+    model_spec_name: places365_resnet50_448_triton
+    kind: single_input
+    input: { dtype: UINT8, shape: [1, 448, 448, 3], layout: nhwc, value: random_int, int_range: [0, 256] }
+    output: { name: OUTPUT__0 }
+
+

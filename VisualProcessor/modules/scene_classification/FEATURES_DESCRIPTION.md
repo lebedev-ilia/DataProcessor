@@ -45,20 +45,12 @@
 
 По сцене берётся среднее по кадрам.
 
-## 4. Time of Day Detection
-
-### mean_morning, mean_day, mean_evening, mean_night, time_of_day_probs, time_of_day_top, time_of_day_confidence
-- **mean_morning / mean_day / mean_evening / mean_night**: средние по кадрам вероятности времени суток, полученные из эвристики по яркости и доле тёплых тонов.
-- **time_of_day_probs**: нормализованный вектор распределения сцены по времени суток `[morning, day, evening, night]`, полученный как усреднение по кадрам с последующей нормализацией.
-- **time_of_day_top**: наиболее вероятное время суток для сцены (argmax по `time_of_day_probs`).
-- **time_of_day_confidence**: уверенность в доминирующем времени суток (максимальный компонент `time_of_day_probs`).
-
 ## 5. Aesthetic Score
 
 ### mean_aesthetic_score, aesthetic_std, aesthetic_frac_high
 Оценка эстетической привлекательности сцены (0.0‑1.0).
 
-- На уровне кадра: либо CLIP‑based zero‑shot (позитивные против негативных промптов), либо эвристика (sharpness, contrast, colorfulness, brightness_score).
+- На уровне кадра: **CLIP‑based zero‑shot** (позитивные против негативных промптов) на базе `core_clip` (без локального CLIP и без эвристик).
 - На уровне сцены:
   - **mean_aesthetic_score** — среднее по кадрам;
   - **aesthetic_std** — стандартное отклонение по кадрам (стабильность эстетики);
@@ -79,19 +71,10 @@
 ### mean_cozy, mean_scary, mean_epic, mean_neutral, atmosphere_entropy
 Вероятности атмосферы сцены (уютная, страшная, эпическая, нейтральная).
 
-- На уровне кадра: либо CLIP zero‑shot (4 класса), либо эвристика на основе яркости, контраста и тёплых цветов.
+- На уровне кадра: **CLIP zero‑shot (4 класса)** на базе `core_clip` (без эвристик).
 - На уровне сцены:
   - **mean_cozy / mean_scary / mean_epic / mean_neutral** — средние вероятности по кадрам;
   - **atmosphere_entropy** — энтропия усреднённого распределения `[cozy, scary, epic, neutral]`, показывающая «определённость» атмосферы.
-
-## 8. Geometric Features
-
-### mean_openness, mean_clutter, mean_depth_cues
-- **mean_openness**: оценка открытости сцены (0.0‑1.0), характеризующая видимость неба/горизонта. Вычисляется через анализ яркости верхней трети изображения и вариативности яркости.
-- **mean_clutter**: оценка визуальной загруженности/сложности сцены (0.0‑1.0) через плотность краёв (Canny edge density) с нормализацией по размеру кадра.
-- **mean_depth_cues**: оценка наличия признаков глубины (0.0‑1.0) на основе среднего модуля градиента (операторы Собеля).
-
-Все геометрические метрики нормализуются по размеру изображения (через плотности/средние значения), что делает их более стабильными к разрешению.
 
 ### scene_change_score, label_stability, dominant_places_topk_ids, dominant_places_topk_probs
 - **scene_change_score**: мера вариативности сцены, основанная на стандартном отклонении confidence top‑1 по кадрам (чем выше, тем менее стабильна сцена).

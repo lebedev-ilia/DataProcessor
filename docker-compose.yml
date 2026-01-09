@@ -1,0 +1,110 @@
+services:
+  redis:
+    image: redis:7-alpine
+    ports:
+      - "6379:6379"
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 5s
+      timeout: 3s
+      retries: 20
+
+  minio:
+    image: minio/minio:RELEASE.2025-01-20T00-00-00Z
+    command: server /data --console-address ":9001"
+    environment:
+      MINIO_ROOT_USER: ${MINIO_ROOT_USER}
+      MINIO_ROOT_PASSWORD: ${MINIO_ROOT_PASSWORD}
+    ports:
+      - "9000:9000"
+      - "9001:9001"
+    volumes:
+      - minio_data:/data
+
+  minio-init:
+    image: minio/mc:RELEASE.2025-01-17T23-03-09Z
+    depends_on:
+      - minio
+    environment:
+      MINIO_ROOT_USER: ${MINIO_ROOT_USER}
+      MINIO_ROOT_PASSWORD: ${MINIO_ROOT_PASSWORD}
+      S3_BUCKET: ${S3_BUCKET}
+    entrypoint: ["/bin/sh", "-lc"]
+    command: >
+      for i in $(seq 1 60); do
+        mc alias set local http://minio:9000 "$MINIO_ROOT_USER" "$MINIO_ROOT_PASSWORD" && break;
+        echo "[minio-init] waiting for minio..." && sleep 1;
+      done &&
+      (mc mb -p "local/$S3_BUCKET" || true) &&
+      mc anonymous set none "local/$S3_BUCKET" || true
+
+  # PR-7 NOTE: still not the full ML pipeline image yet.
+  # We run celery worker + health API in separate services but same minimal image.
+  dataprocessor-celery-worker:
+    build:
+      context: .
+      dockerfile: docker/worker/Dockerfile
+    depends_on:
+      redis:
+        condition: service_healthy
+      minio-init:
+        condition: service_completed_successfully
+    environment:
+      CELERY_BROKER_URL: ${CELERY_BROKER_URL}
+      CELERY_RESULT_BACKEND: ${CELERY_RESULT_BACKEND}
+      S3_ENDPOINT: ${S3_ENDPOINT}
+      S3_BUCKET: ${S3_BUCKET}
+      S3_PREFIX: ${S3_PREFIX}
+      AWS_ACCESS_KEY_ID: ${AWS_ACCESS_KEY_ID}
+      AWS_SECRET_ACCESS_KEY: ${AWS_SECRET_ACCESS_KEY}
+      AWS_DEFAULT_REGION: ${AWS_DEFAULT_REGION}
+      TRITON_HTTP_URL: ${TRITON_HTTP_URL}
+    volumes:
+      - .:/app:ro
+    command: ["celery", "-A", "dp_queue.celery_app:celery_app", "worker", "--loglevel=INFO"]
+
+  dataprocessor-health:
+    build:
+      context: .
+      dockerfile: docker/worker/Dockerfile
+    depends_on:
+      redis:
+        condition: service_healthy
+      minio-init:
+        condition: service_completed_successfully
+    environment:
+      CELERY_BROKER_URL: ${CELERY_BROKER_URL}
+      CELERY_RESULT_BACKEND: ${CELERY_RESULT_BACKEND}
+      S3_ENDPOINT: ${S3_ENDPOINT}
+      S3_BUCKET: ${S3_BUCKET}
+      AWS_ACCESS_KEY_ID: ${AWS_ACCESS_KEY_ID}
+      AWS_SECRET_ACCESS_KEY: ${AWS_SECRET_ACCESS_KEY}
+      AWS_DEFAULT_REGION: ${AWS_DEFAULT_REGION}
+      TRITON_HTTP_URL: ${TRITON_HTTP_URL}
+    volumes:
+      - .:/app:ro
+    ports:
+      - "8080:8080"
+    command: ["uvicorn", "health.app:app", "--host", "0.0.0.0", "--port", "8080"]
+
+  # Triton is required for production-baseline, but in PR-0 we keep it optional
+  # because enabling GPU runtime depends on your local Docker setup (nvidia-container-toolkit).
+  triton:
+    profiles: ["triton"]
+    image: nvcr.io/nvidia/tritonserver:24.08-py3
+    # GPU runtime setup is environment-specific. We'll finalize it in PR-8.
+    # runtime: nvidia
+    # environment:
+    #   NVIDIA_VISIBLE_DEVICES: all
+    ports:
+      - "8000:8000" # http
+      - "8001:8001" # grpc
+      - "8002:8002" # metrics
+    volumes:
+      - ./triton/models:/models:ro
+    command: ["tritonserver", "--model-repository=/models"]
+
+volumes:
+  minio_data:
+
+

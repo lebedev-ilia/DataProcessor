@@ -1,0 +1,24 @@
+model_name: places365_timm_regnetx_006
+model_version: "places365"
+role: scene_classification
+runtime: inprocess
+engine: torch
+precision: fp32
+device_policy: auto
+local_artifacts:
+  - path: visual/places365/timm/regnetx_006_places365.pth
+    kind: file
+  - path: visual/places365/categories_places365.txt
+    kind: file
+weights_digest: auto
+runtime_params:
+  factory: dp_models.factories.vision:create_timm_model
+  factory_kwargs:
+    model_name: regnetx_006
+    num_classes: 365
+  checkpoint_relpath: visual/places365/timm/regnetx_006_places365.pth
+  state_dict_key: state_dict
+  strict: false
+  categories_relpath: visual/places365/categories_places365.txt
+
+

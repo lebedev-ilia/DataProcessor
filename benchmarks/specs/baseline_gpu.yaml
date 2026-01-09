@@ -1,0 +1,194 @@
+version: "bench_spec_v1"
+
+# Baseline GPU branches (NO dynamic axes).
+# Each entry references a dp_models Triton spec (model_spec_name).
+#
+# NOTE: preprocess can live inside Triton graph/ensemble.
+# This harness only needs to know what input tensors to send (dtype/shape).
+
+defaults:
+  warmup: 5
+  repeats: 30
+  timeout_sec: 10.0
+
+models:
+  # --- CLIP image branches ---
+  - name: clip_image_224
+    model_spec_name: clip_image_224_triton
+    kind: single_input
+    input:
+      dtype: UINT8
+      shape: [1, 224, 224, 3]   # NHWC (raw RGB pixels)
+      layout: nhwc
+      value: random_int
+      int_range: [0, 256]
+    output:
+      name: OUTPUT__0
+
+  - name: clip_image_336
+    model_spec_name: clip_image_336_triton
+    kind: single_input
+    input:
+      dtype: UINT8
+      shape: [1, 336, 336, 3]   # NHWC (raw RGB pixels)
+      layout: nhwc
+      value: random_int
+      int_range: [0, 256]
+    output:
+      name: OUTPUT__0
+
+  - name: clip_image_448
+    model_spec_name: clip_image_448_triton
+    kind: single_input
+    input:
+      dtype: UINT8
+      shape: [1, 448, 448, 3]   # NHWC (raw RGB pixels)
+      layout: nhwc
+      value: random_int
+      int_range: [0, 256]
+    output:
+      name: OUTPUT__0
+
+  # --- CLIP text (token ids) ---
+  - name: clip_text
+    model_spec_name: clip_text_triton
+    kind: single_input
+    input:
+      dtype: INT64
+      shape: [1, 77]
+      layout: tokens
+      value: random_int
+      int_range: [0, 49408]
+    output:
+      name: OUTPUT__0
+
+  # --- Places365 (scene classification) ---
+  - name: places365_resnet50_224
+    model_spec_name: places365_resnet50_224_triton
+    kind: single_input
+    input:
+      dtype: UINT8
+      shape: [1, 224, 224, 3]
+      layout: nhwc
+      value: random_int
+      int_range: [0, 256]
+    output:
+      name: OUTPUT__0
+
+  - name: places365_resnet50_336
+    model_spec_name: places365_resnet50_336_triton
+    kind: single_input
+    input:
+      dtype: UINT8
+      shape: [1, 336, 336, 3]
+      layout: nhwc
+      value: random_int
+      int_range: [0, 256]
+    output:
+      name: OUTPUT__0
+
+  - name: places365_resnet50_448
+    model_spec_name: places365_resnet50_448_triton
+    kind: single_input
+    input:
+      dtype: UINT8
+      shape: [1, 448, 448, 3]
+      layout: nhwc
+      value: random_int
+      int_range: [0, 256]
+    output:
+      name: OUTPUT__0
+
+  # --- MiDaS depth branches ---
+  - name: midas_256
+    model_spec_name: midas_256_triton
+    kind: single_input
+    input:
+      dtype: UINT8
+      shape: [1, 256, 256, 3]
+      layout: nhwc
+      value: random_int
+      int_range: [0, 256]
+    output:
+      name: OUTPUT__0
+
+  - name: midas_384
+    model_spec_name: midas_384_triton
+    kind: single_input
+    input:
+      dtype: UINT8
+      shape: [1, 384, 384, 3]
+      layout: nhwc
+      value: random_int
+      int_range: [0, 256]
+    output:
+      name: OUTPUT__0
+
+  - name: midas_512
+    model_spec_name: midas_512_triton
+    kind: single_input
+    input:
+      dtype: UINT8
+      shape: [1, 512, 512, 3]
+      layout: nhwc
+      value: random_int
+      int_range: [0, 256]
+    output:
+      name: OUTPUT__0
+
+  # --- RAFT optical flow branches (two inputs) ---
+  - name: raft_256
+    model_spec_name: raft_256_triton
+    kind: two_inputs
+    input0:
+      dtype: UINT8
+      shape: [1, 256, 256, 3]
+      layout: nhwc
+      value: random_int
+      int_range: [0, 256]
+    input1:
+      dtype: UINT8
+      shape: [1, 256, 256, 3]
+      layout: nhwc
+      value: random_int
+      int_range: [0, 256]
+    output:
+      name: OUTPUT__0
+
+  - name: raft_384
+    model_spec_name: raft_384_triton
+    kind: two_inputs
+    input0:
+      dtype: UINT8
+      shape: [1, 384, 384, 3]
+      layout: nhwc
+      value: random_int
+      int_range: [0, 256]
+    input1:
+      dtype: UINT8
+      shape: [1, 384, 384, 3]
+      layout: nhwc
+      value: random_int
+      int_range: [0, 256]
+    output:
+      name: OUTPUT__0
+
+  - name: raft_512
+    model_spec_name: raft_512_triton
+    kind: two_inputs
+    input0:
+      dtype: UINT8
+      shape: [1, 512, 512, 3]
+      layout: nhwc
+      value: random_int
+      int_range: [0, 256]
+    input1:
+      dtype: UINT8
+      shape: [1, 512, 512, 3]
+      layout: nhwc
+      value: random_int
+      int_range: [0, 256]
+    output:
+      name: OUTPUT__0
+
+

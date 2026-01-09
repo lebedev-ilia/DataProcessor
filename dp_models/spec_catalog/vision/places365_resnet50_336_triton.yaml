@@ -1,0 +1,23 @@
+model_name: places365_resnet50_336_triton
+model_version: "1"
+role: scene_classification
+runtime: triton
+engine: triton
+precision: fp32
+device_policy: cuda
+weights_digest: provided_by_deploy
+local_artifacts:
+  - path: visual/places365/categories_places365.txt
+    kind: file
+runtime_params:
+  triton_http_url: "${TRITON_HTTP_URL}"
+  triton_timeout_sec: 60.0
+  triton_model_name: "places365_resnet50_336"
+  triton_model_version: "1"
+  triton_input_name: "INPUT__0"
+  triton_input_datatype: "UINT8"
+  triton_output_name: "OUTPUT__0"
+  triton_output_datatype: "FP32"
+  categories_relpath: visual/places365/categories_places365.txt
+
+

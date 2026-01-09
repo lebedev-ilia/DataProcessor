@@ -85,7 +85,9 @@ Segmenter обязан записать в `frames_dir/metadata.json`:
 - **`shot_end_frame`**: `(S,) int32`
 - **`shot_frame_count`**: `(S,) int32` — число sampled кадров в шоте
 - **`shot_features_mean/std/min/max`**: `(S, F) float32` — агрегаты по кадрам шота
-- **`meta`**: `object` — словарь с версией/маппингами категорий и др.
+- **`impl_meta`**: `object` — модульный словарь (маппинги категорий, prompts и др.)
+
+**Важно про `meta`:** canonical `meta` всегда добавляется `BaseModule.save_results()` и содержит run identity keys, status/empty_reason и т.д.
 
 ### “Нет лиц” — это нормально
 Если на видео нет лиц, это **не ошибка**:
@@ -152,5 +154,14 @@ data = np.load(latest, allow_pickle=True)
 - face ROI quality (по `core_face_landmarks`)
 
 Классы `quality_probs` соответствуют `core_clip["shot_quality_prompts"]` (P=7).
+
+---
+
+## GPU / batching
+
+Текущая реализация вычисления `quality_probs` — **numpy‑only (CPU)**. Параметр `device` сохранён как конфигурационное поле (информативно).
+
+Для контроля памяти матмала используется **явный** параметр:
+- `matmul_chunk_size` (через config), default `2048` (без эвристик).
 
 

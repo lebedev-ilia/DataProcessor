@@ -480,16 +480,31 @@ class QualityValidator:
         
         # Для shot_quality проверяем scores
         if component_name == "shot_quality":
-            shot_quality_scores = data.get("shot_quality_scores")
-            if shot_quality_scores is not None:
-                scores = np.asarray(shot_quality_scores, dtype=np.float32)
-                if scores.size > 0:
-                    if np.any(scores < 0.0) or np.any(scores > 1.0):
+            quality_probs = data.get("quality_probs")
+            if quality_probs is None:
+                self.issues.append(QualityIssue(
+                    component=component_name,
+                    feature_name="quality_probs",
+                    severity="warning",
+                    message="Missing quality_probs (expected (N,P) float16)"
+                ))
+            else:
+                qp = np.asarray(quality_probs, dtype=np.float32)
+                if qp.ndim != 2 or qp.shape[0] <= 0 or qp.shape[1] <= 0:
+                    self.issues.append(QualityIssue(
+                        component=component_name,
+                        feature_name="quality_probs",
+                        severity="error",
+                        message=f"quality_probs has invalid shape: {list(qp.shape)}"
+                    ))
+                else:
+                    row_sums = np.sum(qp, axis=1)
+                    if np.any(row_sums < 0.95) or np.any(row_sums > 1.05):
                         self.issues.append(QualityIssue(
                             component=component_name,
-                            feature_name="shot_quality_scores",
+                            feature_name="quality_probs",
                             severity="warning",
-                            message=f"Quality scores out of [0,1] range: min={scores.min():.3f}, max={scores.max():.3f}"
+                            message=f"quality_probs rows not close to 1.0 (min_sum={row_sums.min():.3f}, max_sum={row_sums.max():.3f})"
                         ))
     
     def _validate_general_quality(self, data: np.ndarray, component_name: str) -> None:

@@ -1,0 +1,25 @@
+model_name: places365_resnet50
+model_version: "places365"
+role: scene_classification
+runtime: inprocess
+engine: torch
+precision: fp32
+device_policy: auto
+local_artifacts:
+  - path: visual/places365/resnet50_places365.pth.tar
+    kind: file
+  - path: visual/places365/categories_places365.txt
+    kind: file
+weights_digest: auto
+runtime_params:
+  factory: dp_models.factories.vision:create_torchvision_resnet
+  factory_kwargs:
+    model_name: resnet50
+    num_classes: 365
+  checkpoint_relpath: visual/places365/resnet50_places365.pth.tar
+  state_dict_key: state_dict
+  strict: false
+  strip_prefix: "module."
+  categories_relpath: visual/places365/categories_places365.txt
+
+

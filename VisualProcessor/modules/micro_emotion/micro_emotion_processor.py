@@ -8,7 +8,7 @@ Micro Emotion Processor - Optimized version
 - Per-frame векторы для VisualTransformer
 
 Все TODO выполнены:
-    1. ✅ Интеграция с внешними зависимостями через BaseModule (face_detection, core_face_landmarks)
+    1. ✅ Интеграция с внешними зависимостями через BaseModule (core_face_landmarks)
     2. ✅ Использование результатов core провайдеров вместо прямых вызовов моделей
     3. ✅ Интеграция с BaseModule через класс MicroEmotionModule
     4. ✅ Единый формат вывода для сохранения в npz
@@ -807,7 +807,7 @@ class MicroEmotionModule(BaseModule):
     Может работать с:
     - Готовым DataFrame (переданным через config)
     - CSV файлом OpenFace (загружается автоматически)
-    - Результатами face_detection для фильтрации кадров
+        - face presence из core_face_landmarks для фильтрации кадров (face_detection удалён)
     """
     
     def __init__(
@@ -837,7 +837,7 @@ class MicroEmotionModule(BaseModule):
             gaze_centered_threshold: Порог для определения взгляда в камеру (градусы)
             pca_components: Количество PCA компонент для AU
             au_confidence_threshold: Порог уверенности AU
-            use_face_detection: Использовать результаты face_detection для фильтрации кадров
+            use_face_detection: Устаревший флаг. Если True — фильтруем кадры по `core_face_landmarks.face_present`
             **kwargs: Дополнительные параметры для BaseModule
         """
         super().__init__(rs_path=rs_path, **kwargs)
@@ -862,12 +862,11 @@ class MicroEmotionModule(BaseModule):
         Возвращает список зависимостей модуля.
         
         Опциональные зависимости:
-        - face_detection: для фильтрации кадров с лицами
-        - core_face_landmarks: для использования готовых landmarks (если доступны)
+        - core_face_landmarks: для фильтрации кадров по face_present (если включён use_face_detection)
         """
         deps = []
         if self.use_face_detection:
-            deps.append("face_detection")
+            deps.append("core_face_landmarks")
         return deps
     
     def _load_openface_dataframe(
@@ -937,12 +936,12 @@ class MicroEmotionModule(BaseModule):
         
         return None
     
-    def _filter_frame_indices_by_face_detection(
+    def _filter_frame_indices_by_face_presence(
         self,
         frame_indices: List[int]
     ) -> List[int]:
         """
-        Фильтрует индексы кадров по результатам face_detection.
+        Фильтрует индексы кадров по `core_face_landmarks.face_present`.
         
         Args:
             frame_indices: Исходный список индексов кадров
@@ -954,17 +953,19 @@ class MicroEmotionModule(BaseModule):
             return frame_indices
         
         try:
-            face_data = self.load_dependency_results("face_detection", format="json")
-            if not face_data or 'frames' not in face_data:
-                self.logger.warning("face_detection результаты не найдены, используем все кадры")
+            core = self.load_dependency_results("core_face_landmarks", format="npz")
+            if not core or "frame_indices" not in core or "face_present" not in core:
+                self.logger.warning("core_face_landmarks missing; cannot filter frames, using all frames")
                 return frame_indices
-            
-            frames_with_faces = [
-                int(k) for k, v in face_data['frames'].items()
-                if v and len(v) > 0
-            ]
-            
-            filtered = sorted(set(frame_indices) & set(frames_with_faces))
+
+            fi = np.asarray(core["frame_indices"], dtype=np.int32)
+            fp = np.asarray(core["face_present"], dtype=bool)
+            if fi.shape[0] != fp.shape[0]:
+                self.logger.warning("core_face_landmarks shape mismatch; cannot filter frames, using all frames")
+                return frame_indices
+
+            frames_with_faces = set(int(x) for x in fi[fp].tolist())
+            filtered = sorted(set(int(x) for x in frame_indices) & frames_with_faces)
             self.logger.info(
                 f"Отфильтровано кадров: {len(frame_indices)} -> {len(filtered)} "
                 f"(с лицами: {len(frames_with_faces)})"
@@ -973,7 +974,7 @@ class MicroEmotionModule(BaseModule):
             
         except Exception as e:
             self.logger.warning(
-                f"Ошибка загрузки face_detection результатов: {e}. "
+                f"Ошибка фильтрации по core_face_landmarks: {e}. "
                 "Используем все кадры."
             )
             return frame_indices
@@ -1003,8 +1004,8 @@ class MicroEmotionModule(BaseModule):
             - microexpr_features: фичи micro-expressions
             - summary: метаданные обработки
         """
-        # Фильтруем кадры по face_detection, если нужно
-        filtered_indices = self._filter_frame_indices_by_face_detection(frame_indices)
+        # Фильтруем кадры по face presence, если нужно
+        filtered_indices = self._filter_frame_indices_by_face_presence(frame_indices)
         
         # Загружаем DataFrame OpenFace
         df = self._load_openface_dataframe(config)

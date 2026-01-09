@@ -8,6 +8,7 @@ from typing import Any, Dict, Optional
 
 from src.core.base_extractor import BaseExtractor
 from src.core.metrics import system_snapshot, process_memory_bytes
+from src.core.path_utils import default_artifacts_dir, default_cache_dir
 
 
 class EmbeddingSourceIdExtractor(BaseExtractor):
@@ -17,11 +18,11 @@ class EmbeddingSourceIdExtractor(BaseExtractor):
         self,
         vector_store_uri: str = "faiss://semantic_titles_v1",
         model_version: str = "unknown",
-        artifacts_dir: str = "/home/ilya/Рабочий стол/DataProcessor/TextProcessor/.artifacts",
+        artifacts_dir: str | None = None,
     ) -> None:
         self.vector_store_uri = vector_store_uri
         self.model_version = model_version
-        self.artifacts_dir = Path(artifacts_dir)
+        self.artifacts_dir = Path(artifacts_dir).expanduser().resolve() if artifacts_dir else default_artifacts_dir()
 
     @staticmethod
     def _generate_stable_id(file_path: str) -> str:
@@ -39,7 +40,7 @@ class EmbeddingSourceIdExtractor(BaseExtractor):
         # Priority: title -> transcript aggregated -> description
         patterns = [
             "title_embedding_*.npy",
-            "transcript_*_mean_embedding_*.npy",
+            "transcript_*_agg_mean_*.npy",
             "description_embedding_*.npy",
         ]
         for pattern in patterns:
@@ -66,7 +67,7 @@ class EmbeddingSourceIdExtractor(BaseExtractor):
             name = Path(npy_path).name
             if name.startswith("transcript_") and "_embedding_" in name:
                 h = name.split("_embedding_")[-1].split(".")[0]
-                cache_dir = Path(str(self.artifacts_dir).replace(".artifacts", ".cache/transcript_embed"))
+                cache_dir = default_cache_dir() / "transcript_embed"
                 meta_path2 = cache_dir / f"{h}.json"
                 if meta_path2.exists():
                     import json as _json

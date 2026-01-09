@@ -11,10 +11,11 @@ import torch.nn as nn
 
 from src.core.base_extractor import BaseExtractor
 from src.core.metrics import system_snapshot, process_memory_bytes
+from src.core.path_utils import default_artifacts_dir
 
 
 class ChunkAutoencoder(nn.Module):
-    def __init__(self, input_dim: int = 1024, bottleneck_dim: int = 256):
+    def __init__(self, input_dim: int = 384, bottleneck_dim: int = 256):
         super().__init__()
         self.encoder = nn.Sequential(
             nn.Linear(input_dim, 512),
@@ -58,12 +59,12 @@ class LongformEmbeddingSummaryExtractor(BaseExtractor):
 
     def __init__(
         self,
-        artifacts_dir: str = "/home/ilya/Рабочий стол/DataProcessor/TextProcessor/.artifacts",
-        input_dim: int = 1024,
+        artifacts_dir: str | None = None,
+        input_dim: int = 384,
         bottleneck_dim: int = 256,
         device: str = "cpu",
     ) -> None:
-        self.artifacts_dir = Path(artifacts_dir)
+        self.artifacts_dir = Path(artifacts_dir).expanduser().resolve() if artifacts_dir else default_artifacts_dir()
         self.device = device
         self.bottleneck_dim = bottleneck_dim
         self.model = ChunkAutoencoder(input_dim=input_dim, bottleneck_dim=bottleneck_dim).to(self.device)

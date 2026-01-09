@@ -1,323 +1,263 @@
 """
-Экстрактор эмоциональной диаризации на основе SpeechBrain.
+Emotion diarization extractor (Triton-backed) + Segmenter time windows.
+
+Policy:
+- NO runtime downloads (ModelManager enforced).
+- Uses Segmenter `audio/segments.json` family: `emotion`.
+- `<5s` audio -> ERROR.
+- Truly silent audio -> EMPTY (payload.status="empty", empty_reason="audio_silent").
+
+Outputs (payload):
+- emotion_probs: np.ndarray [N, C] float32 (per-window probabilities)
+- emotion_id: np.ndarray [N] int32 (argmax per window)
+- emotion_confidence: np.ndarray [N] float32 (max prob per window)
+- emotion_mean_probs: np.ndarray [C] float32
+- emotion_entropy: float
+- dominant_emotion_id: int
+- dominant_emotion_prob: float
+- segment_start_sec/end_sec/center_sec: lists[float] aligned with N
 """
+
+from __future__ import annotations
+
+import os
 import time
 import logging
+from typing import Any, Dict, List, Optional
+
 import numpy as np
-import torch
-from typing import Dict, Any, Optional, List
-from pathlib import Path
-from contextlib import redirect_stdout, redirect_stderr
-import os
 
 from src.core.base_extractor import BaseExtractor, ExtractorResult
 from src.core.audio_utils import AudioUtils
+from dp_triton import TritonHttpClient, TritonError  # type: ignore
 
 logger = logging.getLogger(__name__)
 
 
 class EmotionDiarizationExtractor(BaseExtractor):
-    """Экстрактор эмоциональной диаризации на основе SpeechBrain."""
-    
     name = "emotion_diarization_extractor"
-    version = "1.0.0"
-    description = "Эмоциональная диаризация с помощью SpeechBrain"
+    version = "2.0.0"
+    description = "Emotion diarization via Triton (probs + aggregates)"
     category = "speech"
-    dependencies = ["torch", "speechbrain", "librosa"]
-    estimated_duration = 5.0
-    
-    # Предпочитает GPU для SpeechBrain
+    dependencies = ["numpy", "dp_triton", "dp_models"]
+    estimated_duration = 6.0
+
     gpu_required = False
     gpu_preferred = True
-    gpu_memory_required = 1.0  # 1GB для SpeechBrain модели
-    
-    def __init__(
-        self, 
-        device: str = "auto",
-        model_path: str = "/home/ilya/Рабочий стол/DataProcessor/AudioProcessor/pretrained_models/emotion_diarization",
-        sample_rate: int = 16000,
-        batch_size: int = 1
-    ):
-        """
-        Инициализация экстрактора эмоциональной диаризации.
-        
-        Args:
-            device: Устройство для обработки
-            model_path: Путь к предобученной модели
-            sample_rate: Частота дискретизации
-            batch_size: Размер батча для обработки
-        """
-        super().__init__(device=device)
-        
-        self.model_path = model_path
-        self.sample_rate = sample_rate
-        self.batch_size = batch_size
-        
-        self.audio_utils = AudioUtils(device=device, sample_rate=sample_rate)
-        
-        # Инициализируем модель
-        self._setup_model()
-    
-    def _setup_model(self):
-        """Настройка модели эмоциональной диаризации."""
-        try:
-            # Приглушаем шумные логи SpeechBrain
-            try:
-                for _name in [
-                    "speechbrain",
-                    "speechbrain.utils.fetching",
-                    "speechbrain.utils.parameter_transfer",
-                    "speechbrain.dataio.encoder",
-                ]:
-                    logging.getLogger(_name).setLevel(logging.ERROR)
-            except Exception:
-                pass
+    gpu_memory_required = 0.0  # Triton-backed
 
-            # Скрываем инфо-логи инициализации модели
-            with open(os.devnull, "w") as _devnull:
-                with redirect_stdout(_devnull), redirect_stderr(_devnull):
-                    # Импортируем SpeechBrain только здесь, чтобы избежать ошибок при отсутствии библиотеки
-                    from speechbrain.inference.diarization import Speech_Emotion_Diarization
-                    
-                    # Инициализируем модель
-                    self.sed_model = Speech_Emotion_Diarization.from_hparams(
-                        source=self.model_path,
-                        savedir=self.model_path,
-                    )
-            
-            # self.logger.debug("Модель эмоциональной диаризации инициализирована")
-            
-        except ImportError as e:
-            self.logger.error(f"SpeechBrain не установлен: {e}")
-            raise RuntimeError("SpeechBrain не установлен. Установите: pip install speechbrain")
+    def __init__(
+        self,
+        device: str = "auto",
+        model_size: str = "small",
+        sample_rate: int = 16000,
+        batch_size: int = 16,
+    ):
+        super().__init__(device=device)
+        self.model_size = str(model_size or "small").strip().lower()
+        if self.model_size not in ("small", "large"):
+            raise ValueError(f"emotion_diarization | unsupported model_size={self.model_size}. Expected: small|large")
+        self.sample_rate = int(sample_rate)
+        self.batch_size = max(1, int(batch_size))
+
+        self.audio_utils = AudioUtils(device=device, sample_rate=self.sample_rate)
+
+        # ModelManager: resolve Triton runtime params (no-network).
+        try:
+            from dp_models import get_global_model_manager  # type: ignore
+
+            self._mm = get_global_model_manager()
         except Exception as e:
-            self.logger.error(f"Ошибка инициализации модели эмоциональной диаризации: {e}")
-            raise
-    
-    def run(self, input_uri: str, tmp_path: str) -> ExtractorResult:
-        """
-        Извлечение эмоциональной диаризации.
-        
-        Args:
-            input_uri: Путь к аудио файлу
-            tmp_path: Временная директория
-            
-        Returns:
-            ExtractorResult с эмоциональной диаризацией
-        """
+            raise RuntimeError(f"emotion_diarization | ModelManager is required but failed to init: {e}") from e
+
+        spec_name = f"emotion_diarization_{self.model_size}_triton"
+        try:
+            self.model_spec = self._mm.get_spec(model_name=spec_name)
+            _dev, _prec, rt, _eng, wd, _arts = self._mm.resolve(self.model_spec)
+            if str(rt) != "triton":
+                raise RuntimeError(f"emotion_diarization | expected runtime=triton in spec {spec_name}, got {rt}")
+            self.model_name = str(self.model_spec.model_name)
+            self.weights_digest = str(wd)
+            rp = self.model_spec.runtime_params or {}
+            self.triton_http_url = self._expand_env(str(rp.get("triton_http_url") or os.environ.get("TRITON_HTTP_URL") or ""))
+            self.triton_model_name = str(rp.get("triton_model_name") or "")
+            self.triton_model_version = rp.get("triton_model_version")
+            self.triton_input_name = str(rp.get("triton_input_name") or "AUDIO__0")
+            self.triton_input_datatype = str(rp.get("triton_input_datatype") or "FP32")
+            self.triton_output_name = str(rp.get("triton_output_probs_name") or "PROBS__0")
+            self.triton_output_datatype = str(rp.get("triton_output_probs_datatype") or "FP32")
+            self.emotion_labels = rp.get("emotion_labels") if isinstance(rp.get("emotion_labels"), list) else []
+            if not self.triton_http_url or not self.triton_model_name:
+                raise RuntimeError("emotion_diarization | Triton runtime_params missing triton_http_url/triton_model_name")
+        except Exception as e:
+            raise RuntimeError(f"emotion_diarization | failed to resolve model spec via ModelManager: {e}") from e
+
+        self._client = TritonHttpClient(base_url=self.triton_http_url, timeout_sec=10.0)
+
+    def _expand_env(self, s: str) -> str:
+        if "${" not in str(s):
+            return str(s)
+        import re
+
+        def repl(m):
+            return os.environ.get(m.group(1), "")
+
+        return re.sub(r"\$\{([^}]+)\}", repl, str(s))
+
+    @staticmethod
+    def _rms_and_peak(x: np.ndarray) -> tuple[float, float]:
+        x = np.asarray(x, dtype=np.float32).reshape(-1)
+        if x.size == 0:
+            return 0.0, 0.0
+        rms = float(np.sqrt(float(np.mean(x * x)) + 1e-12))
+        peak = float(np.max(np.abs(x)) + 1e-12)
+        return rms, peak
+
+    def run_segments(self, input_uri: str, tmp_path: str, segments: List[Dict[str, Any]]) -> ExtractorResult:
         start_time = time.time()
-        
         try:
-            # Валидация входного файла
             if not self._validate_input(input_uri):
-                return self._create_result(
-                    success=False,
-                    error="Некорректный входной файл",
-                    processing_time=time.time() - start_time
-                )
-            
-            self._log_extraction_start(input_uri)
-            
-            # Извлекаем эмоциональную диаризацию
-            diarization_result = self._extract_emotion_diarization(input_uri)
-            
-            # Обрабатываем результат
-            processed_result = self._process_diarization_result(diarization_result)
-            
-            processing_time = time.time() - start_time
-            
-            # Создаем результат
-            payload = {
-                "emotion_segments": processed_result["emotion_segments"],
-                "emotion_labels": processed_result["emotion_labels"],
-                "speaker_segments": processed_result["speaker_segments"],
-                "emotion_speaker_mapping": processed_result["emotion_speaker_mapping"],
-                "emotion_statistics": processed_result["emotion_statistics"],
-                "speaker_count": processed_result["speaker_count"],
-                "duration": processed_result["duration"],
-                "device_used": self.device,
-                "sample_rate": self.sample_rate,
-                "model_path": self.model_path
-            }
-            
-            self._log_extraction_success(input_uri, processing_time)
-            
-            return self._create_result(
-                success=True,
-                payload=payload,
-                processing_time=processing_time
-            )
-            
-        except Exception as e:
-            processing_time = time.time() - start_time
-            error_msg = f"Ошибка извлечения эмоциональной диаризации: {str(e)}"
-            self._log_extraction_error(input_uri, error_msg, processing_time)
-            
-            return self._create_result(
-                success=False,
-                error=error_msg,
-                processing_time=processing_time
-            )
-    
-    def _extract_emotion_diarization(self, audio_path: str) -> Dict[str, Any]:
-        """Извлечение эмоциональной диаризации."""
-        try:
-            # SpeechBrain сам управляет устройством внутри diarize_file; приглушаем stdout/stderr
-            with open(os.devnull, "w") as _devnull:
-                with redirect_stdout(_devnull), redirect_stderr(_devnull):
-                    result = self.sed_model.diarize_file(audio_path)
-            return result
-        except Exception as e:
-            self.logger.error(f"Ошибка извлечения эмоциональной диаризации: {e}")
-            raise
-    
-    def _process_diarization_result(self, result: Dict[str, Any]) -> Dict[str, Any]:
-        """Обработка результата эмоциональной диаризации."""
-        try:
-            # Извлекаем сегменты из результата SpeechBrain
-            # Структура результата зависит от конкретной модели
-            emotion_segments = []
-            speaker_segments = []
-            emotion_labels = []
-            emotion_speaker_mapping = {}
-            
-            # Обрабатываем результат в зависимости от его структуры
-            if isinstance(result, dict):
-                # Если результат - словарь, извлекаем сегменты
-                segments = result.get("segments", [])
-                emotions = result.get("emotions", [])
-                speakers = result.get("speakers", [])
-                
-                for i, segment in enumerate(segments):
-                    start_time = segment.get("start", 0.0)
-                    end_time = segment.get("end", 0.0)
-                    duration = end_time - start_time
-                    
-                    # Эмоциональный сегмент
-                    emotion = emotions[i] if i < len(emotions) else "neutral"
-                    emotion_segment = {
-                        "start": start_time,
-                        "end": end_time,
-                        "duration": duration,
-                        "emotion": emotion,
-                        "confidence": segment.get("confidence", 0.0),
-                        "segment_index": i
-                    }
-                    emotion_segments.append(emotion_segment)
-                    
-                    # Спикерский сегмент
-                    speaker = speakers[i] if i < len(speakers) else 0
-                    speaker_segment = {
-                        "start": start_time,
-                        "end": end_time,
-                        "duration": duration,
-                        "speaker_id": int(speaker),
-                        "segment_index": i
-                    }
-                    speaker_segments.append(speaker_segment)
-                    
-                    # Маппинг эмоций к спикерам
-                    emotion_speaker_mapping[f"speaker_{speaker}"] = emotion
-                    
-                    emotion_labels.append(emotion)
-            
-            elif isinstance(result, list):
-                # Если результат - список сегментов
-                for i, segment in enumerate(result):
-                    if isinstance(segment, dict):
-                        start_time = segment.get("start", 0.0)
-                        end_time = segment.get("end", 0.0)
-                        duration = end_time - start_time
-                        
-                        emotion = segment.get("emotion", "neutral")
-                        speaker = segment.get("speaker", 0)
-                        
-                        # Эмоциональный сегмент
-                        emotion_segment = {
-                            "start": start_time,
-                            "end": end_time,
-                            "duration": duration,
-                            "emotion": emotion,
-                            "confidence": segment.get("confidence", 0.0),
-                            "segment_index": i
-                        }
-                        emotion_segments.append(emotion_segment)
-                        
-                        # Спикерский сегмент
-                        speaker_segment = {
-                            "start": start_time,
-                            "end": end_time,
-                            "duration": duration,
-                            "speaker_id": int(speaker),
-                            "segment_index": i
-                        }
-                        speaker_segments.append(speaker_segment)
-                        
-                        # Маппинг эмоций к спикерам
-                        emotion_speaker_mapping[f"speaker_{speaker}"] = emotion
-                        
-                        emotion_labels.append(emotion)
-            
-            # Вычисляем статистики
-            unique_emotions = list(set(emotion_labels))
-            unique_speakers = list(set([seg["speaker_id"] for seg in speaker_segments]))
-            speaker_count = len(unique_speakers)
-            
-            # Статистики по эмоциям
-            emotion_stats = {}
-            for emotion in unique_emotions:
-                emotion_segs = [seg for seg in emotion_segments if seg["emotion"] == emotion]
-                total_duration = sum(seg["duration"] for seg in emotion_segs)
-                emotion_stats[emotion] = {
-                    "count": len(emotion_segs),
-                    "total_duration": total_duration,
-                    "percentage": (total_duration / sum(seg["duration"] for seg in emotion_segments)) * 100 if emotion_segments else 0
+                return self._create_result(False, error="Некорректный входной файл", processing_time=time.time() - start_time)
+            if not isinstance(segments, list) or not segments:
+                raise ValueError("segments is empty (no-fallback)")
+
+            dur_sec = float(max((float(s.get("end_sec", 0.0)) for s in segments), default=0.0))
+            if dur_sec < 5.0:
+                raise RuntimeError(f"emotion_diarization | audio too short (<5s): duration_sec={dur_sec:.3f}")
+
+            waves: list[np.ndarray] = []
+            starts: list[float] = []
+            ends: list[float] = []
+            centers: list[float] = []
+            lens: list[int] = []
+            for seg in segments:
+                ss = int(seg.get("start_sample"))
+                es = int(seg.get("end_sample"))
+                st = float(seg.get("start_sec"))
+                en = float(seg.get("end_sec"))
+                c = float(seg.get("center_sec"))
+                wav_t, sr = self.audio_utils.load_audio_segment(input_uri, start_sample=ss, end_sample=es, target_sr=self.sample_rate)
+                wav = self.audio_utils.to_numpy(wav_t)
+                wav = wav[0] if wav.ndim == 2 else wav.reshape(-1)
+                wav = np.asarray(wav, dtype=np.float32).reshape(-1)
+                if int(sr) != int(self.sample_rate):
+                    raise RuntimeError(f"emotion_diarization | segment SR mismatch: got {sr} expected {self.sample_rate}")
+                waves.append(wav)
+                lens.append(int(wav.shape[0]))
+                starts.append(st)
+                ends.append(en)
+                centers.append(c)
+
+            max_len = int(max(lens) if lens else 0)
+            if max_len <= 0:
+                raise RuntimeError("emotion_diarization | no audio samples in segments")
+
+            concat = np.concatenate([w for w in waves if w.size], axis=0) if waves else np.zeros((0,), dtype=np.float32)
+            rms, peak = self._rms_and_peak(concat)
+            # Conservative silence detection: require both low peak and low rms.
+            if peak < 1e-3 and rms < 1e-4:
+                payload: Dict[str, Any] = {
+                    "status": "empty",
+                    "empty_reason": "audio_silent",
+                    "segments_count": int(len(segments)),
+                    "sample_rate": int(self.sample_rate),
+                    "rms": float(rms),
+                    "peak": float(peak),
+                    "model_name": self.model_name,
+                    "emotion_labels": self.emotion_labels,
+                    "device_used": "cuda",
                 }
-            
-            # Общая длительность
-            duration = sum(seg["duration"] for seg in emotion_segments) if emotion_segments else 0.0
-            
-            return {
-                "emotion_segments": emotion_segments,
-                "speaker_segments": speaker_segments,
-                "emotion_labels": emotion_labels,
-                "emotion_speaker_mapping": emotion_speaker_mapping,
-                "emotion_statistics": emotion_stats,
-                "speaker_count": speaker_count,
-                "duration": duration
+                return self._create_result(True, payload=payload, processing_time=time.time() - start_time)
+
+            if not self._client.ready():
+                raise TritonError(f"Triton is not ready at {self.triton_http_url}", error_code="triton_unavailable")
+
+            padded = np.zeros((len(waves), max_len), dtype=np.float32)
+            for i, w in enumerate(waves):
+                padded[i, : int(w.shape[0])] = w
+
+            probs_chunks: list[np.ndarray] = []
+            for start in range(0, padded.shape[0], self.batch_size):
+                batch = padded[start : start + self.batch_size]
+                res = self._client.infer(
+                    model_name=self.triton_model_name,
+                    model_version=(str(self.triton_model_version) if self.triton_model_version else None),
+                    input_name=self.triton_input_name,
+                    input_tensor=batch,
+                    output_name=self.triton_output_name,
+                    datatype=self.triton_input_datatype,
+                ).output
+                p = np.asarray(res, dtype=np.float32)
+                if p.ndim != 2 or p.shape[0] != batch.shape[0]:
+                    raise RuntimeError(f"emotion_diarization | unexpected probs shape from Triton: {p.shape}")
+                probs_chunks.append(p)
+
+            probs = np.concatenate(probs_chunks, axis=0) if probs_chunks else np.zeros((0, 0), dtype=np.float32)
+            if probs.shape[0] != padded.shape[0]:
+                raise RuntimeError(f"emotion_diarization | probs batch mismatch: probs={probs.shape} windows={padded.shape[0]}")
+
+            # normalize (defensive)
+            s = np.sum(probs, axis=1, keepdims=True) + 1e-9
+            probs = probs / s
+
+            emotion_id = np.argmax(probs, axis=1).astype(np.int32)
+            emotion_conf = np.max(probs, axis=1).astype(np.float32)
+
+            mean_probs = np.mean(probs, axis=0).astype(np.float32) if probs.size else np.zeros((0,), dtype=np.float32)
+            ent = float(-np.sum(mean_probs * np.log(mean_probs + 1e-9))) if mean_probs.size else 0.0
+            dominant_id = int(np.argmax(mean_probs)) if mean_probs.size else -1
+            dominant_prob = float(np.max(mean_probs)) if mean_probs.size else 0.0
+
+            payload = {
+                "emotion_probs": probs,
+                "emotion_id": emotion_id,
+                "emotion_confidence": emotion_conf,
+                "emotion_labels": self.emotion_labels,
+                "emotion_mean_probs": mean_probs,
+                "emotion_entropy": float(ent),
+                "dominant_emotion_id": int(dominant_id),
+                "dominant_emotion_prob": float(dominant_prob),
+                "segment_start_sec": starts,
+                "segment_end_sec": ends,
+                "segment_center_sec": centers,
+                "segments_count": int(len(segments)),
+                "sample_rate": int(self.sample_rate),
+                "device_used": "cuda",
+                "rms": float(rms),
+                "peak": float(peak),
+                "model_name": self.model_name,
             }
-            
+            return self._create_result(True, payload=payload, processing_time=time.time() - start_time)
+
+        except TritonError as e:
+            return self._create_result(False, error=str(e), processing_time=time.time() - start_time)
         except Exception as e:
-            self.logger.error(f"Ошибка обработки результата эмоциональной диаризации: {e}")
-            return {
-                "emotion_segments": [],
-                "speaker_segments": [],
-                "emotion_labels": [],
-                "emotion_speaker_mapping": {},
-                "emotion_statistics": {},
-                "speaker_count": 0,
-                "duration": 0.0
-            }
-    
+            return self._create_result(False, error=str(e), processing_time=time.time() - start_time)
+
+    def run(self, input_uri: str, tmp_path: str) -> ExtractorResult:
+        return self._create_result(
+            success=False,
+            error="emotion_diarization_extractor | run() is not supported in production. Use run_segments() with Segmenter families.emotion windows.",
+            processing_time=0.0,
+        )
+
     def _validate_input(self, input_uri: str) -> bool:
-        """Валидация входного файла."""
         if not super()._validate_input(input_uri):
             return False
-        
-        # Проверяем, что это аудио файл
-        audio_extensions = {'.wav', '.mp3', '.flac', '.m4a', '.mp4', '.avi', '.mov'}
+        audio_extensions = {".wav", ".mp3", ".flac", ".m4a", ".mp4", ".avi", ".mov"}
         if not any(input_uri.lower().endswith(ext) for ext in audio_extensions):
             self.logger.error(f"Файл не является поддерживаемым аудио/видео форматом: {input_uri}")
             return False
-        
         return True
-    
+
     def get_model_info(self) -> Dict[str, Any]:
-        """Получение информации о модели."""
         return {
-            "model_path": self.model_path,
+            "model_size": self.model_size,
             "sample_rate": self.sample_rate,
             "batch_size": self.batch_size,
             "device": self.device,
-            "gpu_available": self.gpu_available
+            "model_name": getattr(self, "model_name", None),
+            "weights_digest": getattr(self, "weights_digest", None),
         }
+
+

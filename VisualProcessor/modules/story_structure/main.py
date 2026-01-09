@@ -34,6 +34,8 @@ def main(argv: Optional[List[str]] = None) -> int:
     parser.add_argument("--clip-model", type=str, default=None, help="legacy/compat (unused in baseline)")
     parser.add_argument("--sentence-model", type=str, default=None, help="legacy/compat (unused in baseline)")
     parser.add_argument("--subtitles", type=str, default=None, help="Comma-separated subtitles/ASR chunks (optional)")
+    parser.add_argument("--max-frames", type=int, default=200, help="Fail-fast лимит на число sampled кадров (N)")
+    parser.add_argument("--energy-smoothing-sigma", type=float, default=1.0, help="Sigma для сглаживания energy/motion curves")
 
     parser.add_argument("--log-level", type=str, default="INFO", help="DEBUG/INFO/WARN/ERROR")
 
@@ -50,11 +52,13 @@ def main(argv: Optional[List[str]] = None) -> int:
         subtitles = [s.strip() for s in str(args.subtitles).split(",") if s.strip()]
 
     try:
-        module = StoryStructureBaselineModule(rs_path=args.rs_path)
+        module = StoryStructureBaselineModule(rs_path=args.rs_path, max_frames=int(args.max_frames))
         config: Dict[str, Any] = {
             "subtitles": subtitles,
             "clip_model": args.clip_model,
             "sentence_model": args.sentence_model,
+            "max_frames": int(args.max_frames),
+            "energy_smoothing_sigma": float(args.energy_smoothing_sigma),
         }
         saved_path = module.run(frames_dir=args.frames_dir, config=config)
         logger.info("Готово. Результаты сохранены: %s", saved_path)

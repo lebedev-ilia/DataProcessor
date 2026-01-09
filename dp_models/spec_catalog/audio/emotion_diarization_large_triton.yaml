@@ -1,0 +1,19 @@
+model_name: emotion_diarization_large_triton
+model_version: "1"
+role: emotion_diarization
+runtime: triton
+engine: triton
+precision: fp16
+device_policy: cuda
+weights_digest: provided_by_deploy
+local_artifacts: []
+runtime_params:
+  triton_http_url: "${TRITON_HTTP_URL}"
+  triton_model_name: "emotion_diarization_large"
+  triton_model_version: null
+  triton_input_name: "AUDIO__0"
+  triton_input_datatype: "FP32"
+  triton_output_probs_name: "PROBS__0"
+  triton_output_probs_datatype: "FP32"
+  emotion_labels: []
+

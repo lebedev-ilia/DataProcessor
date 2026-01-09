@@ -6,6 +6,7 @@ import numpy as np
 
 from src.core.base_extractor import BaseExtractor
 from src.core.metrics import system_snapshot, process_memory_bytes
+from src.core.path_utils import default_artifacts_dir
 
 
 class EmbeddingShiftIndicatorExtractor(BaseExtractor):
@@ -36,7 +37,7 @@ class EmbeddingShiftIndicatorExtractor(BaseExtractor):
         import os
         from pathlib import Path
 
-        artifacts_dir = Path("/home/ilya/Рабочий стол/DataProcessor/TextProcessor/.artifacts")
+        artifacts_dir = default_artifacts_dir()
 
         def _latest(pattern: str) -> Optional[Path]:
             files = glob(str(artifacts_dir / pattern))

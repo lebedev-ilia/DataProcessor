@@ -1,0 +1,47 @@
+version: "pr8_triton_midas_raft_local_v1"
+
+processors:
+  audio:
+    enabled: false
+    required: false
+  text:
+    enabled: false
+    required: false
+
+visual:
+  cfg_path: "./VisualProcessor/config_triton_midas_raft_local.yaml"
+  requirements:
+    core_depth_midas: true
+    core_optical_flow: true
+
+# PR‑8: resolved model mapping (MVP source-of-truth in profile YAML).
+resolved_model_mapping:
+  core_depth_midas:
+    runtime: triton
+    triton_http_url: "http://localhost:8000"
+    triton_model_name: "midas_256"
+    triton_model_version: "1"
+    triton_input_name: "INPUT__0"
+    triton_output_name: "OUTPUT__0"
+    triton_datatype: "UINT8"
+    triton_preprocess_preset: "midas_256"
+    # for models_used/model_signature (best-effort)
+    model_version: "midas_256@local"
+    weights_digest: "provided_by_deploy"
+    precision: "fp16"
+
+  core_optical_flow:
+    runtime: triton
+    triton_http_url: "http://localhost:8000"
+    triton_model_name: "raft_256"
+    triton_model_version: "1"
+    triton_input0_name: "INPUT0__0"
+    triton_input1_name: "INPUT1__0"
+    triton_output_name: "OUTPUT__0"
+    triton_datatype: "UINT8"
+    triton_preprocess_preset: "raft_256"
+    model_version: "raft_256@local"
+    weights_digest: "provided_by_deploy"
+    precision: "fp16"
+
+

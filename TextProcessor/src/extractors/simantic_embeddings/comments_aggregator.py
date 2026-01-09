@@ -25,13 +25,16 @@ from src.schemas.models import VideoDocument
 
 class CommentsAggregationExtractor(BaseExtractor):
     VERSION = "1.0.0"
+    DEFAULT_EMBED_DIM = 384
 
     def __init__(
         self,
-        artifacts_dir: str = "/home/ilya/Рабочий стол/DataProcessor/TextProcessor/.artifacts",
-        model_name: str = "intfloat/multilingual-e5-large",
+        artifacts_dir: str | None = None,
+        model_name: str = "sentence-transformers/all-MiniLM-L6-v2",
     ) -> None:
-        self.artifacts_dir = Path(artifacts_dir)
+        from src.core.path_utils import default_artifacts_dir  # local import to avoid cycles
+
+        self.artifacts_dir = Path(artifacts_dir).expanduser().resolve() if artifacts_dir else default_artifacts_dir()
         self.artifacts_dir.mkdir(parents=True, exist_ok=True)
         self.model_name = model_name
 
@@ -59,9 +62,9 @@ class CommentsAggregationExtractor(BaseExtractor):
             return None
 
     @staticmethod
-    def _aggregate_weighted_mean(embs: np.ndarray, likes: Optional[List[float]], authority: Optional[List[float]], recency: Optional[List[float]]) -> Dict[str, Any]:
+    def _aggregate_weighted_mean(embs: np.ndarray, likes: Optional[List[float]], authority: Optional[List[float]], recency: Optional[List[float]], *, default_dim: int) -> Dict[str, Any]:
         if embs.size == 0:
-            return {"embedding": np.zeros((1024,), dtype=np.float32), "count": 0, "std": 0.0}
+            return {"embedding": np.zeros((default_dim,), dtype=np.float32), "count": 0, "std": 0.0}
         n, _ = embs.shape
         w = np.ones(n, dtype=np.float32)
         if likes is not None and len(likes) == n:
@@ -82,9 +85,9 @@ class CommentsAggregationExtractor(BaseExtractor):
         return {"embedding": vec.astype(np.float32), "count": int(n), "std": float(np.std(embs))}
 
     @staticmethod
-    def _aggregate_median(embs: np.ndarray) -> Dict[str, Any]:
+    def _aggregate_median(embs: np.ndarray, *, default_dim: int) -> Dict[str, Any]:
         if embs.size == 0:
-            return {"embedding": np.zeros((1024,), dtype=np.float32), "count": 0, "std": 0.0}
+            return {"embedding": np.zeros((default_dim,), dtype=np.float32), "count": 0, "std": 0.0}
         vec = np.median(embs, axis=0)
         norm = np.linalg.norm(vec)
         if norm > 0:
@@ -127,14 +130,16 @@ class CommentsAggregationExtractor(BaseExtractor):
         authority = getattr(doc, "comments_authority", None)
         recency = getattr(doc, "comments_recency", None)
 
+        dim = int(embs.shape[1]) if isinstance(embs, np.ndarray) and embs.ndim == 2 and embs.shape[1] > 0 else self.DEFAULT_EMBED_DIM
+
         # weighted mean
         t_agg0 = time.perf_counter()
-        mean_res = self._aggregate_weighted_mean(embs, likes, authority, recency)
+        mean_res = self._aggregate_weighted_mean(embs, likes, authority, recency, default_dim=dim)
         mean_s = time.perf_counter() - t_agg0
 
         # median
         t_agg1 = time.perf_counter()
-        med_res = self._aggregate_median(embs)
+        med_res = self._aggregate_median(embs, default_dim=dim)
         median_s = time.perf_counter() - t_agg1
 
         # save artifacts

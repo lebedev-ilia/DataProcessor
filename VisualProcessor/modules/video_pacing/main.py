@@ -26,6 +26,8 @@ def main(argv: Optional[List[str]] = None) -> int:
     parser.add_argument("--frames-dir", required=True, help="Директория с кадрами (с metadata.json)")
     parser.add_argument("--rs-path", required=True, help="Папка result_store для артефактов")
     parser.add_argument("--downscale-factor", type=float, default=0.25, help="Downscale для дешёвых визуальных метрик")
+    parser.add_argument("--min-shot-length-seconds", type=float, default=0.15, help="Минимальная длительность шота (для merge) в секундах")
+    parser.add_argument("--shot-detect-k", type=float, default=6.0, help="Робастный порог (MAD-multiplier) для shot boundary detection")
     parser.add_argument("--log-level", type=str, default="INFO", help="DEBUG/INFO/WARN/ERROR")
 
     args = parser.parse_args(argv)
@@ -38,7 +40,11 @@ def main(argv: Optional[List[str]] = None) -> int:
 
     try:
         module = VideoPacingModule(rs_path=args.rs_path, downscale_factor=args.downscale_factor)
-        config: Dict[str, Any] = {"downscale_factor": args.downscale_factor}
+        config: Dict[str, Any] = {
+            "downscale_factor": args.downscale_factor,
+            "min_shot_length_seconds": args.min_shot_length_seconds,
+            "shot_detect_k": args.shot_detect_k,
+        }
         saved_path = module.run(frames_dir=args.frames_dir, config=config)
         logger.info("Готово. Результаты сохранены: %s", saved_path)
         return 0

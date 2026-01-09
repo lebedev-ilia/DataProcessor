@@ -1,0 +1,20 @@
+model_name: whisper_large_triton
+model_version: "1"
+role: asr_whisper
+runtime: triton
+engine: triton
+precision: fp16
+device_policy: cuda
+weights_digest: provided_by_deploy
+local_artifacts: []
+runtime_params:
+  triton_http_url: "${TRITON_HTTP_URL}"
+  triton_model_name: "whisper_large"
+  triton_model_version: null
+  triton_input_name: "AUDIO__0"
+  triton_input_datatype: "FP32"
+  triton_output_token_ids_name: "TOKEN_IDS__0"
+  triton_output_token_ids_datatype: "INT32"
+  triton_output_lang_id_name: "LANG_ID__0"
+  triton_output_lang_id_datatype: "INT32"
+

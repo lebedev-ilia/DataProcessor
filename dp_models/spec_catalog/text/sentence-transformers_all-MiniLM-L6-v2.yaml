@@ -1,0 +1,18 @@
+model_name: "sentence-transformers/all-MiniLM-L6-v2"
+model_version: "unknown"
+role: "text_embedding"
+runtime: "inprocess"
+engine: "sentence-transformers"
+precision: "fp16"
+device_policy: "auto"
+
+# Local-only policy:
+# Place the model folder under:
+#   ${DP_MODELS_ROOT}/text/sentence-transformers_all-MiniLM-L6-v2/
+local_artifacts:
+  - path: "text/sentence-transformers_all-MiniLM-L6-v2"
+    kind: "dir"
+
+weights_digest: "auto"
+
+

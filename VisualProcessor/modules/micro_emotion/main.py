@@ -106,31 +106,30 @@ def run_pipeline(
     OpenFaceAnalyzer = _get_openface_analyzer()
     analyzer = OpenFaceAnalyzer(docker_image=docker_image)
 
-    # 1. Получаем список индексов кадров (опционально фильтруем по результатам face_detection)
+    # 1. Получаем список индексов кадров (опционально фильтруем по core_face_landmarks.face_present)
     frame_indices: List[int] = list(range(int(metadata.get("total_frames", 0))))
 
     if use_face_detection and rs_path:
         try:
-            face_results_path = os.path.join(rs_path, "face_detection")
-            if os.path.exists(face_results_path):
-                face_files = [f for f in os.listdir(face_results_path) if f.endswith(".json")]
-                if face_files:
-                    face_files.sort()
-                    face_data = _load_json(os.path.join(face_results_path, face_files[-1]))
-                    if "frames" in face_data:
-                        frames_with_faces = [
-                            int(k)
-                            for k, v in face_data["frames"].items()
-                            if v and len(v) > 0
-                        ]
-                        frame_indices = sorted(set(frame_indices) & set(frames_with_faces))
-                        logger.info(
-                            f"VisualProcessor | {MODULE_NAME} | main | "
-                            f"Filtered to {len(frame_indices)} frames with faces"
-                        )
+            # face_detection module removed: use core_face_landmarks instead
+            core_dir = os.path.join(rs_path, "core_face_landmarks")
+            npz_files = [f for f in os.listdir(core_dir) if f.endswith(".npz")] if os.path.isdir(core_dir) else []
+            if npz_files:
+                npz_files.sort()
+                npz_path = os.path.join(core_dir, npz_files[-1])
+                core = np.load(npz_path, allow_pickle=True)
+                fi = np.asarray(core.get("frame_indices"), dtype=np.int32)
+                fp = np.asarray(core.get("face_present"), dtype=bool)
+                if fi.shape[0] == fp.shape[0]:
+                    frames_with_faces = set(int(x) for x in fi[fp].tolist())
+                    frame_indices = sorted(set(frame_indices) & frames_with_faces)
+                    logger.info(
+                        f"VisualProcessor | {MODULE_NAME} | main | "
+                        f"Filtered to {len(frame_indices)} frames with faces (core_face_landmarks)"
+                    )
         except Exception as e:  # noqa: BLE001
             logger.warning(
-                "VisualProcessor | %s | main | Could not load face detection data: %s",
+                "VisualProcessor | %s | main | Could not load core_face_landmarks face_present: %s",
                 MODULE_NAME,
                 e,
             )
@@ -467,7 +466,7 @@ def main(argv: Optional[List[str]] = None) -> int:
     parser.add_argument(
         "--use-face-detection",
         action="store_true",
-        help="Фильтровать кадры по результатам face_detection (если есть в rs_path)",
+        help="Фильтровать кадры по core_face_landmarks.face_present (face_detection удалён)",
     )
     parser.add_argument(
         "--docker-image",

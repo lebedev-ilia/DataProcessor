@@ -15,18 +15,21 @@ from src.core.text_utils import normalize_whitespace
 
 class TranscriptAggregatorExtractor(BaseExtractor):
     VERSION = "1.0.0"
+    DEFAULT_EMBED_DIM = 384
 
     def __init__(
         self,
-        artifacts_dir: str = "/home/ilya/Рабочий стол/DataProcessor/TextProcessor/.artifacts",
-        model_name: str = "intfloat/multilingual-e5-large",
-        device: Optional[str] = None,
+        artifacts_dir: Optional[str] = None,
+        model_name: str = "sentence-transformers/all-MiniLM-L6-v2",
+        device: Optional[str] = "cpu",
         decay_rate: float = 0.01,
     ) -> None:
-        self.artifacts_dir = Path(artifacts_dir)
+        from src.core.path_utils import default_artifacts_dir  # local import to avoid cycles
+
+        self.artifacts_dir = Path(artifacts_dir).expanduser().resolve() if artifacts_dir else default_artifacts_dir()
         self.artifacts_dir.mkdir(parents=True, exist_ok=True)
         self.model_name = model_name
-        self.device = device or ("cuda" if torch.cuda.is_available() else "cpu")
+        self.device = str(device or "cpu")
         self.decay_rate = decay_rate
         # no heavy model; pure tensor ops
 
@@ -47,7 +50,7 @@ class TranscriptAggregatorExtractor(BaseExtractor):
         decay_rate: float = 0.01,
     ) -> Dict[str, Any]:
         if not chunk_embeddings:
-            return {"embedding": np.zeros((1024,), dtype=np.float32), "count": 0, "std": 0.0}
+            return {"embedding": np.zeros((self.DEFAULT_EMBED_DIM,), dtype=np.float32), "count": 0, "std": 0.0}
 
         emb = torch.tensor(np.stack(chunk_embeddings), dtype=torch.float32, device="cpu")
         n_chunks = emb.shape[0]
@@ -64,7 +67,7 @@ class TranscriptAggregatorExtractor(BaseExtractor):
 
     def _aggregate_maxpool(self, chunk_embeddings: List[np.ndarray]) -> Dict[str, Any]:
         if not chunk_embeddings:
-            return {"embedding": np.zeros((1024,), dtype=np.float32), "count": 0, "std": 0.0}
+            return {"embedding": np.zeros((self.DEFAULT_EMBED_DIM,), dtype=np.float32), "count": 0, "std": 0.0}
 
         emb = torch.tensor(np.stack(chunk_embeddings), dtype=torch.float32)
         maxpooled = emb.max(dim=0).values

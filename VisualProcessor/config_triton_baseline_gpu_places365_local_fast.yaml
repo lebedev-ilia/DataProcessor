@@ -1,0 +1,58 @@
+core_providers:
+  core_clip: true
+  core_face_landmarks: false
+  core_depth_midas: false
+  core_object_detections: false
+  core_optical_flow: false
+
+modules:
+  cut_detection: false
+  scene_classification: true
+  face_detection: false
+  detalize_face_modules: false
+  emotion_face: false
+  behavioral: false
+  optical_flow: false
+  action_recognition: false
+  color_light: false
+  frames_composition: false
+  shot_quality: false
+  video_pacing: false
+  story_structure: false
+  micro_emotion: false
+  similarity_metrics: false
+  text_scoring: false
+  uniqueness: false
+
+global:
+  root_path: null
+  frames_dir: null
+  rs_path: null
+  max_parallel_modules: 1
+  gpu_max_concurrent: "auto"
+
+# Fast E2E mode: cap sampling to ~50 frames for upstream heavy providers.
+core_clip:
+  runtime: "triton"
+  batch_size: 1
+  triton_preprocess_preset: "openai_clip_224"
+  sampling:
+    min_frames: 50
+    target_frames: 50
+    max_frames: 50
+
+scene_classification:
+  runtime: "triton"
+  triton_model_spec: "places365_resnet50_224_triton"
+  input_size: 224
+  batch_size: 1
+  min_scene_length: 10
+  min_scene_seconds: null
+  enable_advanced_features: true
+  use_clip_for_semantics: true
+  sampling:
+    min_frames: 50
+    target_frames: 50
+    max_frames: 50
+
+

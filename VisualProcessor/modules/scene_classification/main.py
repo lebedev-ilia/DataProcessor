@@ -38,9 +38,20 @@ def main(argv: Optional[List[str]] = None) -> int:
     # Model options
     parser.add_argument("--model-arch", type=str, default="resnet50", help="Архитектура модели Places365/timm")
     parser.add_argument("--use-timm", action="store_true", help="Использовать timm-модели (если установлено)")
+    parser.add_argument(
+        "--runtime",
+        type=str,
+        default="inprocess",
+        help="Runtime for Places365: inprocess | triton",
+    )
+    parser.add_argument(
+        "--triton-model-spec",
+        type=str,
+        default="places365_resnet50_224_triton",
+        help="dp_models spec name for Triton-backed Places365 (used when --runtime=triton)",
+    )
     parser.add_argument("--device", type=str, default=None, help="cuda/cpu (по умолчанию auto)")
-    parser.add_argument("--categories-path", type=str, default=None, help="Путь к categories_places365.txt (опционально)")
-    parser.add_argument("--cache-dir", type=str, default=None, help="Директория кэша (веса/категории)")
+    # NOTE: model artifacts are resolved via ModelManager (DP_MODELS_ROOT). No direct paths here (no-fallback).
 
     # Runtime thresholds
     parser.add_argument("--min-scene-length", type=int, default=30, help="Минимальная длина сцены в кадрах")
@@ -72,14 +83,14 @@ def main(argv: Optional[List[str]] = None) -> int:
 
     try:
         classifier = Places365SceneClassifier(
+            runtime=args.runtime,
+            triton_model_spec=args.triton_model_spec,
             model_arch=args.model_arch,
             use_timm=args.use_timm,
             min_scene_length=args.min_scene_length,
             min_scene_seconds=args.min_scene_seconds,
             batch_size=args.batch_size,
             device=args.device,
-            categories_path=args.categories_path,
-            cache_dir=args.cache_dir,
             input_size=args.input_size,
             use_tta=args.use_tta,
             use_multi_crop=args.use_multi_crop,

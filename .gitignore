@@ -14,6 +14,8 @@ build/
 
 Interpret/
 ByteTrack/
+docs/baseline/out/
+dp_models/bundled_models/
 
 # Virtual environments
 .venv/
@@ -88,6 +90,9 @@ BatchRunner/state.jsonl
 
 # Local result store for mass runs
 result_store_runs/
+
+# Local orchestrator outputs (smoke runs / debugging)
+_runs/
 
 # Feature caches
 features_cache/
@@ -234,5 +239,6 @@ exports/
 *.png
 *.jpg
 *.pt
+vp_runtime_*.yaml
 
 OpenFace/

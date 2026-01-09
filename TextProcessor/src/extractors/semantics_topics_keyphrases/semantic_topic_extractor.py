@@ -10,17 +10,17 @@ from src.core.metrics import system_snapshot, process_memory_bytes
 from src.schemas.models import VideoDocument
 from src.core.text_utils import normalize_whitespace
 from src.core.model_registry import get_model
+from src.core.path_utils import default_artifacts_dir
 
 
 class SemanticTopicExtractor(BaseExtractor):
     VERSION = "1.0.0"
 
-    def __init__(self, device: str | None = None, artifacts_dir: str = "/home/ilya/Рабочий стол/DataProcessor/TextProcessor/.artifacts") -> None:
+    def __init__(self, device: str | None = "cpu", artifacts_dir: str | None = None) -> None:
         super().__init__()
-        # device is injected by MainProcessor via devices_config; fallback to auto
-        import torch
-        self.device = device or ("cuda" if torch.cuda.is_available() else "cpu")
-        self.artifacts_dir = artifacts_dir
+        # device is injected by MainProcessor via devices_config; default to CPU for determinism.
+        self.device = str(device or "cpu")
+        self.artifacts_dir = str(default_artifacts_dir()) if artifacts_dir is None else str(artifacts_dir)
         try:
             os.makedirs(self.artifacts_dir, exist_ok=True)
         except Exception:
@@ -66,8 +66,8 @@ class SemanticTopicExtractor(BaseExtractor):
                 from hdbscan import HDBSCAN  # type: ignore
             except Exception:
                 HDBSCAN = None  # type: ignore
-            # use shared e5 model
-            model_name = "intfloat/multilingual-e5-large"
+            # local-only model (no-network)
+            model_name = "sentence-transformers/all-MiniLM-L6-v2"
             use_fp16 = "cuda" in self.device
             st_model = get_model(model_name, device=self.device, fp16=use_fp16)
             umap_model = None
@@ -128,14 +128,8 @@ class SemanticTopicExtractor(BaseExtractor):
                 if top_keyphrases_list:
                     # embed phrases (limited to 10) and save npy artifact; return only path and count
                     import torch
-                    try:
-                        with torch.no_grad():
-                            vecs = st_model.encode(top_keyphrases_list, convert_to_numpy=True, normalize_embeddings=True)
-                    except Exception:
-                        # fallback to CPU fp32
-                        cpu_model = get_model("intfloat/multilingual-e5-large", device="cpu", fp16=False)
-                        with torch.no_grad():
-                            vecs = cpu_model.encode(top_keyphrases_list, convert_to_numpy=True, normalize_embeddings=True)
+                    with torch.no_grad():
+                        vecs = st_model.encode(top_keyphrases_list, convert_to_numpy=True, normalize_embeddings=True)
                     arr = np.asarray(vecs, dtype=np.float32)
                     h = hashlib.sha256(("|".join(top_keyphrases_list)).encode("utf-8")).hexdigest()
                     out_path = os.path.join(self.artifacts_dir, f"semantic_topic_keyphrase_centroids_{h}.npy")
@@ -153,7 +147,7 @@ class SemanticTopicExtractor(BaseExtractor):
             try:
                 from sklearn.cluster import KMeans  # type: ignore
                 import torch
-                model_name = "intfloat/multilingual-e5-large"
+                model_name = "sentence-transformers/all-MiniLM-L6-v2"
                 use_fp16 = "cuda" in self.device
                 st_model = get_model(model_name, device=self.device, fp16=use_fp16)
                 with torch.no_grad():
@@ -183,11 +177,7 @@ class SemanticTopicExtractor(BaseExtractor):
                 top_keyphrases_list = [w for w, _ in top_keyphrases_with_scores]
                 if top_keyphrases_list:
                     with torch.no_grad():
-                        try:
-                            kp_emb = st_model.encode(top_keyphrases_list, convert_to_numpy=True, normalize_embeddings=True)
-                        except Exception:
-                            cpu_model = get_model("intfloat/multilingual-e5-large", device="cpu", fp16=False)
-                            kp_emb = cpu_model.encode(top_keyphrases_list, convert_to_numpy=True, normalize_embeddings=True)
+                        kp_emb = st_model.encode(top_keyphrases_list, convert_to_numpy=True, normalize_embeddings=True)
                     arr = np.asarray(kp_emb, dtype=np.float32)
                     h = hashlib.sha256(("|".join(top_keyphrases_list)).encode("utf-8")).hexdigest()
                     out_path = os.path.join(self.artifacts_dir, f"semantic_topic_keyphrase_centroids_{h}.npy")

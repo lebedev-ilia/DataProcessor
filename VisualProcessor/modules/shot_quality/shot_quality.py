@@ -19,14 +19,13 @@ from typing import Any, Dict, List, Optional, Sequence, Tuple
 import numpy as np
 import cv2
 
-import torch
-
 from modules.base_module import BaseModule
 from utils.frame_manager import FrameManager
 
 
 MODULE_NAME = "shot_quality"
 VERSION = "2.0"
+SCHEMA_VERSION = "shot_quality_npz_v2"
 
 
 def _require_npz_key(d: Dict[str, Any], key: str, provider: str) -> Any:
@@ -430,8 +429,9 @@ class ShotQualityModule(BaseModule):
         ]
 
     def _do_initialize(self) -> None:
-        if self.device == "cuda" and not torch.cuda.is_available():
-            raise RuntimeError(f"{MODULE_NAME} | device=cuda requested but torch.cuda.is_available() is False")
+        # NOTE: current implementation is numpy-only (CPU). We keep `device` as an informational config field.
+        if str(self.device).lower() == "cuda":
+            self.logger.info("%s | device=cuda requested, but implementation is numpy-only (CPU).", MODULE_NAME)
 
     def process(self, frame_manager: FrameManager, frame_indices: List[int], config: Dict[str, Any]) -> Dict[str, Any]:
         self.initialize()
@@ -504,46 +504,29 @@ class ShotQualityModule(BaseModule):
                 f"text={txt_emb.shape}, image={clip_emb.shape}"
             )
 
-        # Adaptive matmul batching on GPU
-        img_t = torch.from_numpy(clip_emb)
-        txt_t = torch.from_numpy(txt_emb)
-        if self.device == "cuda":
-            img_t = img_t.to("cuda")
-            txt_t = txt_t.to("cuda")
-        img_t = img_t.to(torch.float16 if self.device == "cuda" else torch.float32)
-        txt_t = txt_t.to(torch.float16 if self.device == "cuda" else torch.float32)
-
         n = int(frame_indices_np.shape[0])
         p = int(txt_emb.shape[0])
         quality_probs = np.zeros((n, p), dtype=np.float16)
 
-        # choose chunk size based on free GPU memory (very conservative)
-        chunk = 2048
-        if self.device == "cuda":
-            try:
-                free_b, total_b = torch.cuda.mem_get_info()
-                # heuristic: allow ~256MB for activations
-                if free_b < 2_000_000_000:
-                    chunk = 512
-                elif free_b < 6_000_000_000:
-                    chunk = 1024
-                self.logger.debug(
-                    f"{MODULE_NAME} | process | GPU memory: free={free_b/1e9:.2f}GB, "
-                    f"total={total_b/1e9:.2f}GB, chunk_size={chunk}"
-                )
-            except Exception:
-                pass
+        # Scheduler-controlled chunking (no heuristics). This prevents accidental huge allocations.
+        try:
+            chunk = int((config or {}).get("matmul_chunk_size") or 2048)
+        except Exception:
+            chunk = 2048
+        if chunk <= 0:
+            raise RuntimeError(f"{MODULE_NAME} | invalid matmul_chunk_size={chunk}; must be > 0")
 
         self.logger.info(
             f"{MODULE_NAME} | process | CLIP matmul: frames={n}, prompts={p}, "
             f"chunk_size={chunk}, device={self.device}"
         )
-        with torch.no_grad():
-            for start in range(0, n, chunk):
-                end = min(n, start + chunk)
-                logits = img_t[start:end] @ txt_t.T
-                probs = torch.softmax(logits, dim=-1)
-                quality_probs[start:end] = probs.detach().cpu().to(torch.float16).numpy()
+        # numpy-only softmax in chunks
+        txtT = txt_emb.T.astype(np.float32, copy=False)  # (D, P)
+        for start in range(0, n, chunk):
+            end = min(n, start + chunk)
+            logits = (clip_emb[start:end].astype(np.float32, copy=False) @ txtT).astype(np.float32, copy=False)  # (B, P)
+            probs = _softmax_np(logits, axis=-1).astype(np.float16)
+            quality_probs[start:end] = probs
         self.logger.info(f"{MODULE_NAME} | process | CLIP quality probabilities вычислены: shape={quality_probs.shape}")
 
         # --- Per-frame feature extraction (pixels + depth + detections + face ROI) ---
@@ -870,7 +853,8 @@ class ShotQualityModule(BaseModule):
 
         meta_out = {
             "producer": MODULE_NAME,
-            "version": VERSION,
+            "producer_version": VERSION,
+            "schema_version": SCHEMA_VERSION,
             "created_at": datetime.utcnow().isoformat(),
             "frame_count": int(n),
             "shot_count": int(s),
@@ -905,8 +889,8 @@ class ShotQualityModule(BaseModule):
             "shot_features_std": shot_std,
             "shot_features_min": shot_min,
             "shot_features_max": shot_max,
-            # meta
-            "meta": np.asarray(meta_out, dtype=object),
+            # module-specific metadata (BaseModule will store canonical `meta` separately)
+            "impl_meta": np.asarray(meta_out, dtype=object),
         }
 
 

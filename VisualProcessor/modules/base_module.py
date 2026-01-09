@@ -24,6 +24,7 @@ from utils.frame_manager import FrameManager
 from utils.results_store import ResultsStore
 from utils.logger import get_logger
 from utils.utilites import load_metadata
+from utils.meta_builder import apply_models_meta, model_used
 import json
 import uuid
 import re
@@ -163,6 +164,32 @@ class BaseModule(ABC):
             Список имен модулей-зависимостей
         """
         return []
+
+    def get_models_used(self, config: Dict[str, Any], metadata: Dict[str, Any]) -> List[Dict[str, Any]]:
+        """
+        Best-effort model usage declaration.
+        Model-based modules should override this to provide accurate fields.
+        """
+        cfg = config or {}
+        model_name = cfg.get("model_name") or cfg.get("model") or None
+        if not model_name:
+            return []
+        device = str(cfg.get("device") or metadata.get("device") or "auto")
+        precision = str(cfg.get("precision") or ("fp16" if "fp16" in str(cfg.get("dtype") or "").lower() else "fp32"))
+        engine = str(cfg.get("engine") or "torch")
+        runtime = str(cfg.get("runtime") or "local")
+        model_version = str(cfg.get("model_version") or "unknown")
+        return [
+            model_used(
+                model_name=str(model_name),
+                model_version=model_version,
+                weights_digest="unknown",
+                runtime=runtime,
+                engine=engine,
+                precision=precision,
+                device=device,
+            )
+        ]
     
     def load_dependency_results(
         self,
@@ -415,6 +442,10 @@ class BaseModule(ABC):
         save_meta.setdefault("schema_version", getattr(self, "SCHEMA_VERSION", None) or f"{self.module_name}_npz_v1")
         save_meta.setdefault("status", "ok")
         save_meta.setdefault("empty_reason", None)
+        # PR-3: model system baseline
+        save_meta.setdefault("models_used", [])
+        # Compute model_signature (from models_used). Also canonicalize models_used list.
+        save_meta = apply_models_meta(save_meta, models_used=save_meta.get("models_used"))
         
         # Определяем, нужно ли использовать store_compressed
         # (для per-track результатов с эмбеддингами)
@@ -450,6 +481,15 @@ class BaseModule(ABC):
         # Подготовка данных для сохранения
         npz_dict: Dict[str, Any] = {}
         
+        def _box_object(v: Any) -> np.ndarray:
+            """
+            Store arbitrary Python object as a *scalar* object array.
+            This avoids numpy interpreting dicts as iterables of keys.
+            """
+            a = np.empty((), dtype=object)
+            a[()] = v
+            return a
+
         # Рекурсивно обрабатываем результаты
         for key, value in results.items():
             if isinstance(value, (np.ndarray, np.generic)):
@@ -462,14 +502,14 @@ class BaseModule(ABC):
                     # Если не удалось - сохраняем как object array
                     npz_dict[key] = np.asarray(value, dtype=object)
             elif isinstance(value, dict):
-                # Вложенные словари сохраняем как object
-                npz_dict[key] = np.asarray(value, dtype=object)
+                # Вложенные словари сохраняем как scalar object (важно!)
+                npz_dict[key] = _box_object(value)
             elif isinstance(value, (int, float, str, bool)):
                 # Скаляры сохраняем как numpy типы
                 npz_dict[key] = np.asarray(value)
             else:
                 # Остальное - как object
-                npz_dict[key] = np.asarray(value, dtype=object)
+                npz_dict[key] = _box_object(value)
         
         # Добавляем метаданные
         npz_dict["meta"] = np.asarray(save_meta, dtype=object)
@@ -676,14 +716,25 @@ class BaseModule(ABC):
                 "total_frames": metadata.get("total_frames"),
                 "processed_frames": len(frame_indices),
                 "frames_dir": frames_dir,
-            # Baseline run identity (copied into NPZ meta)
-            "platform_id": metadata.get("platform_id"),
-            "video_id": metadata.get("video_id"),
-            "run_id": metadata.get("run_id"),
-            "sampling_policy_version": metadata.get("sampling_policy_version"),
-            "config_hash": metadata.get("config_hash"),
+                # Baseline run identity (copied into NPZ meta)
+                "platform_id": metadata.get("platform_id"),
+                "video_id": metadata.get("video_id"),
+                "run_id": metadata.get("run_id"),
+                "sampling_policy_version": metadata.get("sampling_policy_version"),
+                "config_hash": metadata.get("config_hash"),
+                # Baseline reproducibility keys
+                "dataprocessor_version": metadata.get("dataprocessor_version"),
+                "analysis_fps": metadata.get("analysis_fps"),
+                "analysis_width": metadata.get("analysis_width"),
+                "analysis_height": metadata.get("analysis_height"),
             }
-            
+
+            # PR-3: declare models_used (best-effort) for model-based modules.
+            try:
+                save_metadata["models_used"] = self.get_models_used(config=config or {}, metadata=metadata or {})
+            except Exception:
+                save_metadata["models_used"] = []
+
             # Сохранение результатов
             saved_path = self.save_results(
                 results=results,

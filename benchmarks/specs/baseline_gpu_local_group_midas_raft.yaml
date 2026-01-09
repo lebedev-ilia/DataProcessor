@@ -1,0 +1,54 @@
+version: "bench_spec_v1"
+
+# Grouped local baseline (GPU/Triton): MiDaS + RAFT only.
+# On 6GB GPUs, these models may OOM if other large ORT CUDA models were run earlier.
+# Recommended: restart Triton before running this group.
+
+defaults:
+  warmup: 5
+  repeats: 30
+  timeout_sec: 10.0
+
+models:
+  # --- MiDaS depth ---
+  - name: midas_256
+    model_spec_name: midas_256_triton
+    kind: single_input
+    input: { dtype: UINT8, shape: [1, 256, 256, 3], layout: nhwc, value: random_int, int_range: [0, 256] }
+    output: { name: OUTPUT__0 }
+
+  - name: midas_384
+    model_spec_name: midas_384_triton
+    kind: single_input
+    input: { dtype: UINT8, shape: [1, 384, 384, 3], layout: nhwc, value: random_int, int_range: [0, 256] }
+    output: { name: OUTPUT__0 }
+
+  - name: midas_512
+    model_spec_name: midas_512_triton
+    kind: single_input
+    input: { dtype: UINT8, shape: [1, 512, 512, 3], layout: nhwc, value: random_int, int_range: [0, 256] }
+    output: { name: OUTPUT__0 }
+
+  # --- RAFT optical flow ---
+  - name: raft_256
+    model_spec_name: raft_256_triton
+    kind: two_inputs
+    input0: { dtype: UINT8, shape: [1, 256, 256, 3], layout: nhwc, value: random_int, int_range: [0, 256] }
+    input1: { dtype: UINT8, shape: [1, 256, 256, 3], layout: nhwc, value: random_int, int_range: [0, 256] }
+    output: { name: OUTPUT__0 }
+
+  - name: raft_384
+    model_spec_name: raft_384_triton
+    kind: two_inputs
+    input0: { dtype: UINT8, shape: [1, 384, 384, 3], layout: nhwc, value: random_int, int_range: [0, 256] }
+    input1: { dtype: UINT8, shape: [1, 384, 384, 3], layout: nhwc, value: random_int, int_range: [0, 256] }
+    output: { name: OUTPUT__0 }
+
+  - name: raft_512
+    model_spec_name: raft_512_triton
+    kind: two_inputs
+    input0: { dtype: UINT8, shape: [1, 512, 512, 3], layout: nhwc, value: random_int, int_range: [0, 256] }
+    input1: { dtype: UINT8, shape: [1, 512, 512, 3], layout: nhwc, value: random_int, int_range: [0, 256] }
+    output: { name: OUTPUT__0 }
+
+

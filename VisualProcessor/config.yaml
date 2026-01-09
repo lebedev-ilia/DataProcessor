@@ -7,7 +7,6 @@ core_providers:
 
 modules:
     scene_classification: false
-    face_detection: false
     detalize_face_modules: false
     emotion_face: false
     behavioral: false
@@ -60,16 +59,28 @@ core_face_landmarks:
     face_mesh_min_detection_confidence: 0.5
     face_mesh_min_tracking_confidence: 0.5
 
-core_object_detections:
-    model: "yolo11x.pt" # google/owlvit-base-patch32, google/owlvit-base-patch16, google/owlvit-large-patch14, google/owlv2-base-patch16, yolo11x.pt
-    model_family: null # owlv2, owlvit, null
+core_depth_midas:
+    # Triton-only (prod): preprocessing lives in Triton; no local torch engine.
+    runtime: "triton"
+    triton_http_url: "http://triton:8000"
+    triton_model_name: "midas_384"
+    triton_model_version: null
+    triton_input_name: "INPUT__0"
+    triton_output_name: "OUTPUT__0"
+    triton_datatype: "FP32"
+    triton_preprocess_preset: "midas_384" # midas_256 | midas_384 | midas_512
+    out_width: 384
+    out_height: 384
+    # Controlled by scheduler (DynamicBatching, in development). For now must be explicit in runtime configs.
     batch_size: 16
-    use_queries: false
-    default_categories: null # "person,bus"
+    frames_bgr: false
+
+core_object_detections:
+    model: "yolo11x.pt"
+    batch_size: 16
     device: "cuda"
-    box_threshold: 0.6 # 0.3 для owl
+    box_threshold: 0.6
     iou-threshold: 0.3
-    sample-step: 10
 
 
 
@@ -79,8 +90,6 @@ scene_classification:
     batch_size: 1
     min_scene_length: 20
     device: "cuda"
-    categories_path: "VisualProcessor/modules/scene_classification/categories_places365.txt"
-    cache_dir: null
     gpu_memory_threshold: 0.95
     log_metrics_every_n_frames: 10
     input_size: 224 # 256, 320 ...
@@ -90,10 +99,6 @@ scene_classification:
     smoothing_window: 5
     enable_advanced_features: true
     use_clip_for_semantics: true
-
-face_detection:
-    threshold: 0.5
-    det_size: "640,640"
 
 detalize_face_modules:
     modules: "geometry,pose,quality,lighting,skin,accessories,eyes,motion,structure,professional,lip_reading,face_3d"
@@ -173,11 +178,20 @@ optical_flow:
     fg_bg_threshold: 0.5
     motion_clusters_n: 5
 
-# Canonical core provider config (torchvision RAFT). Output: rs_path/core_optical_flow/flow.npz
+# Canonical core provider config (Triton optical flow). Output: rs_path/core_optical_flow/flow.npz
 core_optical_flow:
-    model: "small" # small | large
-    max_dim: 256
-    device: "auto" # auto | cpu | cuda
+    runtime: "triton"
+    triton_http_url: "http://triton:8000"
+    triton_model_name: "raft_256"
+    triton_model_version: null
+    triton_input0_name: "INPUT0__0"
+    triton_input1_name: "INPUT1__0"
+    triton_output_name: "OUTPUT__0"
+    triton_datatype: "FP32"
+    triton_preprocess_preset: "raft_256" # raft_256 | raft_384 | raft_512
+    model_version: "unknown"
+    weights_digest: "unknown"
+    precision: "fp32"
 
 action_recognition:
     clip_len: 16
@@ -207,7 +221,7 @@ shot_quality:
 cut_detection:
     device: "cuda"
     use_clip: true
-    use_deep_features: true
+    use_deep_features: false
 
 video_pacing:
     batch_size: 6

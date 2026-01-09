@@ -20,43 +20,34 @@ from typing import List, Optional, Tuple, Any, Dict
 import numpy as np
 import torch
 
-try:
-    from sentence_transformers import SentenceTransformer
-except Exception as e:
-    raise ImportError(
-        "Requires sentence-transformers. Install with: pip install sentence-transformers"
-    ) from e
-
-
 from src.core.base_extractor import BaseExtractor  # noqa: E402
 from src.core.text_utils import normalize_whitespace  # noqa: E402
 from src.schemas.models import VideoDocument  # noqa: E402
 from src.core.metrics import system_snapshot, process_memory_bytes  # noqa: E402
 from src.core.model_registry import get_model  # noqa: E402
+from src.core.path_utils import default_artifacts_dir, default_cache_dir  # noqa: E402
 
 
 class TitleEmbedder(BaseExtractor):
     VERSION = "1.0.0"
     def __init__(
         self,
-        model_name: str = "intfloat/multilingual-e5-large",
-        cache_dir: str = "/home/ilya/Рабочий стол/DataProcessor/TextProcessor/.cache/embed_cache",
-        device: Optional[str] = None,   # "cuda" or "cpu" or None(auto)
+        model_name: str = "sentence-transformers/all-MiniLM-L6-v2",
+        cache_dir: Optional[str] = None,
+        device: Optional[str] = "cpu",
         fp16: bool = True,
         batch_size: int = 128,
-        artifacts_dir: str = "/home/ilya/Рабочий стол/DataProcessor/TextProcessor/.artifacts",
+        artifacts_dir: Optional[str] = None,
     ):
         self.model_name = model_name
-        self.cache_dir = Path(cache_dir)
+        base_cache = default_cache_dir() / "embed_cache"
+        self.cache_dir = Path(cache_dir).expanduser().resolve() if cache_dir else base_cache
         self.cache_dir.mkdir(parents=True, exist_ok=True)
         self.batch_size = batch_size
-        self.artifacts_dir = Path(artifacts_dir)
+        self.artifacts_dir = Path(artifacts_dir).expanduser().resolve() if artifacts_dir else default_artifacts_dir()
         self.artifacts_dir.mkdir(parents=True, exist_ok=True)
 
-        if device is None:
-            self.device = "cuda" if torch.cuda.is_available() else "cpu"
-        else:
-            self.device = device
+        self.device = str(device or "cpu")
 
         # metrics: init snapshots
         init_sys_before = system_snapshot()

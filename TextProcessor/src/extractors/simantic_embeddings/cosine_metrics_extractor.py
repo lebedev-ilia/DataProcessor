@@ -34,8 +34,10 @@ def _cosine(a: np.ndarray, b: np.ndarray) -> float:
 class CosineMetricsExtractor(BaseExtractor):
     VERSION = "1.0.0"
 
-    def __init__(self, artifacts_dir: str = "/home/ilya/Рабочий стол/DataProcessor/TextProcessor/.artifacts") -> None:
-        self.artifacts_dir = Path(artifacts_dir)
+    def __init__(self, artifacts_dir: str | None = None) -> None:
+        from src.core.path_utils import default_artifacts_dir  # local import
+
+        self.artifacts_dir = Path(artifacts_dir).expanduser().resolve() if artifacts_dir else default_artifacts_dir()
 
     def _load_vector(self, pattern: str) -> Optional[np.ndarray]:
         p = _latest(str(self.artifacts_dir / pattern))

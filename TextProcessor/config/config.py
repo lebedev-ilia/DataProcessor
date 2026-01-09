@@ -3,6 +3,7 @@ from __future__ import annotations
 import json
 import os
 from dataclasses import dataclass
+from pathlib import Path
 from typing import Dict, List, Optional, Union
 
 try:
@@ -26,11 +27,12 @@ def _load_env() -> None:
 
 @dataclass
 class TitleEmbedderConfig:
-    model_name: str = "sentence-transformers/all-mpnet-base-v2"
-    cache_dir: str = "/home/ilya/Рабочий стол/DataProcessor/TextProcessor/.cache/embed_cache"
+    # Local-only model (no-network policy). Must exist in dp_models catalog + local artifacts.
+    model_name: str = "sentence-transformers/all-MiniLM-L6-v2"
+    cache_dir: str = ""
     fp16: bool = False
     batch_size: int = 128
-    artifacts_dir: str = "/home/ilya/Рабочий стол/DataProcessor/TextProcessor/.artifacts"
+    artifacts_dir: str = ""
 
 
 @dataclass
@@ -43,6 +45,10 @@ class AppConfig:
 def load_config() -> AppConfig:
     _load_env()
 
+    tp_root = Path(__file__).resolve().parents[1]
+    default_cache_dir = str((tp_root / ".cache" / "embed_cache").resolve())
+    default_artifacts_dir = str((tp_root / ".artifacts").resolve())
+
     # Devices mapping
     devices_config_raw = os.environ.get("DEVICES_CONFIG", "")
     if devices_config_raw:
@@ -54,11 +60,11 @@ def load_config() -> AppConfig:
         devices_config = {"gpu": "TitleEmbedder"}
 
     # TitleEmbedder params
-    model_name = os.environ.get("TITLE_EMBEDDER_MODEL_NAME", "sentence-transformers/all-mpnet-base-v2")
-    cache_dir = os.environ.get("TITLE_EMBEDDER_CACHE_DIR", "/home/ilya/Рабочий стол/DataProcessor/TextProcessor/.cache/embed_cache")
+    model_name = os.environ.get("TITLE_EMBEDDER_MODEL_NAME", "sentence-transformers/all-MiniLM-L6-v2")
+    cache_dir = os.environ.get("TITLE_EMBEDDER_CACHE_DIR", default_cache_dir)
     fp16 = _str_to_bool(os.environ.get("TITLE_EMBEDDER_FP16", "false"))
     batch_size = int(os.environ.get("TITLE_EMBEDDER_BATCH_SIZE", "128"))
-    artifacts_dir = os.environ.get("ARTIFACTS_DIR", "/home/ilya/Рабочий стол/DataProcessor/TextProcessor/.artifacts")
+    artifacts_dir = os.environ.get("ARTIFACTS_DIR", default_artifacts_dir)
 
     default_input_path = os.environ.get("DEFAULT_INPUT_PATH", None)
 

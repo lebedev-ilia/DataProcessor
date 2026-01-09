@@ -88,7 +88,7 @@
 # tensorboardX==2.6.4
 # tensorflow-hub==0.16.1
 # tf_keras==2.20.1
-# tokenizers==0.21.4
+tokenizers==0.21.4
 torch==2.8.0+cu126
 # torch_pitch_shift==1.2.5
 # torchlibrosa==0.1.0

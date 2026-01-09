@@ -1,0 +1,27 @@
+version: "pr9_profile_v1"
+
+# PR‑9 MVP: switch core_depth_midas to ONNX engine (inprocess).
+# NOTE: You must export the ONNX file first (see docs/PR9_MODEL_OPTIMIZATIONS.md).
+
+processors:
+  audio:
+    enabled: false
+    required: false
+  text:
+    enabled: false
+    required: false
+
+visual:
+  cfg_path: "./VisualProcessor/config_pr2_min.yaml"
+  requirements:
+    core_depth_midas: true
+
+resolved_model_mapping:
+  core_depth_midas:
+    engine: onnx
+    onnx_path: "./models/optimized/midas/MiDaS_small/model.onnx"
+    model_version: "MiDaS_small@unknown"
+    weights_digest: "unknown"
+    precision: "fp32"
+
+

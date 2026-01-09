@@ -1,42 +1,40 @@
 """
-ASR экстрактор на основе Whisper с поддержкой GPU.
+ASR extractor (Whisper) — Triton-backed, no-network, token-IDs output (no raw text).
 """
 import time
 import logging
+import os
 import numpy as np
-import torch
-import whisper
 from typing import Dict, Any, Optional, List
-from pathlib import Path
 
 from src.core.base_extractor import BaseExtractor, ExtractorResult
 from src.core.audio_utils import AudioUtils
-from src.utils.prof import timeit
+from dp_triton import TritonHttpClient, TritonError  # type: ignore
 
 logger = logging.getLogger(__name__)
 
 
 class ASRExtractor(BaseExtractor):
-    """Экстрактор автоматического распознавания речи на основе Whisper."""
+    """
+    Whisper ASR via Triton. Output is token IDs from a shared tokenizer (dp_models),
+    so TextProcessor can decode without storing raw transcript text in artifacts.
+    """
     
     name = "asr_extractor"
-    version = "1.0.0"
-    description = "Автоматическое распознавание речи с помощью Whisper"
+    version = "2.0.0"
+    description = "Whisper ASR via Triton (token IDs, no raw text)"
     category = "speech"
-    dependencies = ["torch", "whisper", "librosa"]
-    estimated_duration = 5.0
+    dependencies = ["numpy", "dp_triton", "dp_models"]
+    estimated_duration = 8.0
     
-    # Предпочитает GPU для Whisper
     gpu_required = False
     gpu_preferred = True
-    gpu_memory_required = 1.0  # 1GB для Whisper
+    gpu_memory_required = 0.0  # client-side only; model runs on Triton
     
     def __init__(
         self, 
         device: str = "auto",
         model_size: str = "small",
-        language: Optional[str] = None,
-        task: str = "transcribe",
         sample_rate: int = 16000
     ):
         """
@@ -44,49 +42,167 @@ class ASRExtractor(BaseExtractor):
         
         Args:
             device: Устройство для обработки
-            model_size: Размер модели Whisper ('tiny', 'base', 'small', 'medium', 'large')
-            language: Язык для распознавания (None для автоопределения)
-            task: Тип задачи ('transcribe' или 'translate')
+            model_size: Whisper size: small|medium|large (Triton model selection via ModelManager)
             sample_rate: Частота дискретизации
         """
         super().__init__(device=device)
         
-        self.model_size = model_size
-        self.language = language
-        self.task = task
-        self.sample_rate = sample_rate
+        self.model_size = str(model_size or "small").strip().lower()
+        if self.model_size not in ("small", "medium", "large"):
+            raise ValueError(f"ASR | unsupported model_size={self.model_size}. Expected: small|medium|large")
+        self.sample_rate = int(sample_rate)
         
         self.audio_utils = AudioUtils(device=device, sample_rate=sample_rate)
-        
-        # Инициализируем модель Whisper
-        self._setup_whisper_model()
-    
-    def _setup_whisper_model(self):
-        """Настройка модели Whisper."""
+
+        # Resolve models via ModelManager (no-network).
         try:
-            # Убираем шумные инфо-логи инициализации
-            # self.logger.debug(f"Загрузка модели Whisper {self.model_size}...")
-            
-            # Загружаем модель на нужное устройство
-            with timeit("asr: load_model"):
-                self.model = whisper.load_model(self.model_size, device=self.device)
-            try:
-                print(f"[ASR] model={self.model_size} device={self.device} fp16={self.device=='cuda'} cuda_available={torch.cuda.is_available()}")
-            except Exception:
-                pass
-            
-            # Настраиваем опции декодирования
-            self.decoding_options = whisper.DecodingOptions(
-                language=self.language,
-                task=self.task,
-                fp16=self.device == "cuda"  # Используем fp16 на GPU для экономии памяти
-            )
-            
-            # self.logger.debug(f"Модель Whisper {self.model_size} загружена на {self.device}")
-            
+            from dp_models import get_global_model_manager  # type: ignore
+            from dp_models.errors import ModelManagerError  # type: ignore
+
+            self._mm = get_global_model_manager()
         except Exception as e:
-            self.logger.error(f"Ошибка загрузки модели Whisper: {e}")
-            raise
+            raise RuntimeError(f"ASR | ModelManager is required but failed to init: {e}") from e
+
+        # Shared tokenizer must exist locally (B: shared tokenizer contract).
+        try:
+            tok_spec = self._mm.get_spec(model_name="shared_tokenizer_v1")
+            _d, _p, _rt, _eng, tok_digest, tok_artifacts = self._mm.resolve(tok_spec)
+            self.tokenizer_model_name = str(tok_spec.model_name)
+            self.tokenizer_weights_digest = str(tok_digest)
+            self.tokenizer_artifact_path = list(tok_artifacts.values())[0] if tok_artifacts else None
+            if not self.tokenizer_artifact_path:
+                raise RuntimeError("ASR | shared_tokenizer_v1 has empty artifacts")
+        except Exception as e:
+            raise RuntimeError(f"ASR | shared tokenizer is missing/invalid: {e}") from e
+
+        # Whisper Triton spec selection by size.
+        whisper_spec_name = f"whisper_{self.model_size}_triton"
+        try:
+            self.whisper_spec = self._mm.get_spec(model_name=whisper_spec_name)
+            dev, prec, rt, eng, wd, _art = self._mm.resolve(self.whisper_spec)
+            if str(rt) != "triton":
+                raise RuntimeError(f"ASR | expected runtime=triton in spec {whisper_spec_name}, got {rt}")
+            self.whisper_model_name = str(self.whisper_spec.model_name)
+            self.whisper_weights_digest = str(wd)
+            rp = self.whisper_spec.runtime_params or {}
+            self.triton_http_url = self._expand_env(str(rp.get("triton_http_url") or os.environ.get("TRITON_HTTP_URL") or ""))
+            self.triton_model_name = str(rp.get("triton_model_name") or "")
+            self.triton_model_version = rp.get("triton_model_version")
+            self.triton_input_name = str(rp.get("triton_input_name") or "AUDIO__0")
+            self.triton_input_datatype = str(rp.get("triton_input_datatype") or "FP32")
+            self.triton_output_token_ids_name = str(rp.get("triton_output_token_ids_name") or "TOKEN_IDS__0")
+            self.triton_output_token_ids_datatype = str(rp.get("triton_output_token_ids_datatype") or "INT32")
+            self.triton_output_lang_id_name = str(rp.get("triton_output_lang_id_name") or "LANG_ID__0")
+            self.triton_output_lang_id_datatype = str(rp.get("triton_output_lang_id_datatype") or "INT32")
+            if not self.triton_http_url or not self.triton_model_name:
+                raise RuntimeError("ASR | Triton runtime_params missing triton_http_url/triton_model_name")
+        except Exception as e:
+            raise RuntimeError(f"ASR | failed to resolve whisper triton spec via ModelManager: {e}") from e
+
+        self._client = TritonHttpClient(base_url=self.triton_http_url, timeout_sec=10.0)
+
+    def _expand_env(self, s: str) -> str:
+        """
+        Expand simple ${VAR} placeholders (used in model specs).
+        """
+        out = str(s)
+        if "${" not in out:
+            return out
+        import re
+
+        def repl(m):
+            k = m.group(1)
+            return os.environ.get(k, "")
+
+        return re.sub(r"\$\{([^}]+)\}", repl, out)
+
+    def _infer_segment_token_ids(self, audio_1d: np.ndarray) -> tuple[np.ndarray, int]:
+        if not self._client.ready():
+            raise TritonError(f"Triton is not ready at {self.triton_http_url}", error_code="triton_unavailable")
+        x = np.asarray(audio_1d, dtype=np.float32).reshape(1, -1)
+        outs = self._client.infer_multi(
+            model_name=self.triton_model_name,
+            model_version=(str(self.triton_model_version) if self.triton_model_version else None),
+            input_name=self.triton_input_name,
+            input_tensor=x,
+            input_datatype=self.triton_input_datatype,
+            outputs=[
+                (self.triton_output_token_ids_name, self.triton_output_token_ids_datatype),
+                (self.triton_output_lang_id_name, self.triton_output_lang_id_datatype),
+            ],
+        )
+        tok = outs[self.triton_output_token_ids_name].output
+        lang = outs[self.triton_output_lang_id_name].output
+        tok = np.asarray(tok, dtype=np.int32)
+        # allow [1, L] or [L]
+        if tok.ndim == 2 and tok.shape[0] == 1:
+            tok = tok[0]
+        tok = tok.reshape(-1)
+        lang_id = int(np.asarray(lang).reshape(-1)[0]) if np.asarray(lang).size else -1
+        return tok, lang_id
+
+    def run_segments(self, input_uri: str, tmp_path: str, segments: List[Dict[str, Any]]) -> ExtractorResult:
+        """
+        Run ASR on Segmenter-provided long windows (families.asr) and return token ids per segment.
+        No raw transcript is stored.
+        """
+        start_time = time.time()
+        try:
+            if not self._validate_input(input_uri):
+                return self._create_result(
+                    success=False,
+                    error="Некорректный входной файл",
+                    processing_time=time.time() - start_time,
+                )
+            if not isinstance(segments, list) or not segments:
+                raise ValueError("segments is empty (no-fallback)")
+
+            token_ids_by_segment: list[np.ndarray] = []
+            lang_id_by_segment: list[int] = []
+            seg_st: list[float] = []
+            seg_en: list[float] = []
+            seg_center: list[float] = []
+
+            for seg in segments:
+                ss = int(seg.get("start_sample"))
+                es = int(seg.get("end_sample"))
+                st = float(seg.get("start_sec"))
+                en = float(seg.get("end_sec"))
+                c = float(seg.get("center_sec"))
+
+                wav_t, sr = self.audio_utils.load_audio_segment(input_uri, start_sample=ss, end_sample=es, target_sr=self.sample_rate)
+                wav_np = self.audio_utils.to_numpy(wav_t)
+                if wav_np.ndim == 2:
+                    wav_np = wav_np[0]
+                wav_np = np.asarray(wav_np, dtype=np.float32).reshape(-1)
+                if int(sr) != int(self.sample_rate):
+                    # load_audio_segment should resample; keep strictness anyway
+                    raise RuntimeError(f"ASR | segment SR mismatch: got {sr} expected {self.sample_rate}")
+
+                tok, lang_id = self._infer_segment_token_ids(wav_np)
+                token_ids_by_segment.append(tok.astype(np.int32))
+                lang_id_by_segment.append(int(lang_id))
+                seg_st.append(float(st))
+                seg_en.append(float(en))
+                seg_center.append(float(c))
+
+            payload: Dict[str, Any] = {
+                "token_ids_by_segment": [t.tolist() for t in token_ids_by_segment],
+                "lang_id_by_segment": lang_id_by_segment,
+                "segment_start_sec": seg_st,
+                "segment_end_sec": seg_en,
+                "segment_center_sec": seg_center,
+                "segments_count": int(len(token_ids_by_segment)),
+                "sample_rate": int(self.sample_rate),
+                "whisper_model_name": self.whisper_model_name,
+                "tokenizer_model_name": self.tokenizer_model_name,
+                "device_used": "cuda",  # Triton-backed assumption in this project
+            }
+            return self._create_result(True, payload=payload, processing_time=time.time() - start_time)
+        except TritonError as e:
+            return self._create_result(False, error=str(e), processing_time=time.time() - start_time)
+        except Exception as e:
+            return self._create_result(False, error=str(e), processing_time=time.time() - start_time)
     
     def run(self, input_uri: str, tmp_path: str) -> ExtractorResult:
         """
@@ -97,156 +213,13 @@ class ASRExtractor(BaseExtractor):
             tmp_path: Временная директория
             
         Returns:
-            ExtractorResult с транскрипцией и сегментами
+            ExtractorResult with token IDs (requires segments mode in production).
         """
-        start_time = time.time()
-        
-        try:
-            
-            # Валидация входного файла
-            if not self._validate_input(input_uri):
-                return self._create_result(
-                    success=False,
-                    error="Некорректный входной файл",
-                    processing_time=time.time() - start_time
-                )
-            
-            self._log_extraction_start(input_uri)
-            
-            # Загружаем аудио
-            with timeit("asr: load_audio"):
-                waveform, sample_rate = self.audio_utils.load_audio(input_uri, self.sample_rate)
-            # Полная длительность аудио (сек)
-            try:
-                if hasattr(waveform, "shape"):
-                    total_samples = int(waveform.shape[-1])
-                else:
-                    # numpy-like
-                    total_samples = int(getattr(waveform, "size", 0))
-                audio_duration = float(total_samples) / float(sample_rate or self.sample_rate or 1)
-            except Exception:
-                audio_duration = 0.0
-            
-            # Нормализуем аудио
-            with timeit("asr: normalize_audio"):
-                waveform = self.audio_utils.normalize_audio(waveform)
-            
-            # Перемещаем на нужное устройство
-            with timeit("asr: move_to_device"):
-                waveform = self.audio_utils._move_to_device(waveform)
-            
-            # Извлекаем транскрипцию
-            with timeit("asr: whisper.transcribe"):
-                transcription_result = self._extract_transcription(waveform)
-            
-            # Обрабатываем результат
-            with timeit("asr: process_transcription_result"):
-                processed_result = self._process_transcription_result(transcription_result)
-            
-            processing_time = time.time() - start_time
-            
-            # Создаем результат
-            payload = {
-                "transcription": processed_result["text"],
-                "segments": processed_result["segments"],
-                "language": processed_result["language"],
-                "language_probability": processed_result["language_probability"],
-                # speech_duration — суммарная длительность речи (по сегментам Whisper)
-                "speech_duration": processed_result["duration"],
-                # audio_duration — полная длительность входного аудио
-                "audio_duration": audio_duration,
-                "model_size": self.model_size,
-                "task": self.task,
-                "device_used": self.device,
-                "sample_rate": sample_rate
-            }
-            
-            self._log_extraction_success(input_uri, processing_time)
-            
-            return self._create_result(
-                success=True,
-                payload=payload,
-                processing_time=processing_time
-            )
-            
-        except Exception as e:
-            processing_time = time.time() - start_time
-            error_msg = f"Ошибка извлечения транскрипции: {str(e)}"
-            self._log_extraction_error(input_uri, error_msg, processing_time)
-            
-            return self._create_result(
-                success=False,
-                error=error_msg,
-                processing_time=processing_time
-            )
-    
-    def _extract_transcription(self, waveform: torch.Tensor) -> Dict[str, Any]:
-        """Извлечение транскрипции с помощью Whisper."""
-        try:
-            # Конвертируем в numpy для Whisper
-            audio_np = self.audio_utils.to_numpy(waveform)
-            
-            # Убираем batch dimension если есть
-            if audio_np.ndim > 1:
-                audio_np = audio_np[0] if audio_np.shape[0] == 1 else audio_np
-            
-            # Применяем Whisper
-            result = self.model.transcribe(
-                audio_np,
-                language=self.language,
-                task=self.task,
-                fp16=self.device == "cuda"
-            )
-            
-            return result
-            
-        except Exception as e:
-            self.logger.error(f"Ошибка извлечения транскрипции: {e}")
-            raise
-    
-    def _process_transcription_result(self, result: Dict[str, Any]) -> Dict[str, Any]:
-        """Обработка результата транскрипции."""
-        try:
-            # Извлекаем основную информацию
-            text = result.get("text", "")
-            language = result.get("language", "unknown")
-            language_probability = result.get("language_probability", 0.0)
-            
-            # Обрабатываем сегменты
-            segments = []
-            for segment in result.get("segments", []):
-                processed_segment = {
-                    "start": float(segment.get("start", 0.0)),
-                    "end": float(segment.get("end", 0.0)),
-                    "text": segment.get("text", "").strip(),
-                    "tokens": segment.get("tokens", []),
-                    "temperature": segment.get("temperature", 0.0),
-                    "avg_logprob": segment.get("avg_logprob", 0.0),
-                    "compression_ratio": segment.get("compression_ratio", 0.0),
-                    "no_speech_prob": segment.get("no_speech_prob", 0.0)
-                }
-                segments.append(processed_segment)
-            
-            # Вычисляем общую длительность
-            duration = max([seg["end"] for seg in segments], default=0.0)
-            
-            return {
-                "text": text,
-                "segments": segments,
-                "language": language,
-                "language_probability": language_probability,
-                "duration": duration
-            }
-            
-        except Exception as e:
-            self.logger.error(f"Ошибка обработки результата транскрипции: {e}")
-            return {
-                "text": "",
-                "segments": [],
-                "language": "unknown",
-                "language_probability": 0.0,
-                "duration": 0.0
-            }
+        return self._create_result(
+            success=False,
+            error="ASRExtractor | run() is not supported in production. Use run_segments() with Segmenter-provided families.asr windows.",
+            processing_time=0.0,
+        )
     
     def _validate_input(self, input_uri: str) -> bool:
         """Валидация входного файла."""

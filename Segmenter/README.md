@@ -9,7 +9,7 @@
 - `output/<video_id>/video/metadata.json`
 - `output/<video_id>/video/batch_*.npy`
 - `output/<video_id>/audio/metadata.json`
-- `output/<video_id>/audio/<video_id>.wav` (если включено/доступно ffmpeg)
+- `output/<video_id>/audio/audio.wav` (если доступно `ffmpeg`; имя стабильное)
 
 ### Union-sampled frames_dir (DEFAULT)
 
@@ -21,7 +21,19 @@
 
 Также фиксируются:
 - `color_space="RGB"` (все кадры в `.npy` — RGB)
-- `union_timestamps_sec` (mapping к исходному времени)
+- `union_timestamps_sec` (mapping кадра к времени в секундах — **source-of-truth** для мультимодальной синхронизации)
+
+### Time-axis (мультимодальная синхронизация)
+
+Ключевая идея: видео и аудио живут на **общей временной оси**.
+
+- Для кадров Segmenter пишет `union_timestamps_sec` (sec) для каждого union-кадра.
+- Для аудио Segmenter хранит сырое `audio.wav` + `audio/metadata.json` (duration/sample_rate/total_samples).
+- Любой компонент, которому нужна синхронизация, должен использовать time-domain:
+  - `t_frame = union_timestamps_sec[frame_idx]`
+  - дальше выбрать/агрегировать аудио вокруг времени \(t_frame\) по окну.
+
+Важно: правила построения sampling policy (выбор кадров, `analysis_fps`, resizing) считаются **DEFERRED** до завершения полного аудита компонентов.
 
 ### Legacy режим (НЕ рекомендуется)
 

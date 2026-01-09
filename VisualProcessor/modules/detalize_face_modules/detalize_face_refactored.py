@@ -1,6 +1,6 @@
 """
 Все TODO выполнены:
-    1. ✅ Интеграция с внешними зависимостями через BaseModule (core_face_landmarks, face_detection)
+    1. ✅ Интеграция с внешними зависимостями через BaseModule (core_face_landmarks)
     2. ✅ Использование результатов core провайдеров вместо прямых вызовов моделей
     3. ✅ Интеграция с BaseModule через класс DetalizeFaceModule
     4. ✅ Единый формат вывода для сохранения в npz
@@ -174,7 +174,7 @@ class DetalizeFaceExtractorRefactored():
 
     def frames_with_face_load(self, filename, rs_path: Optional[str] = None):
         """
-        Загружает список кадров с лицами из результатов face_detection.
+        Возвращает список кадров с лицами на основе `core_face_landmarks`.
         
         Args:
             filename: Имя файла или "auto" для автоматического поиска
@@ -188,56 +188,15 @@ class DetalizeFaceExtractorRefactored():
             logger.warning("DetalizeFaceExtractorRefactored | frames_with_face_load | rs_path не указан, возвращаем пустой список")
             return []
         
+        # face_detection module was removed; we rely on core_face_landmarks only.
         try:
-            # Пытаемся загрузить через load_dependency_results (если доступен)
-            # Иначе используем прямой доступ к файлу
-            face_data = None
-            
-            # Вариант 1: через BaseModule (если доступен)
-            if hasattr(self, 'load_dependency_results'):
-                try:
-                    face_data = self.load_dependency_results("face_detection", format="json")
-                except Exception:
-                    pass
-            
-            # Вариант 2: прямой доступ к файлу
-            if face_data is None:
-                face_detection_dir = os.path.join(rs_path, "face_detection")
-                if not os.path.exists(face_detection_dir):
-                    logger.warning(f"DetalizeFaceExtractorRefactored | frames_with_face_load | Директория {face_detection_dir} не найдена")
-                    return []
-                
-                json_files = list(Path(face_detection_dir).glob("*.json"))
-                if not json_files:
-                    logger.warning(f"DetalizeFaceExtractorRefactored | frames_with_face_load | JSON файлы не найдены в {face_detection_dir}")
-                    return []
-                
-                if filename == "auto":
-                    json_file = max(json_files, key=lambda p: p.stat().st_mtime)
-                else:
-                    json_file = Path(face_detection_dir) / filename
-                    if not json_file.exists():
-                        logger.warning(f"DetalizeFaceExtractorRefactored | frames_with_face_load | Файл {json_file} не найден")
-                        return []
-                
-                with open(json_file, "r", encoding="utf-8") as f:
-                    face_data = json.load(f)
-            
-            # Извлекаем frames_with_face
-            if isinstance(face_data, dict):
-                frames_with_face = face_data.get("frames_with_face", [])
-                if not frames_with_face:
-                    # Альтернативный формат: frames -> keys
-                    frames = face_data.get("frames", {})
-                    if frames:
-                        frames_with_face = [int(k) for k, v in frames.items() if v and len(v) > 0]
-                
-                logger.info(f"DetalizeFaceExtractorRefactored | frames_with_face_load | Загружено {len(frames_with_face)} кадров с лицами")
-                return sorted(frames_with_face)
-            else:
-                logger.warning("DetalizeFaceExtractorRefactored | frames_with_face_load | Неожиданный формат данных face_detection")
+            if not isinstance(self.core_landmarks, dict) or not self.core_landmarks:
                 return []
-                
+            frames_with_face = sorted(int(k) for k in self.core_landmarks.keys())
+            logger.info(
+                f"DetalizeFaceExtractorRefactored | frames_with_face_load | using core_face_landmarks frames: {len(frames_with_face)}"
+            )
+            return frames_with_face
         except Exception as e:
             logger.error(f"DetalizeFaceExtractorRefactored | frames_with_face_load | Error: {e}")
             return []
@@ -561,8 +520,7 @@ class DetalizeFaceModule(BaseModule):
     Использует DetalizeFaceExtractorRefactored для обработки кадров.
     
     Зависимости:
-    - core_face_landmarks (обязательная) - landmarks лиц
-    - face_detection (опциональная) - для фильтрации кадров с лицами
+    - core_face_landmarks (обязательная) - landmarks лиц (и face presence)
     """
     
     def __init__(
@@ -604,12 +562,13 @@ class DetalizeFaceModule(BaseModule):
             min_aspect_ratio: Минимальное соотношение сторон лица
             max_aspect_ratio: Максимальное соотношение сторон лица
             validate_landmarks: Валидировать landmarks
-            use_face_detection: Использовать результаты face_detection для фильтрации кадров
+            use_face_detection: Устаревший флаг. Теперь фильтрация делается по core_face_landmarks, face_detection удалён.
             **kwargs: Дополнительные параметры для BaseModule
         """
         super().__init__(rs_path=rs_path, **kwargs)
         
-        self.use_face_detection = use_face_detection
+        # Backward-compat flag: keep it, but it no longer loads face_detection.
+        self.use_face_detection = bool(use_face_detection)
         
         # Инициализируем extractor
         self.extractor = DetalizeFaceExtractorRefactored(
@@ -633,15 +592,11 @@ class DetalizeFaceModule(BaseModule):
         # Загружаем core_face_landmarks через BaseModule
         self._load_core_landmarks()
         
-        # Загружаем frames_with_face через BaseModule
-        if use_face_detection:
-            self._load_frames_with_face()
+        # Always derive frames_with_face from core_face_landmarks (face_detection удалён).
+        if self.extractor.core_landmarks:
+            self.extractor.frames_with_face = sorted(self.extractor.core_landmarks.keys())
         else:
-            # Если не используем face_detection, извлекаем все кадры из core_landmarks
-            if self.extractor.core_landmarks:
-                self.extractor.frames_with_face = sorted(self.extractor.core_landmarks.keys())
-            else:
-                self.extractor.frames_with_face = []
+            self.extractor.frames_with_face = []
     
     def required_dependencies(self) -> List[str]:
         """
@@ -651,12 +606,9 @@ class DetalizeFaceModule(BaseModule):
         - core_face_landmarks: landmarks лиц
         
         Опциональные:
-        - face_detection: для фильтрации кадров с лицами
+        - (none) — face_detection удалён
         """
-        deps = ["core_face_landmarks"]
-        if self.use_face_detection:
-            deps.append("face_detection")
-        return deps
+        return ["core_face_landmarks"]
     
     def _load_core_landmarks(self) -> None:
         """Загружает core_face_landmarks через BaseModule."""
@@ -691,42 +643,13 @@ class DetalizeFaceModule(BaseModule):
             raise
     
     def _load_frames_with_face(self) -> None:
-        """Загружает список кадров с лицами через BaseModule."""
-        if not self.use_face_detection:
-            return
-        
-        try:
-            # Используем метод extractor, но с доступом к load_dependency_results
-            # Временно добавляем метод в extractor
-            if not hasattr(self.extractor, 'load_dependency_results'):
-                # Создаем обёртку для доступа к BaseModule методам
-                def load_dep_wrapper(module_name: str, format: str = "auto"):
-                    return self.load_dependency_results(module_name, format=format)
-                self.extractor.load_dependency_results = load_dep_wrapper
-            
-            frames_with_face = self.extractor.frames_with_face_load("auto", rs_path=self.rs_path)
-            self.extractor.frames_with_face = frames_with_face
-            
-            if frames_with_face:
-                self.logger.info(
-                    f"DetalizeFaceModule | Загружено {len(frames_with_face)} кадров с лицами "
-                    f"из face_detection"
-                )
-            else:
-                # Fallback: используем все кадры из core_landmarks
-                if self.extractor.core_landmarks:
-                    self.extractor.frames_with_face = sorted(self.extractor.core_landmarks.keys())
-                    self.logger.warning(
-                        "DetalizeFaceModule | face_detection результаты не найдены, "
-                        f"используем все кадры из core_landmarks ({len(self.extractor.frames_with_face)} кадров)"
-                    )
-        except Exception as e:
-            self.logger.warning(
-                f"DetalizeFaceModule | Ошибка загрузки frames_with_face: {e}. "
-                "Используем все кадры из core_landmarks."
-            )
-            if self.extractor.core_landmarks:
-                self.extractor.frames_with_face = sorted(self.extractor.core_landmarks.keys())
+        """
+        Deprecated: face_detection removed. Kept for compatibility; derives frames from core_face_landmarks.
+        """
+        if self.extractor.core_landmarks:
+            self.extractor.frames_with_face = sorted(self.extractor.core_landmarks.keys())
+        else:
+            self.extractor.frames_with_face = []
     
     def process(
         self,

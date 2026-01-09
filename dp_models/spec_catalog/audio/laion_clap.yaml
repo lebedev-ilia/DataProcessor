@@ -1,0 +1,15 @@
+model_name: laion_clap
+role: audio_embedding
+runtime: inprocess
+engine: torch
+precision: fp32
+device_policy: auto
+preprocess_preset: ""
+weights_digest: auto
+
+# Local-only policy (NO NETWORK):
+# Put your CLAP checkpoint file under DP_MODELS_ROOT and update this path accordingly.
+local_artifacts:
+  - kind: file
+    path: "audio/laion_clap/clap_ckpt.pt"
+

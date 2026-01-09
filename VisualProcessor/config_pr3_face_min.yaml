@@ -1,0 +1,36 @@
+core_providers:
+  core_face_landmarks: true
+  core_clip: false
+  core_depth_midas: false
+  core_object_detections: false
+  core_optical_flow: false
+
+modules:
+  cut_detection: false
+  scene_classification: false
+  shot_quality: false
+  video_pacing: false
+  story_structure: false
+  similarity_metrics: false
+  text_scoring: false
+  uniqueness: false
+
+global:
+  root_path: null
+  frames_dir: null
+  rs_path: null
+  max_parallel_modules: 1
+  gpu_max_concurrent: "auto"
+
+core_face_landmarks:
+  # no explicit venv_path: VisualProcessor will use built-in isolated venv for this core.
+  use_pose: false
+  use_hands: false
+  use_face_mesh: true
+  face_mesh_max_num_faces: 1
+  sampling:
+    target_frames: 60
+    min_frames: 30
+    max_frames: 120
+
+

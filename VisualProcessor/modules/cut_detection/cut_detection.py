@@ -26,6 +26,7 @@ if _path not in sys.path:
 import cv2
 import math
 import time
+import hashlib
 from collections import deque
 from typing import Dict, List, Any, Optional
 import numpy as np
@@ -60,12 +61,22 @@ from skimage.metrics import structural_similarity as ssim
 from sklearn.cluster import KMeans, DBSCAN
 from sklearn.preprocessing import StandardScaler
 
+# Split large helper blocks into smaller files (keep public API stable).
+from modules.cut_detection.visual_features import ImageFromCV, ImageFromRGB, frame_histogram_diff, frame_ssim  # noqa: E402
+from modules.cut_detection.flow_features import (  # noqa: E402
+    estimate_global_motion_homography,
+    optical_flow_direction_consistency,
+    optical_flow_magnitude,
+    resize_gray_max_side as _resize_gray_max_side,
+)
+
 from modules.base_module import BaseModule
 from utils.frame_manager import FrameManager
 from utils.logger import get_logger
 
 NAME = "CutDetectionPipeline"
-VERSION = "1.0"
+VERSION = "2.0"
+SCHEMA_VERSION = "cut_detection_npz_v1"
 
 logger = get_logger(NAME)
 
@@ -76,26 +87,118 @@ def float_or_zero(x):
 def seconds_from_fps(n_frames, fps):
     return n_frames / float(fps) if fps > 0 else 0.0
 
+def _require_union_times_s(frame_manager: FrameManager, frame_indices: List[int]) -> np.ndarray:
+    """
+    Segmenter contract: union_timestamps_sec is source-of-truth for time axis.
+    No-fallback: if missing/invalid -> error (production).
+    """
+    meta = getattr(frame_manager, "meta", None)
+    if not isinstance(meta, dict):
+        raise RuntimeError("cut_detection | FrameManager.meta missing (requires union_timestamps_sec)")
+    ts = meta.get("union_timestamps_sec")
+    if not isinstance(ts, list) or not ts:
+        raise RuntimeError("cut_detection | union_timestamps_sec missing/empty in frames metadata (no-fallback)")
+    uts = np.asarray(ts, dtype=np.float32)
+    fi = np.asarray([int(i) for i in frame_indices], dtype=np.int32)
+    if fi.size == 0:
+        raise RuntimeError("cut_detection | frame_indices is empty (no-fallback)")
+    if int(np.max(fi)) >= int(uts.shape[0]):
+        raise RuntimeError("cut_detection | union_timestamps_sec does not cover frame_indices (no-fallback)")
+    times_s = uts[fi]
+    # enforce monotonic non-decreasing
+    if times_s.size >= 2 and np.any(np.diff(times_s) < -1e-3):
+        raise RuntimeError("cut_detection | union_timestamps_sec is not monotonic (no-fallback)")
+    return times_s.astype(np.float32)
 
-def frame_histogram_diff(frameA, frameB, bins=32):
-    """Compute histogram difference (normalized) between two RGB frames."""
-    hsvA = cv2.cvtColor(frameA, cv2.COLOR_RGB2HSV)
-    hsvB = cv2.cvtColor(frameB, cv2.COLOR_RGB2HSV)
-    hA = cv2.calcHist([hsvA], [2], None, [bins], [0,256]).flatten()
-    hB = cv2.calcHist([hsvB], [2], None, [bins], [0,256]).flatten()
-    hA = hA / (hA.sum() + 1e-9)
-    hB = hB / (hB.sum() + 1e-9)
-    return float(np.linalg.norm(hA - hB, ord=1))  # L1
 
-def frame_ssim(frameA, frameB):
-    """Convert to gray and compute SSIM (0..1). Return 1-SSIM as drop measure."""
-    grayA = cv2.cvtColor(frameA, cv2.COLOR_RGB2GRAY)
-    grayB = cv2.cvtColor(frameB, cv2.COLOR_RGB2GRAY)
-    try:
-        s = ssim(grayA, grayB, data_range=grayB.max() - grayB.min())
-        return float(1.0 - s)  # bigger = larger drop
-    except Exception:
+def _video_length_seconds(times_s: np.ndarray) -> float:
+    if times_s.size == 0:
         return 0.0
+    if times_s.size == 1:
+        return 0.0
+    return float(max(times_s[-1] - times_s[0], 0.0))
+
+
+def _resolve_audio_path(frames_dir: str, config: Optional[Dict[str, Any]]) -> Optional[str]:
+    """
+    Auto-resolve Segmenter audio path (audio/audio.wav) relative to frames_dir (video/).
+    User may override with config['audio_path'].
+    """
+    if isinstance(config, dict):
+        p = config.get("audio_path")
+        if isinstance(p, str) and p:
+            return p
+    # frames_dir usually ends with ".../<video_id>/video"
+    base = os.path.dirname(os.path.abspath(frames_dir))
+    cand = os.path.join(base, "audio", "audio.wav")
+    return cand if os.path.exists(cand) else None
+
+
+def _resolve_clip_download_root(config: Optional[Dict[str, Any]]) -> Optional[str]:
+    """
+    DEPRECATED (baseline GPU-only):
+    `cut_detection` MUST NOT load CLIP weights locally (no-network, single source-of-truth).
+    CLIP is served via Triton and resolved via `dp_models` + `core_clip` artifacts.
+    """
+    return None
+
+
+def _cut_timing_statistics_from_times(cut_times_s: List[float], video_length_s: float) -> Dict[str, Any]:
+    """
+    Stats for cut timing (time-based, not fps-based).
+    """
+    if not cut_times_s:
+        return {
+            "cuts_per_minute": 0.0,
+            "median_cut_interval": float("nan"),
+            "min_cut_interval": float("nan"),
+            "max_cut_interval": float("nan"),
+            "cut_interval_std": float("nan"),
+            "cut_interval_cv": float("nan"),
+            "cut_interval_entropy": float("nan"),
+            "cut_rhythm_uniformity_score": float("nan"),
+        }
+    if video_length_s <= 0:
+        return {
+            "cuts_per_minute": float("nan"),
+            "median_cut_interval": float("nan"),
+            "min_cut_interval": float("nan"),
+            "max_cut_interval": float("nan"),
+            "cut_interval_std": float("nan"),
+            "cut_interval_cv": float("nan"),
+            "cut_interval_entropy": float("nan"),
+            "cut_rhythm_uniformity_score": float("nan"),
+        }
+    t = np.asarray(sorted(set(float(x) for x in cut_times_s)), dtype=np.float32)
+    intervals = np.diff(t)
+    if intervals.size == 0:
+        intervals = np.asarray([float(video_length_s)], dtype=np.float32)
+    cpm = float(len(t) / max(video_length_s, 1e-6) * 60.0)
+    median = float(np.median(intervals))
+    mn = float(np.min(intervals))
+    mx = float(np.max(intervals))
+    std = float(np.std(intervals))
+    mean_int = float(np.mean(intervals))
+    cv = float(std / (mean_int + 1e-9))
+    n_bins = int(min(20, max(2, intervals.size)))
+    hist, _ = np.histogram(intervals, bins=n_bins)
+    hist = hist.astype(np.float64) + 1e-9
+    ent = float(scipy.stats.entropy(hist))
+    max_entropy = float(np.log(n_bins)) if n_bins > 1 else 1.0
+    ent_normalized = float(ent / (max_entropy + 1e-9))
+    cv_clipped = float(np.clip(cv, 0.0, 1.0))
+    uniformity = float(1.0 - cv_clipped)
+    return {
+        "cuts_per_minute": cpm,
+        "median_cut_interval": median,
+        "min_cut_interval": mn,
+        "max_cut_interval": mx,
+        "cut_interval_std": std,
+        "cut_interval_cv": cv,
+        "cut_interval_entropy": ent_normalized,
+        "cut_rhythm_uniformity_score": uniformity,
+    }
+
 
 def get_embedding_model(device='cpu', model_name='resnet18'):
     """Initialize and return a pre-trained embedding model."""
@@ -139,84 +242,6 @@ def feature_embedding_diff(frameA, frameB, embed_model=None, transform=None, dev
         sim = (eA * eB).sum().item()
         return float(1.0 - sim)
 
-# helper convert RGB ndarray -> PIL Image
-def ImageFromRGB(frame_rgb):
-    try:
-        from PIL import Image
-        return Image.fromarray(frame_rgb)
-    except ImportError:
-        return frame_rgb
-
-
-# helper convert "cv image" (np.ndarray) -> PIL Image
-# IMPORTANT (project contract): FrameManager.get() returns RGB, so we must NOT assume BGR here.
-def ImageFromCV(frame: np.ndarray):
-    return ImageFromRGB(frame)
-
-def optical_flow_magnitude(prev_gray, gray):
-    """Farneback optical flow average magnitude."""
-    try:
-        flow = cv2.calcOpticalFlowFarneback(prev_gray, gray,
-                                            None, 0.5, 3, 15, 3, 5, 1.2, 0)
-        mag, ang = cv2.cartToPolar(flow[...,0], flow[...,1])
-        return float(np.mean(mag)), mag, ang
-    except Exception:
-        return 0.0, None, None
-
-def optical_flow_direction_consistency(flow_angles, window_size=5):
-    """Compute direction consistency using circular statistics."""
-    if flow_angles is None:
-        return 0.0
-    # Convert angles to unit vectors
-    cos_angles = np.cos(flow_angles)
-    sin_angles = np.sin(flow_angles)
-    mean_cos = np.mean(cos_angles)
-    mean_sin = np.mean(sin_angles)
-    # Resultant length (0-1, higher = more consistent direction)
-    consistency = np.sqrt(mean_cos**2 + mean_sin**2)
-    return float(consistency)
-
-def estimate_global_motion_homography(prev_gray, gray):
-    """
-    Estimate global camera motion using RANSAC homography.
-    Returns homography matrix and inlier ratio.
-    """
-    try:
-        # Detect features using ORB (lightweight)
-        orb = cv2.ORB_create(nfeatures=500)
-        kp1, des1 = orb.detectAndCompute(prev_gray, None)
-        kp2, des2 = orb.detectAndCompute(gray, None)
-        
-        if des1 is None or des2 is None or len(des1) < 10 or len(des2) < 10:
-            return None, 0.0
-        
-        # Match features
-        bf = cv2.BFMatcher(cv2.NORM_HAMMING, crossCheck=False)
-        matches = bf.knnMatch(des1, des2, k=2)
-        
-        # Apply ratio test
-        good_matches = []
-        for match_pair in matches:
-            if len(match_pair) == 2:
-                m, n = match_pair
-                if m.distance < 0.75 * n.distance:
-                    good_matches.append(m)
-        
-        if len(good_matches) < 10:
-            return None, 0.0
-        
-        # Extract matched points
-        src_pts = np.float32([kp1[m.queryIdx].pt for m in good_matches]).reshape(-1, 1, 2)
-        dst_pts = np.float32([kp2[m.trainIdx].pt for m in good_matches]).reshape(-1, 1, 2)
-        
-        # Estimate homography with RANSAC
-        H, mask = cv2.findHomography(src_pts, dst_pts, cv2.RANSAC, 5.0)
-        inlier_ratio = float(np.sum(mask)) / len(good_matches) if mask is not None else 0.0
-        
-        return H, inlier_ratio
-    except Exception:
-        return None, 0.0
-
 def morphological_clean_cuts(cut_flags, min_neighbors=1):
     """
     Morphological cleaning: remove isolated cut detections.
@@ -248,12 +273,21 @@ def detect_hard_cuts(
     hist_thresh=None, 
     ssim_thresh=None, 
     flow_thresh=None,
+    ssim_max_side: int = 0,
+    flow_max_side: int = 0,
+    external_flow_mags: Optional[np.ndarray] = None,
     use_deep_features=True, 
     use_adaptive_thresholds=True, 
     temporal_smoothing=True, 
     embed_model=None, 
     transform=None, 
-    device='cpu'
+    device='cpu',
+    return_model_facing: bool = False,
+    # Optional performance mode: cascade-gate expensive computations (SSIM/flow/deep) using cheap histogram signal.
+    # Default is OFF to preserve quality; enable explicitly for "fast" profile experiments.
+    cascade_enabled: bool = False,
+    cascade_keep_top_p: float = 0.25,
+    cascade_hist_margin: float = 0.0,
     ):
     """
     Improved hard cut detection with adaptive thresholds, deep features, and temporal smoothing.
@@ -263,75 +297,216 @@ def detect_hard_cuts(
     """
     n = len(frame_indices)
     if n < 2:
-        return [], []
+        return ([], [], {}) if bool(return_model_facing) else ([], [])
     
-    # Compute all frame differences first
-    hdiffs = []
-    ssim_diffs = []
-    flow_mags = []
-    deep_diffs = []
-    
-    prev_gray = cv2.cvtColor(frame_manager.get(frame_indices[0]), cv2.COLOR_RGB2GRAY)
-    for i in range(1, n):
-        fA = frame_manager.get(frame_indices[i-1])
-        fB = frame_manager.get(frame_indices[i])
-        hdiff = frame_histogram_diff(fA, fB)
-        s = frame_ssim(fA, fB)
-        gray = cv2.cvtColor(fB, cv2.COLOR_RGB2GRAY)
-        flow_mag, _, _ = optical_flow_magnitude(prev_gray, gray)
-        prev_gray = gray
-        
-        hdiffs.append(hdiff)
-        ssim_diffs.append(s)
-        flow_mags.append(flow_mag)
-        
-        # Deep feature difference
-        if use_deep_features and embed_model is not None:
-            deep_diff = feature_embedding_diff(fA, fB, embed_model, transform, device)
-            deep_diffs.append(deep_diff)
+    ext = None
+    if external_flow_mags is not None:
+        try:
+            ext = np.asarray(external_flow_mags, dtype=np.float32).reshape(-1)
+        except Exception:
+            ext = None
+        if ext is not None and int(ext.size) != int(max(0, n - 1)):
+            raise RuntimeError(
+                f"detect_hard_cuts | external_flow_mags length mismatch: got {int(ext.size)} expected {int(max(0, n-1))}"
+            )
+
+    def _ssim_drop_gray(grayA: np.ndarray, grayB: np.ndarray) -> float:
+        try:
+            dr = float(grayB.max() - grayB.min())
+            dr = dr if dr > 1e-9 else 1.0
+            s = ssim(grayA, grayB, data_range=dr)
+            return float(1.0 - s)
+        except Exception:
+            return 0.0
+
+    exp_len = int(max(0, n - 1))
+
+    def _adaptive_thresh(vals: np.ndarray, k: float, *, default_if_empty: float) -> float:
+        try:
+            v = np.asarray(vals, dtype=np.float32).reshape(-1)
+        except Exception:
+            v = np.zeros((0,), dtype=np.float32)
+        if int(v.size) <= 0:
+            return float(default_if_empty)
+        return float(np.median(v) + float(k) * float(np.std(v)))
+
+    # Compute frame differences (optionally in a 2-pass cascade mode)
+    if bool(cascade_enabled):
+        # Pass 1: histogram diffs only (cheap)
+        hdiffs_l: list[float] = []
+        prev_frame = frame_manager.get(frame_indices[0])
+        for i in range(1, n):
+            fB = frame_manager.get(frame_indices[i])
+            hdiffs_l.append(float(frame_histogram_diff(prev_frame, fB)))
+            prev_frame = fB
+        hdiffs = np.asarray(hdiffs_l, dtype=np.float32).reshape(-1)
+
+        # Decide hist threshold early (needed for gating)
+        if use_adaptive_thresholds:
+            hist_thresh_eff = _adaptive_thresh(hdiffs, 2.0, default_if_empty=float("inf")) if hist_thresh is None else float(hist_thresh)
         else:
-            deep_diffs.append(0.0)
-    
-    hdiffs = np.array(hdiffs)
-    ssim_diffs = np.array(ssim_diffs)
-    flow_mags = np.array(flow_mags)
-    deep_diffs = np.array(deep_diffs)
-    
-    # Adaptive thresholds based on local statistics
-    if use_adaptive_thresholds:
-        window_size = min(30, n // 10)  # local window
-        hist_thresh = np.median(hdiffs) + 2.0 * np.std(hdiffs) if hist_thresh is None else hist_thresh
-        ssim_thresh = np.median(ssim_diffs) + 1.5 * np.std(ssim_diffs) if ssim_thresh is None else ssim_thresh
-        flow_thresh = np.median(flow_mags) + 2.0 * np.std(flow_mags) if flow_thresh is None else flow_thresh
-        deep_thresh = np.median(deep_diffs) + 1.5 * np.std(deep_diffs) if use_deep_features else 0.0
+            hist_thresh_eff = float(hist_thresh or 0.5)
+        hist_thresh = hist_thresh_eff
+
+        # Candidate mask: keep all "near-threshold" and ensure at least top-P by histogram.
+        m = float(cascade_hist_margin or 0.0)
+        kp = float(cascade_keep_top_p)
+        kp = 1.0 if kp > 1.0 else (0.0 if kp < 0.0 else kp)
+        cand = np.zeros((exp_len,), dtype=bool)
+        if exp_len > 0:
+            cand |= (hdiffs >= (float(hist_thresh_eff) - m))
+            if kp > 0.0 and kp < 1.0:
+                try:
+                    q = float(np.quantile(hdiffs, 1.0 - kp))
+                    cand |= (hdiffs >= q)
+                except Exception:
+                    pass
+            elif kp >= 1.0:
+                cand[:] = True
+
+        # Pass 2: compute expensive signals only for candidates
+        # Use NaN for "not computed" to make encoder-side handling explicit.
+        ssim_diffs = np.full((exp_len,), np.nan, dtype=np.float32)
+        flow_mags = np.full((exp_len,), np.nan, dtype=np.float32)
+        deep_diffs = np.full((exp_len,), np.nan, dtype=np.float32)
+        did_ssim = np.zeros((exp_len,), dtype=bool)
+        did_flow = np.zeros((exp_len,), dtype=bool)
+        did_deep = np.zeros((exp_len,), dtype=bool)
+
+        prev_frame = frame_manager.get(frame_indices[0])
+        prev_gray_full = cv2.cvtColor(prev_frame, cv2.COLOR_RGB2GRAY)
+        for i in range(1, n):
+            fA = prev_frame
+            fB = frame_manager.get(frame_indices[i])
+            gray_full = cv2.cvtColor(fB, cv2.COLOR_RGB2GRAY)
+
+            j = int(i - 1)
+            if bool(cand[j]):
+                # SSIM (candidate only)
+                prev_gray_ssim = _resize_gray_max_side(prev_gray_full, int(ssim_max_side))
+                gray_ssim = _resize_gray_max_side(gray_full, int(ssim_max_side))
+                ssim_diffs[j] = float(_ssim_drop_gray(prev_gray_ssim, gray_ssim))
+                did_ssim[j] = True
+
+                # Flow magnitude
+                if ext is not None:
+                    flow_mags[j] = float(ext[j])
+                    did_flow[j] = True
+                else:
+                    prev_gray_flow = _resize_gray_max_side(prev_gray_full, int(flow_max_side))
+                    gray_flow = _resize_gray_max_side(gray_full, int(flow_max_side))
+                    flow_mag, _, _ = optical_flow_magnitude(prev_gray_flow, gray_flow)
+                    flow_mags[j] = float(flow_mag)
+                    did_flow[j] = True
+
+                # Deep features (candidate only)
+                if use_deep_features and embed_model is not None:
+                    deep_diffs[j] = float(feature_embedding_diff(fA, fB, embed_model, transform, device))
+                    did_deep[j] = True
+
+            # Keep state for next pair
+            prev_frame = fB
+            prev_gray_full = gray_full
+
+        # If flow is external, consider it "computed" everywhere (thresholds should use all values)
+        if ext is not None and exp_len > 0:
+            flow_mags = np.asarray(ext, dtype=np.float32).reshape(-1)
+            did_flow[:] = True
+
+        # Adaptive thresholds based on computed subset only (to avoid zero-padding bias)
+        if use_adaptive_thresholds:
+            ssim_vals = ssim_diffs[did_ssim]
+            flow_vals = flow_mags[did_flow]
+            deep_vals = deep_diffs[did_deep] if use_deep_features else np.zeros((0,), dtype=np.float32)
+            ssim_thresh = _adaptive_thresh(ssim_vals, 1.5, default_if_empty=float("inf")) if ssim_thresh is None else float(ssim_thresh)
+            flow_thresh = _adaptive_thresh(flow_vals, 2.0, default_if_empty=float("inf")) if flow_thresh is None else float(flow_thresh)
+            deep_thresh = _adaptive_thresh(deep_vals, 1.5, default_if_empty=float("inf")) if (use_deep_features and deep_thresh is None) else (float(deep_thresh) if use_deep_features else 0.0)
+        else:
+            ssim_thresh = float(ssim_thresh or 0.25)
+            flow_thresh = float(flow_thresh or 4.0)
+            deep_thresh = float(0.3) if use_deep_features else 0.0
+
     else:
-        hist_thresh = hist_thresh or 0.5
-        ssim_thresh = ssim_thresh or 0.25
-        flow_thresh = flow_thresh or 4.0
-        deep_thresh = 0.3 if use_deep_features else 0.0
+        # Original single-pass: compute all signals for all pairs
+        hdiffs_l: list[float] = []
+        ssim_l: list[float] = []
+        flow_l: list[float] = []
+        deep_l: list[float] = []
+
+        prev_frame = frame_manager.get(frame_indices[0])
+        prev_gray_full = cv2.cvtColor(prev_frame, cv2.COLOR_RGB2GRAY)
+        prev_gray_ssim = _resize_gray_max_side(prev_gray_full, int(ssim_max_side))
+        prev_gray_flow = _resize_gray_max_side(prev_gray_full, int(flow_max_side))
+
+        for i in range(1, n):
+            fA = prev_frame
+            fB = frame_manager.get(frame_indices[i])
+            gray_full = cv2.cvtColor(fB, cv2.COLOR_RGB2GRAY)
+            gray_ssim = _resize_gray_max_side(gray_full, int(ssim_max_side))
+            gray_flow = _resize_gray_max_side(gray_full, int(flow_max_side))
+
+            hdiffs_l.append(float(frame_histogram_diff(prev_frame, fB)))
+            ssim_l.append(float(_ssim_drop_gray(prev_gray_ssim, gray_ssim)))
+            if ext is not None:
+                flow_l.append(float(ext[int(i - 1)]))
+            else:
+                flow_mag, _, _ = optical_flow_magnitude(prev_gray_flow, gray_flow)
+                flow_l.append(float(flow_mag))
+
+            if use_deep_features and embed_model is not None:
+                deep_l.append(float(feature_embedding_diff(fA, fB, embed_model, transform, device)))
+            else:
+                deep_l.append(0.0)
+
+            prev_frame = fB
+            prev_gray_full = gray_full
+            prev_gray_ssim = gray_ssim
+            prev_gray_flow = gray_flow
+
+        hdiffs = np.asarray(hdiffs_l, dtype=np.float32).reshape(-1)
+        ssim_diffs = np.asarray(ssim_l, dtype=np.float32).reshape(-1)
+        flow_mags = np.asarray(flow_l, dtype=np.float32).reshape(-1)
+        deep_diffs = np.asarray(deep_l, dtype=np.float32).reshape(-1)
+        # In full mode everything is computed (except deep if disabled).
+        did_ssim = np.ones_like(ssim_diffs, dtype=bool)
+        did_flow = np.ones_like(flow_mags, dtype=bool)
+        did_deep = np.ones_like(deep_diffs, dtype=bool) if use_deep_features else np.zeros_like(deep_diffs, dtype=bool)
     
-    # Compute scores
-    scores = np.zeros(len(hdiffs))
-    scores += (hdiffs > hist_thresh).astype(float)
-    scores += (ssim_diffs > ssim_thresh).astype(float)
-    scores += (flow_mags > flow_thresh).astype(float)
+    # Adaptive thresholds based on local statistics (single-pass mode only; cascade computed above)
+    if not bool(cascade_enabled):
+        if use_adaptive_thresholds:
+            hist_thresh = _adaptive_thresh(hdiffs, 2.0, default_if_empty=float("inf")) if hist_thresh is None else float(hist_thresh)
+            ssim_thresh = _adaptive_thresh(ssim_diffs, 1.5, default_if_empty=float("inf")) if ssim_thresh is None else float(ssim_thresh)
+            flow_thresh = _adaptive_thresh(flow_mags, 2.0, default_if_empty=float("inf")) if flow_thresh is None else float(flow_thresh)
+            deep_thresh = _adaptive_thresh(deep_diffs, 1.5, default_if_empty=float("inf")) if use_deep_features else 0.0
+        else:
+            hist_thresh = float(hist_thresh or 0.5)
+            ssim_thresh = float(ssim_thresh or 0.25)
+            flow_thresh = float(flow_thresh or 4.0)
+            deep_thresh = float(0.3) if use_deep_features else 0.0
+    
+    # Compute scores (raw, before postprocessing)
+    trig_hist = (hdiffs > hist_thresh)
+    trig_ssim = (ssim_diffs > ssim_thresh)
+    trig_flow = (flow_mags > flow_thresh)
+    trig_deep = (deep_diffs > deep_thresh) if use_deep_features else np.zeros_like(trig_hist, dtype=bool)
+
+    scores = np.zeros(len(hdiffs), dtype=np.float32)
+    scores += trig_hist.astype(np.float32)
+    scores += trig_ssim.astype(np.float32)
+    scores += trig_flow.astype(np.float32)
     if use_deep_features:
-        scores += (deep_diffs > deep_thresh).astype(float)
+        scores += trig_deep.astype(np.float32)
     
-    # Temporal smoothing to reduce false positives
-    if temporal_smoothing and len(scores) > 3:
-        # Apply median filter for robustness (removes spikes)
-        scores_median = medfilt(scores.astype(float), kernel_size=3)
-        # Apply Gaussian smoothing
-        scores_smooth = gaussian_filter1d(scores_median, sigma=1.0)
-        # Require local maximum
-        cut_candidates = []
-        for i in range(1, len(scores_smooth)-1):
-            if scores_smooth[i] > scores_smooth[i-1] and scores_smooth[i] > scores_smooth[i+1]:
-                if scores_smooth[i] >= 2.0:  # require at least two signals
-                    cut_candidates.append((i+1, scores_smooth[i]))  # +1 because indices start from frame 1
-    else:
-        cut_candidates = [(i+1, s) for i, s in enumerate(scores) if s >= 2.0]
+    # Temporal smoothing to reduce false positives.
+    #
+    # IMPORTANT: `scores` is a small integer-like signal (0..3 for CPU-no-deep).
+    # Gaussian smoothing + strict local-max filtering can suppress isolated true hard-cuts
+    # (common pattern: [0,0,3,0,0] -> smoothed peak < 2). For hard-cuts we want to keep
+    # isolated spikes and rely on min-distance + (optional) morphological cleaning instead.
+    # NOTE: median/gaussian smoothing on a sparse integer score tends to erase isolated true cuts.
+    # For hard cuts we keep the thresholded signal and rely on min-distance + morphological cleaning.
+    cut_candidates = [(i + 1, float(s)) for i, s in enumerate(scores) if float(s) >= 2.0]
     
     # Morphological cleaning: remove isolated detections
     cut_flag_array = np.zeros(len(frame_indices) - 1, dtype=int)
@@ -351,9 +526,55 @@ def detect_hard_cuts(
             cut_idxs.append(idx)
             strengths.append(float(strength))
     
+    if bool(return_model_facing):
+        flow_source = "core_optical_flow" if ext is not None else "internal_farneback"
+        flow_mag_units = "core_optical_flow_norm_per_sec_mean" if ext is not None else "farneback_mean_mag_px"
+        debug = {
+            "hist_diff_l1": np.asarray(hdiffs, dtype=np.float32),
+            "ssim_drop": np.asarray(ssim_diffs, dtype=np.float32),
+            "flow_mag": np.asarray(flow_mags, dtype=np.float32),
+            "hard_score": np.asarray(scores, dtype=np.float32),
+            "deep_cosine_dist": (np.asarray(deep_diffs, dtype=np.float32) if use_deep_features else None),
+            "valid_mask": {
+                "ssim": np.asarray(did_ssim, dtype=bool) if "did_ssim" in locals() else np.ones_like(scores, dtype=bool),
+                "flow": np.asarray(did_flow, dtype=bool) if "did_flow" in locals() else np.ones_like(scores, dtype=bool),
+                "deep": np.asarray(did_deep, dtype=bool) if "did_deep" in locals() else np.zeros_like(scores, dtype=bool),
+            },
+            "thresholds": {
+                "hist": float(hist_thresh),
+                "ssim": float(ssim_thresh),
+                "flow": float(flow_thresh),
+                "deep": float(deep_thresh) if use_deep_features else 0.0,
+            },
+            "triggers": {
+                "hist": np.asarray(trig_hist, dtype=bool),
+                "ssim": np.asarray(trig_ssim, dtype=bool),
+                "flow": np.asarray(trig_flow, dtype=bool),
+                "deep": np.asarray(trig_deep, dtype=bool),
+            },
+            "cascade": {
+                "enabled": bool(cascade_enabled),
+                "keep_top_p": float(cascade_keep_top_p),
+                "hist_margin": float(cascade_hist_margin),
+            },
+            "flow_source": str(flow_source),
+            "flow_mag_units": str(flow_mag_units),
+        }
+        return cut_idxs, strengths, debug
+
     return cut_idxs, strengths
 
-def detect_soft_cuts(frame_manager, frame_indices, fps, fade_threshold=0.02, min_duration_frames=4, use_flow_consistency=True):
+def detect_soft_cuts(
+    frame_manager,
+    frame_indices,
+    fps,
+    fade_threshold=0.02,
+    min_duration_frames=4,
+    use_flow_consistency=True,
+    flow_max_side: int = 0,
+    external_flow_mags: Optional[np.ndarray] = None,
+    return_model_facing: bool = False,
+):
     """
     Improved soft cut detection with gradient-based analysis and optical flow consistency.
     Detect fade-in/out and dissolves by monitoring brightness/histogram changes over a window.
@@ -361,16 +582,29 @@ def detect_soft_cuts(frame_manager, frame_indices, fps, fade_threshold=0.02, min
     """
     n = len(frame_indices)
     if n < 3:
-        return []
+        return ([], {}) if bool(return_model_facing) else []
     
     # Multi-channel gradient analysis (HSV + Lab)
-    hsv_values = []
-    lab_values = []
-    hist_diffs = []
-    flow_mags = []
+    hsv_values: List[float] = []
+    lab_values: List[float] = []
+    hist_diffs_pair: List[float] = []   # (N-1,)
+    flow_mags_pair: List[float] = []    # (N-1,)
+    flow_valid_mask: List[bool] = []    # (N-1,)
     
-    prev_gray = cv2.cvtColor(frame_manager.get(frame_indices[0]), cv2.COLOR_RGB2GRAY)
+    prev_gray_full = cv2.cvtColor(frame_manager.get(frame_indices[0]), cv2.COLOR_RGB2GRAY)
+    prev_gray = _resize_gray_max_side(prev_gray_full, int(flow_max_side))
     prev_hsv_hist = None
+
+    ext = None
+    if external_flow_mags is not None:
+        try:
+            ext = np.asarray(external_flow_mags, dtype=np.float32).reshape(-1)
+        except Exception:
+            ext = None
+        if ext is not None and int(ext.size) != int(max(0, n - 1)):
+            raise RuntimeError(
+                f"detect_soft_cuts | external_flow_mags length mismatch: got {int(ext.size)} expected {int(max(0, n-1))}"
+            )
     
     for i, idx in enumerate(frame_indices):
         f = frame_manager.get(idx)
@@ -390,31 +624,35 @@ def detect_soft_cuts(frame_manager, frame_indices, fps, fade_threshold=0.02, min
         hsv_hist = hsv_hist / (hsv_hist.sum() + 1e-9)
         if prev_hsv_hist is not None:
             hist_diff = float(np.linalg.norm(hsv_hist - prev_hsv_hist, ord=1))
-            hist_diffs.append(hist_diff)
-        else:
-            hist_diffs.append(0.0)
+            hist_diffs_pair.append(hist_diff)
+        prev_hsv_hist = hsv_hist
         prev_hsv_hist = hsv_hist
         
-        # Optical flow for consistency check
+        # Optical flow magnitude (per-pair) for consistency check
         if i > 0:
-            gray = cv2.cvtColor(f, cv2.COLOR_RGB2GRAY)
-            flow_mag, _, _ = optical_flow_magnitude(prev_gray, gray)
-            flow_mags.append(flow_mag)
-            prev_gray = gray
-        else:
-            flow_mags.append(0.0)
+            j = int(i - 1)
+            if ext is not None:
+                flow_mags_pair.append(float(ext[j]))
+                flow_valid_mask.append(True)
+            else:
+                gray_full = cv2.cvtColor(f, cv2.COLOR_RGB2GRAY)
+                gray = _resize_gray_max_side(gray_full, int(flow_max_side))
+                flow_mag, _, _ = optical_flow_magnitude(prev_gray, gray)
+                flow_mags_pair.append(float(flow_mag))
+                flow_valid_mask.append(True)
+                prev_gray = gray
     
-    hsv_values = np.array(hsv_values)
-    lab_values = np.array(lab_values)
-    hist_diffs = np.array(hist_diffs)
-    flow_mags = np.array(flow_mags)
+    hsv_values_np = np.asarray(hsv_values, dtype=np.float32)
+    lab_values_np = np.asarray(lab_values, dtype=np.float32)
+    hist_diffs_np = np.asarray(hist_diffs_pair, dtype=np.float32)  # (N-1,)
+    flow_mags_np = np.asarray(flow_mags_pair, dtype=np.float32)    # (N-1,)
     
     events = []
     
     # Fade detection: gradient-based with cumulative distribution
-    hsv_deriv = np.diff(hsv_values)
-    lab_deriv = np.diff(lab_values)
-    hist_deriv = np.diff(hist_diffs)
+    hsv_deriv = np.diff(hsv_values_np)
+    lab_deriv = np.diff(lab_values_np)
+    hist_deriv = np.diff(hist_diffs_np) if hist_diffs_np.size > 1 else np.zeros((0,), dtype=np.float32)
     
     # Smooth derivatives
     hsv_smooth = medfilt(hsv_deriv, kernel_size=5)
@@ -433,12 +671,14 @@ def detect_soft_cuts(frame_manager, frame_indices, fps, fade_threshold=0.02, min
                 j += 1
             duration = j - i
             if duration >= min_duration_frames:
-                hsv_change = abs(hsv_values[j] - hsv_values[i]) if j < len(hsv_values) else 0
-                lab_change = abs(lab_values[j] - lab_values[i]) if j < len(lab_values) else 0
+                hsv_change = abs(hsv_values_np[j] - hsv_values_np[i]) if j < len(hsv_values_np) else 0
+                lab_change = abs(lab_values_np[j] - lab_values_np[i]) if j < len(lab_values_np) else 0
                 if hsv_change > fade_threshold or lab_change > fade_threshold:
-                    typ = 'fade_in' if (hsv_values[j] > hsv_values[i] if j < len(hsv_values) else False) else 'fade_out'
-                    events.append({'type': typ, 'start': i, 'end': min(j, len(frame_indices)-1), 
-                                 'duration_s': seconds_from_fps(duration, fps)})
+                    typ = 'fade_in' if (hsv_values_np[j] > hsv_values_np[i] if j < len(hsv_values_np) else False) else 'fade_out'
+                    # NOTE: duration_s will be re-computed by caller using union_timestamps_sec (source-of-truth).
+                    start = i
+                    end = min(j, len(frame_indices)-1)
+                    events.append({'type': typ, 'start': start, 'end': end, 'duration_s': float("nan")})
             i = j
         else:
             i += 1
@@ -449,8 +689,11 @@ def detect_soft_cuts(frame_manager, frame_indices, fps, fade_threshold=0.02, min
         window_size = min(10, n // 5)
         for i in range(window_size, n - window_size):
             # Check for gradual histogram change
-            hist_window = hist_diffs[i-window_size//2:i+window_size//2]
-            flow_window = flow_mags[i-window_size//2:i+window_size//2]
+            # hist_diffs_np/flow_mags_np are per-pair => align with center pair index (i-1)
+            p = max(0, min(int(i - 1), int(n - 2)))
+            ws = int(window_size // 2)
+            hist_window = hist_diffs_np[max(0, p - ws): min(int(n - 1), p + ws)]
+            flow_window = flow_mags_np[max(0, p - ws): min(int(n - 1), p + ws)]
             
             # Gradual histogram change (low variance in changes)
             hist_var = np.var(hist_window)
@@ -459,8 +702,8 @@ def detect_soft_cuts(frame_manager, frame_indices, fps, fade_threshold=0.02, min
             
             # Check for exposure changes (global brightness shift across entire frame)
             # Exposure changes affect entire frame uniformly, dissolves affect content distribution
-            hsv_window = hsv_values[i-window_size//2:i+window_size//2]
-            lab_window = lab_values[i-window_size//2:i+window_size//2]
+            hsv_window = hsv_values_np[i-window_size//2:i+window_size//2]
+            lab_window = lab_values_np[i-window_size//2:i+window_size//2]
             hsv_gradient = np.abs(np.diff(hsv_window))
             lab_gradient = np.abs(np.diff(lab_window))
             # Low gradient variance = uniform exposure change (not dissolve)
@@ -469,7 +712,7 @@ def detect_soft_cuts(frame_manager, frame_indices, fps, fade_threshold=0.02, min
             
             # Dissolve: gradual histogram change + low motion + not exposure change
             # Also check for linear correlation in histogram changes (dissolve = linear mixing)
-            hist_window_full = hist_diffs[max(0, i-window_size):min(n, i+window_size)]
+            hist_window_full = hist_diffs_np[max(0, p - window_size): min(int(n - 1), p + window_size)]
             if len(hist_window_full) > 3:
                 # Compute correlation of histogram changes (should be smooth/linear for dissolve)
                 hist_correlation = np.corrcoef(hist_window_full[:-1], hist_window_full[1:])[0, 1] if len(hist_window_full) > 1 else 0
@@ -482,11 +725,23 @@ def detect_soft_cuts(frame_manager, frame_indices, fps, fade_threshold=0.02, min
                 # Check if not already detected as fade
                 is_fade = any(e['start'] <= i <= e['end'] for e in events)
                 if not is_fade:
-                    events.append({'type': 'dissolve', 'start': i - window_size//2, 
-                                 'end': i + window_size//2, 
-                                 'duration_s': seconds_from_fps(window_size, fps)})
+                    start = i - window_size//2
+                    end = i + window_size//2
+                    events.append({'type': 'dissolve', 'start': start, 'end': end, 'duration_s': float("nan")})
     
+    if bool(return_model_facing):
+        dbg = {
+            "soft_hsv_v": hsv_values_np.astype(np.float32, copy=False),
+            "soft_lab_l": lab_values_np.astype(np.float32, copy=False),
+            "soft_hist_diff_l1": hist_diffs_np.astype(np.float32, copy=False),   # (N-1,)
+            "soft_flow_mag": flow_mags_np.astype(np.float32, copy=False),       # (N-1,)
+            "soft_flow_valid_mask": np.asarray(flow_valid_mask, dtype=bool).reshape(-1),
+            "soft_flow_source": ("core_optical_flow" if ext is not None else "internal_farneback"),
+        }
+        return events, dbg
+
     return events
+
 
 def detect_motion_based_cuts(
     frame_manager,
@@ -495,7 +750,11 @@ def detect_motion_based_cuts(
     use_direction_analysis=True, 
     adaptive_threshold=True, 
     detect_speed_ramps=True,
-    use_camera_motion_compensation=True
+    use_camera_motion_compensation=True,
+    flow_max_side: int = 0,
+    external_flow_mags: Optional[np.ndarray] = None,
+    motion_cascade_enabled: bool = True,
+    return_model_facing: bool = False,
 ):
     """
     Improved motion-based cut detection with direction analysis and adaptive thresholds.
@@ -504,146 +763,246 @@ def detect_motion_based_cuts(
     """
     n = len(frame_indices)
     if n < 2:
-        return [], [], []
+        return ([], [], [], {}) if bool(return_model_facing) else ([], [], [])
     
-    mags = []
-    angles_list = []
-    direction_consistencies = []
-    mag_variances = []  # For speed ramp detection
-    
-    prev_gray = cv2.cvtColor(frame_manager.get(frame_indices[0]), cv2.COLOR_RGB2GRAY)
-    prev_mag_map = None
-    
-    # Resize frames for faster flow computation if large
-    sample_frame = frame_manager.get(frame_indices[0])
-    h, w = sample_frame.shape[:2]
-    use_low_res = (h * w > 640 * 480)  # Use low-res for large frames
-    target_size = (256, 256) if use_low_res else None
-    
-    for i in range(1, n):
-        gray = cv2.cvtColor(frame_manager.get(frame_indices[i]), cv2.COLOR_RGB2GRAY)
-        
-        # Camera motion compensation: estimate global motion
-        is_camera_motion = False
-        if use_camera_motion_compensation:
-            H, inlier_ratio = estimate_global_motion_homography(prev_gray, gray)
-            # If high inlier ratio, motion is mostly global (camera motion)
-            # Subtract global motion contribution for object motion detection
-            is_camera_motion = inlier_ratio > 0.7 if H is not None else False
-        
-        # Compute flow (on low-res if needed)
-        if use_low_res:
-            prev_gray_small = cv2.resize(prev_gray, target_size)
-            gray_small = cv2.resize(gray, target_size)
-            mag, mag_map, angles = optical_flow_magnitude(prev_gray_small, gray_small)
-            # Scale magnitude back to original frame size
-            mag = mag * (h * w) / (target_size[0] * target_size[1])
-        else:
-            mag, mag_map, angles = optical_flow_magnitude(prev_gray, gray)
-        
-        # Store camera motion flag (will use later for classification)
-        mags.append((mag, is_camera_motion))
-        angles_list.append(angles)
-        
-        # Direction consistency
-        if angles is not None and use_direction_analysis:
-            consistency = optical_flow_direction_consistency(angles)
-            direction_consistencies.append(consistency)
-        else:
-            direction_consistencies.append(0.0)
-        
-        # Speed ramp detection: analyze variance in flow magnitude across frame
-        # Speed ramps show high variance in magnitude (fast motion in center, slow at edges)
-        if detect_speed_ramps and mag_map is not None:
-            mag_variance = float(np.var(mag_map))
-            mag_variances.append(mag_variance)
-        else:
-            mag_variances.append(0.0)
-        
-        prev_gray = gray
-        prev_mag_map = mag_map
-    
-    # Extract magnitudes and camera motion flags
-    mags_array = np.array([m[0] for m in mags])
-    camera_motion_flags = [m[1] for m in mags]
-    direction_consistencies = np.array(direction_consistencies)
-    mag_variances = np.array(mag_variances)
-    
-    # Adaptive threshold using percentiles or z-score
+    ext = None
+    if external_flow_mags is not None:
+        try:
+            ext = np.asarray(external_flow_mags, dtype=np.float32).reshape(-1)
+        except Exception:
+            ext = None
+        if ext is not None and int(ext.size) != int(max(0, n - 1)):
+            raise RuntimeError(
+                f"detect_motion_based_cuts | external_flow_mags length mismatch: got {int(ext.size)} expected {int(max(0, n-1))}"
+            )
+
+    exp_len = int(max(0, n - 1))
+    mags_array = np.zeros((exp_len,), dtype=np.float32)
+    if ext is not None:
+        mags_array = np.asarray(ext, dtype=np.float32).reshape(-1)
+
+    # Debug curves: fill NaN where not computed.
+    motion_flow_mag = mags_array.astype(np.float32, copy=False) if exp_len > 0 else np.zeros((0,), dtype=np.float32)
+    motion_dir_consistency = np.full((exp_len,), np.nan, dtype=np.float32)
+    motion_mag_variance = np.full((exp_len,), np.nan, dtype=np.float32)
+    motion_camera_motion_flag = np.zeros((exp_len,), dtype=bool)
+    motion_dir_valid_mask = np.zeros((exp_len,), dtype=bool)
+    motion_var_valid_mask = np.zeros((exp_len,), dtype=bool)
+    motion_cam_valid_mask = np.zeros((exp_len,), dtype=bool)
+
+    # For non-external mode or if we disable cascade, fall back to original full compute.
+    if ext is None or not bool(motion_cascade_enabled):
+        mags = []
+        direction_consistencies = []
+        mag_variances = []  # For speed ramp detection
+        camera_motion_flags = []
+
+        prev_gray = cv2.cvtColor(frame_manager.get(frame_indices[0]), cv2.COLOR_RGB2GRAY)
+        # Resize frames for faster flow computation if large (or if explicitly requested).
+        sample_frame = frame_manager.get(frame_indices[0])
+        h, w = sample_frame.shape[:2]
+        fm_side = int(flow_max_side) if flow_max_side is not None else 0
+        use_low_res = bool(fm_side > 0) or (h * w > 640 * 480)
+        target_size = (fm_side, fm_side) if fm_side > 0 else ((256, 256) if use_low_res else None)
+
+        for i in range(1, n):
+            gray = cv2.cvtColor(frame_manager.get(frame_indices[i]), cv2.COLOR_RGB2GRAY)
+
+            is_camera_motion = False
+            if use_camera_motion_compensation:
+                H, inlier_ratio = estimate_global_motion_homography(prev_gray, gray)
+                is_camera_motion = inlier_ratio > 0.7 if H is not None else False
+
+            if use_low_res and target_size is not None:
+                prev_gray_small = cv2.resize(prev_gray, target_size)
+                gray_small = cv2.resize(gray, target_size)
+                mag, mag_map, angles = optical_flow_magnitude(prev_gray_small, gray_small)
+                mag = mag * (h * w) / float(max(1, int(target_size[0]) * int(target_size[1])))
+            else:
+                mag, mag_map, angles = optical_flow_magnitude(prev_gray, gray)
+
+            mags.append(float(mag))
+            camera_motion_flags.append(bool(is_camera_motion))
+
+            if angles is not None and use_direction_analysis:
+                direction_consistencies.append(float(optical_flow_direction_consistency(angles)))
+            else:
+                direction_consistencies.append(0.0)
+
+            if detect_speed_ramps and mag_map is not None:
+                mag_variances.append(float(np.var(mag_map)))
+            else:
+                mag_variances.append(0.0)
+
+            prev_gray = gray
+
+        mags_array = np.asarray(mags, dtype=np.float32).reshape(-1)
+        camera_motion_flags_np = np.asarray(camera_motion_flags, dtype=bool).reshape(-1)
+        direction_consistencies_np = np.asarray(direction_consistencies, dtype=np.float32).reshape(-1)
+        mag_variances_np = np.asarray(mag_variances, dtype=np.float32).reshape(-1)
+
+        motion_flow_mag = mags_array
+        motion_camera_motion_flag = camera_motion_flags_np
+        motion_cam_valid_mask[:] = True
+        if use_direction_analysis:
+            motion_dir_consistency = direction_consistencies_np.astype(np.float32, copy=False)
+            motion_dir_valid_mask[:] = True
+        motion_mag_variance = mag_variances_np.astype(np.float32, copy=False)
+        motion_var_valid_mask[:] = bool(detect_speed_ramps)
+
+    # Thresholds based on mags_array (either external or computed)
     if adaptive_threshold:
         if flow_spike_factor is None:
-            # Use 95th percentile as threshold
-            threshold = np.percentile(mags_array, 95)
+            threshold = float(np.percentile(mags_array, 95)) if mags_array.size else float("inf")
         else:
-            median = np.median(mags_array)
-            std = np.std(mags_array) + 1e-9
-            threshold = median + flow_spike_factor * std
+            median = float(np.median(mags_array)) if mags_array.size else 0.0
+            std = float(np.std(mags_array)) + 1e-9
+            threshold = median + float(flow_spike_factor) * std
     else:
-        median = np.median(mags_array)
-        std = np.std(mags_array) + 1e-9
-        threshold = median + (flow_spike_factor or 3.0) * std
-    
-    # Speed ramp threshold: high magnitude + high variance
-    speed_ramp_threshold = np.percentile(mag_variances, 90) if len(mag_variances) > 0 else 0.0
-    
-    # Find spikes (exclude pure camera motion if compensation enabled)
-    spike_mask = mags_array > threshold
-    if use_camera_motion_compensation:
-        # Filter out spikes that are pure camera motion (already handled by hard cuts)
-        spike_mask = spike_mask & ~np.array(camera_motion_flags)
-    
-    spike_idxs = np.where(spike_mask)[0] + 1  # +1 because indices start from frame 1
-    intensities = mags_array[spike_idxs-1].tolist()
-    
-    # Classify as whip pan vs zoom vs speed ramp using direction consistency and variance
-    types = []
-    if use_direction_analysis:
-        for idx in spike_idxs:
-            if idx-1 < len(direction_consistencies):
-                consistency = direction_consistencies[idx-1]
-                mag_var = mag_variances[idx-1] if idx-1 < len(mag_variances) else 0.0
-                is_cam_motion = camera_motion_flags[idx-1] if idx-1 < len(camera_motion_flags) else False
-                
-                # Speed ramp: high magnitude + high variance (fast motion gradient)
-                if detect_speed_ramps and mag_var > speed_ramp_threshold:
-                    types.append('speed_ramp')
-                # High consistency + high magnitude + camera motion = whip pan
-                elif consistency > 0.6 or is_cam_motion:
-                    types.append('whip_pan')
-                # Low consistency + high magnitude = zoom (object motion)
-                else:
-                    types.append('zoom')
+        median = float(np.median(mags_array)) if mags_array.size else 0.0
+        std = float(np.std(mags_array)) + 1e-9
+        threshold = median + float(flow_spike_factor or 3.0) * std
+
+    spike_mask = mags_array > float(threshold)
+
+    # External+cascade path: compute camera motion + direction + variance ONLY for candidate spikes.
+    if ext is not None and bool(motion_cascade_enabled) and spike_mask.size:
+        prev_gray = cv2.cvtColor(frame_manager.get(frame_indices[0]), cv2.COLOR_RGB2GRAY)
+        sample_frame = frame_manager.get(frame_indices[0])
+        h, w = sample_frame.shape[:2]
+        fm_side = int(flow_max_side) if flow_max_side is not None else 0
+        use_low_res = bool(fm_side > 0) or (h * w > 640 * 480)
+        target_size = (fm_side, fm_side) if fm_side > 0 else ((256, 256) if use_low_res else None)
+
+        spike_js = np.where(spike_mask)[0]  # 0-based pair indices
+        for j in spike_js.tolist():
+            i = int(j + 1)  # frame position index in [1..n-1]
+            if i <= 0 or i >= n:
+                continue
+            gray_prev = cv2.cvtColor(frame_manager.get(frame_indices[i - 1]), cv2.COLOR_RGB2GRAY)
+            gray = cv2.cvtColor(frame_manager.get(frame_indices[i]), cv2.COLOR_RGB2GRAY)
+
+            is_camera_motion = False
+            if use_camera_motion_compensation:
+                H, inlier_ratio = estimate_global_motion_homography(gray_prev, gray)
+                is_camera_motion = inlier_ratio > 0.7 if H is not None else False
+                motion_camera_motion_flag[j] = bool(is_camera_motion)
+                motion_cam_valid_mask[j] = True
+
+            if use_camera_motion_compensation and bool(is_camera_motion):
+                continue  # filtered out later (same logic as original)
+
+            # Compute angles + mag_map for classification
+            if use_low_res and target_size is not None:
+                prev_small = cv2.resize(gray_prev, target_size)
+                curr_small = cv2.resize(gray, target_size)
+                _, mag_map, angles = optical_flow_magnitude(prev_small, curr_small)
             else:
-                types.append('unknown')
+                _, mag_map, angles = optical_flow_magnitude(gray_prev, gray)
+
+            if angles is not None and use_direction_analysis:
+                motion_dir_consistency[j] = float(optical_flow_direction_consistency(angles))
+                motion_dir_valid_mask[j] = True
+
+            if detect_speed_ramps and mag_map is not None:
+                motion_mag_variance[j] = float(np.var(mag_map))
+                motion_var_valid_mask[j] = True
+
+        # Apply camera-motion filter
+        if use_camera_motion_compensation:
+            spike_mask = spike_mask & ~motion_camera_motion_flag
+
+    spike_idxs = np.where(spike_mask)[0] + 1
+    intensities = mags_array[spike_idxs - 1].tolist() if spike_idxs.size else []
+
+    # Speed ramp threshold computed on available variances (spike-only in cascade mode)
+    vv = motion_mag_variance[np.isfinite(motion_mag_variance)]
+    speed_ramp_threshold = float(np.percentile(vv, 90)) if (detect_speed_ramps and vv.size > 0) else 0.0
+
+    types: List[str] = []
+    if use_direction_analysis:
+        for idx in spike_idxs.tolist():
+            j = int(idx - 1)
+            consistency = float(motion_dir_consistency[j]) if (j < exp_len and np.isfinite(motion_dir_consistency[j])) else 0.0
+            mag_var = float(motion_mag_variance[j]) if (j < exp_len and np.isfinite(motion_mag_variance[j])) else 0.0
+            is_cam_motion = bool(motion_camera_motion_flag[j]) if j < exp_len else False
+            if detect_speed_ramps and mag_var > speed_ramp_threshold:
+                types.append("speed_ramp")
+            elif consistency > 0.6 or is_cam_motion:
+                types.append("whip_pan")
+            else:
+                types.append("zoom")
     else:
-        types = ['motion_cut'] * len(spike_idxs)
-    
+        types = ["motion_cut"] * int(len(spike_idxs))
+
+    if bool(return_model_facing):
+        dbg = {
+            "motion_flow_mag": motion_flow_mag.astype(np.float32, copy=False),
+            "motion_dir_consistency": motion_dir_consistency.astype(np.float32, copy=False),
+            "motion_mag_variance": motion_mag_variance.astype(np.float32, copy=False),
+            "motion_camera_motion_flag": motion_camera_motion_flag.astype(bool, copy=False),
+            "motion_dir_valid_mask": motion_dir_valid_mask.astype(bool, copy=False),
+            "motion_var_valid_mask": motion_var_valid_mask.astype(bool, copy=False),
+            "motion_cam_valid_mask": motion_cam_valid_mask.astype(bool, copy=False),
+            "motion_flow_source": ("core_optical_flow" if ext is not None else "internal_farneback"),
+            "motion_threshold": float(threshold),
+        }
+        return spike_idxs.tolist(), intensities, types, dbg
+
     return spike_idxs.tolist(), intensities, types
 
-# Stylized transitions classifier (zero-shot with CLIP if available)
+# Stylized transitions classifier (zero-shot with CLIP via Triton).
 class StylizedTransitionZeroShot:
-    def __init__(self, device='cpu', use_temporal_aggregation=True, use_multimodal=True):
-        self.device = device
-        self.use_temporal_aggregation = use_temporal_aggregation
-        self.use_multimodal = use_multimodal
-        self.labels = [
-            "hard cut",
-            "fade",
-            "dissolve",
-            "whip pan",
-            "zoom transition",
-            "wipe transition",
-            "slide transition",
-            "glitch transition",
-            "flash transition",
-            "luma wipe transition"
-        ]
-        if clip is None or torch is None:
-            raise RuntimeError("cut_detection | CLIP (python package `clip`) + torch are required when use_clip=true")
-        self.model, self.preprocess = clip.load("ViT-B/32", device=device)
-        self.text_tokens = clip.tokenize(self.labels).to(device)
-        # Feature cache for efficiency
-        self.feature_cache = {}
+    """
+    Baseline policy:
+    - NO local CLIP weights in this module (no-network).
+    - text embeddings are produced by `core_clip` and loaded from its NPZ artifact.
+    - image embeddings are produced via Triton CLIP image encoder (resolved via ModelManager).
+    """
+
+    _CLIP_MEAN = np.asarray([0.48145466, 0.4578275, 0.40821073], dtype=np.float32)
+    _CLIP_STD = np.asarray([0.26862954, 0.26130258, 0.27577711], dtype=np.float32)
+
+    def __init__(
+        self,
+        *,
+        client,
+        triton_model_name: str,
+        triton_model_version: Optional[str],
+        triton_input_name: str,
+        triton_output_name: str,
+        triton_input_datatype: str,
+        prompts: List[str],
+        text_embeddings: np.ndarray,
+        use_temporal_aggregation: bool = True,
+        use_multimodal: bool = True,
+        image_size: int = 224,
+    ):
+        self.client = client
+        self.triton_model_name = str(triton_model_name)
+        self.triton_model_version = str(triton_model_version) if triton_model_version else None
+        self.triton_input_name = str(triton_input_name)
+        self.triton_output_name = str(triton_output_name)
+        self.triton_input_datatype = str(triton_input_datatype or "FP32")
+        self.use_temporal_aggregation = bool(use_temporal_aggregation)
+        self.use_multimodal = bool(use_multimodal)
+        self.image_size = int(image_size)
+
+        self.labels = [str(x) for x in (prompts or [])]
+        if not self.labels:
+            raise RuntimeError("cut_detection | core_clip prompts are missing/empty (no-fallback)")
+
+        te = np.asarray(text_embeddings, dtype=np.float32)
+        if te.ndim != 2 or te.shape[0] != len(self.labels):
+            raise RuntimeError(
+                f"cut_detection | invalid core_clip text_embeddings shape: {te.shape} (expected [P,D], P={len(self.labels)})"
+            )
+        # Ensure normalized embeddings (core_clip already normalizes, but we enforce anyway).
+        norms = np.linalg.norm(te, axis=-1, keepdims=True) + 1e-9
+        self.text_embeddings = te / norms
+
+        # Feature cache for efficiency (cache_key -> np.ndarray[D])
+        self.feature_cache: Dict[Any, np.ndarray] = {}
     
     def get_edit_style_labels(self):
         """Return labels for edit style classification from FEATURES.MD"""
@@ -695,6 +1054,30 @@ class StylizedTransitionZeroShot:
         
         return combined
 
+    def _preprocess_one(self, img_rgb_uint8: np.ndarray) -> np.ndarray:
+        """
+        Preprocess RGB uint8 image to CLIP float32 tensor: (1,3,S,S)
+        """
+        try:
+            from PIL import Image  # type: ignore
+        except Exception as e:
+            raise RuntimeError(f"cut_detection | PIL is required for CLIP preprocess: {e}") from e
+
+        s = int(self.image_size)
+        pil = Image.fromarray(img_rgb_uint8)
+        pil = pil.resize((s, s), resample=Image.BICUBIC)
+        arr = np.asarray(pil, dtype=np.float32) / 255.0
+        arr = (arr - self._CLIP_MEAN) / (self._CLIP_STD + 1e-12)
+        arr = np.transpose(arr, (2, 0, 1)).astype(np.float32)
+        return arr[None, ...]
+
+    @staticmethod
+    def _softmax(x: np.ndarray) -> np.ndarray:
+        x = np.asarray(x, dtype=np.float32).reshape(-1)
+        x = x - float(np.max(x))
+        e = np.exp(x)
+        return e / (float(np.sum(e)) + 1e-9)
+
     def predict_transition(self, frames_window, cache_key=None):
         """
         Improved transition prediction with temporal aggregation and multi-modal input.
@@ -702,7 +1085,7 @@ class StylizedTransitionZeroShot:
         Return probs per label (zero-shot)
         """
         # Use cache if available
-        if cache_key and cache_key in self.feature_cache:
+        if cache_key is not None and cache_key in self.feature_cache:
             img_feat = self.feature_cache[cache_key]
         else:
             # Create input: multi-modal or single frame
@@ -711,26 +1094,30 @@ class StylizedTransitionZeroShot:
                 if input_img is None:
                     input_img = frames_window[len(frames_window)//2]
             else:
-                mid = frames_window[len(frames_window)//2]
-                input_img = mid
-            
-            pil = ImageFromRGB(input_img) if isinstance(input_img, np.ndarray) else input_img
-            image_input = self.preprocess(pil).unsqueeze(0).to(self.device)
-            
-            with torch.no_grad():
-                img_feat = self.model.encode_image(image_input)
-                img_feat = img_feat / (img_feat.norm(dim=-1, keepdim=True)+1e-9)
-            
-            if cache_key:
+                input_img = frames_window[len(frames_window)//2]
+
+            if not isinstance(input_img, np.ndarray):
+                raise RuntimeError("cut_detection | expected RGB ndarray input for CLIP preprocess (no-fallback)")
+            inp = self._preprocess_one(input_img)  # (1,3,S,S) float32
+
+            res = self.client.infer(
+                model_name=self.triton_model_name,
+                model_version=self.triton_model_version,
+                input_name=self.triton_input_name,
+                input_tensor=inp,
+                output_name=self.triton_output_name,
+                datatype=self.triton_input_datatype,
+            )
+            out = np.asarray(res.output, dtype=np.float32).reshape(1, -1)
+            out = out / (np.linalg.norm(out, axis=-1, keepdims=True) + 1e-9)
+            img_feat = out.reshape(-1)
+            if cache_key is not None:
                 self.feature_cache[cache_key] = img_feat
-        
-        # Compute similarity with text features
-        with torch.no_grad():
-            txt_feat = self.model.encode_text(self.text_tokens)
-            txt_feat = txt_feat / (txt_feat.norm(dim=-1, keepdim=True)+1e-9)
-            logits = (img_feat @ txt_feat.T).softmax(dim=-1).cpu().numpy()[0]
-        
-        return {self.labels[i]: float(logits[i]) for i in range(len(self.labels))}
+
+        # Compute similarity with cached core_clip text embeddings
+        logits = np.matmul(img_feat.reshape(1, -1), self.text_embeddings.T).reshape(-1)
+        probs = self._softmax(logits)
+        return {self.labels[i]: float(probs[i]) for i in range(len(self.labels))}
     
     def predict_transition_temporal(self, frames_window, window_size=5):
         """Temporal aggregation: average probabilities over a window."""
@@ -1411,6 +1798,52 @@ def shot_length_stats(shot_frame_lengths, fps):
         'shot_length_histogram': hist_normalized.tolist()  # 8-bin normalized histogram
     }
 
+
+def _shot_length_stats_from_durations(shot_durations_s: List[float]) -> Dict[str, Any]:
+    """
+    Shot-length statistics computed directly from time-axis durations (seconds).
+    """
+    durations_s = np.asarray(
+        [float(x) for x in shot_durations_s if x is not None and np.isfinite(float(x)) and float(x) >= 0.0],
+        dtype=np.float32,
+    )
+    if durations_s.size == 0:
+        return {
+            "avg_shot_length": float("nan"),
+            "median_shot_length": float("nan"),
+            "shot_length_p10": float("nan"),
+            "shot_length_p25": float("nan"),
+            "shot_length_p75": float("nan"),
+            "shot_length_p90": float("nan"),
+            "short_shots_ratio": float("nan"),
+            "long_shots_ratio": float("nan"),
+            "very_long_shots_count": 0,
+            "extremely_short_shots_count": 0,
+            "shot_length_histogram": [],
+        }
+    avg = float(durations_s.mean())
+    med = float(np.median(durations_s))
+    short_ratio = float(np.mean(durations_s < 1.0))
+    long_ratio = float(np.mean(durations_s > 4.0))
+    very_long = int(np.sum(durations_s > 10.0))
+    extremely_short = int(np.sum(durations_s < 0.25))
+    percentiles = np.percentile(durations_s, [10, 25, 75, 90])
+    hist, _ = np.histogram(durations_s, bins=8)
+    hist_normalized = (hist.astype(np.float32) / (float(np.sum(hist)) + 1e-9)).tolist()
+    return {
+        "avg_shot_length": avg,
+        "median_shot_length": med,
+        "shot_length_p10": float(percentiles[0]),
+        "shot_length_p25": float(percentiles[1]),
+        "shot_length_p75": float(percentiles[2]),
+        "shot_length_p90": float(percentiles[3]),
+        "short_shots_ratio": short_ratio,
+        "long_shots_ratio": long_ratio,
+        "very_long_shots_count": very_long,
+        "extremely_short_shots_count": extremely_short,
+        "shot_length_histogram": hist_normalized,
+    }
+
 def classify_edit_style(cut_timing_stats, shot_stats, motion_cuts_count, jump_cuts_count,
                         stylized_counts, hard_cuts_count, duration_s):
     """
@@ -1474,6 +1907,8 @@ def classify_edit_style(cut_timing_stats, shot_stats, motion_cuts_count, jump_cu
 
 
 class CutDetectionPipeline(BaseModule):
+    VERSION = VERSION
+    SCHEMA_VERSION = SCHEMA_VERSION
     def __init__(
         self,
         rs_path: Optional[str] = None,
@@ -1486,6 +1921,19 @@ class CutDetectionPipeline(BaseModule):
         fade_threshold: float = 0.02,
         min_duration_frames: int = 4,
         use_flow_consistency: bool = True,
+        # Performance knobs (quality-preserving):
+        # - If Segmenter already downsized frames, these may not change anything.
+        # - If frames are high-res (e.g., 720p+), these cap internal SSIM/flow compute resolution.
+        ssim_max_side: int = 512,
+        flow_max_side: int = 320,
+        prefer_core_optical_flow: bool = False,
+        require_core_optical_flow: bool = False,
+        write_model_facing_npz: bool = True,
+        require_model_facing_npz: bool = False,
+        hard_cuts_cascade: bool = False,
+        hard_cuts_cascade_keep_top_p: float = 0.25,
+        hard_cuts_cascade_hist_margin: float = 0.0,
+        clip_image_model_spec: Optional[str] = None,
         **kwargs: Any
     ):
         """
@@ -1517,28 +1965,95 @@ class CutDetectionPipeline(BaseModule):
         self.fade_threshold = fade_threshold
         self.min_duration_frames = min_duration_frames
         self.use_flow_consistency = use_flow_consistency
+        self.ssim_max_side = int(ssim_max_side)
+        self.flow_max_side = int(flow_max_side)
+        self.prefer_core_optical_flow = bool(prefer_core_optical_flow)
+        self.require_core_optical_flow = bool(require_core_optical_flow)
+        self.write_model_facing_npz = bool(write_model_facing_npz)
+        self.require_model_facing_npz = bool(require_model_facing_npz)
+        self.hard_cuts_cascade = bool(hard_cuts_cascade)
+        self.hard_cuts_cascade_keep_top_p = float(hard_cuts_cascade_keep_top_p)
+        self.hard_cuts_cascade_hist_margin = float(hard_cuts_cascade_hist_margin)
         
         # Модели будут инициализированы в _do_initialize()
         self.embed_model = None
         self.transform = None
         self.clip_detector = None
         self._clip_zero_shot = clip_zero_shot
+        self._clip_image_model_spec = str(clip_image_model_spec) if isinstance(clip_image_model_spec, str) and clip_image_model_spec else None
+        self._clip_models_used_entry = None
+
+    def get_models_used(self, config: Dict[str, Any], metadata: Dict[str, Any]) -> List[Dict[str, Any]]:
+        """
+        cut_detection is mostly heuristic. If CLIP is enabled, we record it in models_used[].
+        Baseline policy: CLIP MUST be resolved via dp_models (Triton spec) and core_clip outputs.
+        """
+        if not bool(self._clip_zero_shot):
+            return []
+        if self._clip_models_used_entry is not None:
+            return [self._clip_models_used_entry]
+        if not self._clip_image_model_spec:
+            raise RuntimeError("cut_detection | use_clip=true requires --clip-image-model-spec (dp_models Triton spec)")
+        from dp_models import get_global_model_manager  # type: ignore
+        mm = get_global_model_manager()
+        rm = mm.get(model_name=str(self._clip_image_model_spec))
+        self._clip_models_used_entry = rm.models_used_entry
+        return [rm.models_used_entry]
     
     def _do_initialize(self) -> None:
         """Инициализация моделей."""
         # Initialize embedding model for deep features
         if self.use_deep_features:
-            self.embed_model, self.transform = get_embedding_model(device=self.device, model_name='resnet18')
-            self.logger.info("Deep features model initialized")
+            # Production decision: forbid local torchvision pretrained weights (no-network policy).
+            raise RuntimeError(
+                "cut_detection | use_deep_features=true is not supported in baseline (no-network policy). "
+                "If needed later, move this model into Triton and wire it as a core provider."
+            )
         
         # Initialize CLIP detector
         if self._clip_zero_shot:
+            # 1) load prompts + text embeddings from core_clip (single source-of-truth)
+            core = self.load_core_provider("core_clip", file_name="embeddings.npz")
+            if not isinstance(core, dict):
+                raise RuntimeError("cut_detection | core_clip artifact is missing (required when use_clip=true)")
+            prompts = core.get("cut_detection_transition_prompts")
+            text_emb = core.get("cut_detection_transition_text_embeddings")
+            if prompts is None or text_emb is None:
+                raise RuntimeError(
+                    "cut_detection | core_clip artifact missing cut_detection_transition_* fields (update core_clip schema)"
+                )
+            prompts_list = [str(x) for x in np.asarray(prompts).tolist()]
+            text_emb_np = np.asarray(text_emb, dtype=np.float32)
+
+            # 2) resolve Triton CLIP image encoder via ModelManager spec
+            if not self._clip_image_model_spec:
+                raise RuntimeError("cut_detection | use_clip=true requires --clip-image-model-spec (dp_models Triton spec)")
+            from dp_models import get_global_model_manager  # type: ignore
+            mm = get_global_model_manager()
+            rm = mm.get(model_name=str(self._clip_image_model_spec))
+            rp = rm.spec.runtime_params or {}
+            handle = rm.handle or {}
+            if not isinstance(rp, dict) or not rp:
+                raise RuntimeError("cut_detection | CLIP image Triton spec has empty runtime_params")
+            if not isinstance(handle, dict) or "client" not in handle:
+                raise RuntimeError("cut_detection | CLIP image Triton spec has empty client handle")
+            client = handle["client"]
+            self._clip_models_used_entry = rm.models_used_entry
+
             self.clip_detector = StylizedTransitionZeroShot(
-                device=self.device,
+                client=client,
+                triton_model_name=str(rp.get("triton_model_name")),
+                triton_model_version=str(rp.get("triton_model_version") or "") or None,
+                triton_input_name=str(rp.get("triton_input_name")),
+                triton_output_name=str(rp.get("triton_output_name")),
+                triton_input_datatype=str(rp.get("triton_input_datatype") or "FP32"),
+                prompts=prompts_list,
+                text_embeddings=text_emb_np,
                 use_temporal_aggregation=True,
-                use_multimodal=True
+                use_multimodal=True,
+                image_size=224,
             )
-            self.logger.info("CLIP detector initialized")
+            self.logger.info("CLIP detector initialized (Triton + core_clip prompts)")
 
     def process(
         self,
@@ -1565,11 +2080,10 @@ class CutDetectionPipeline(BaseModule):
         except Exception:
             pass
 
-        # Извлекаем audio_path из config если есть
-        audio_path = None
-        if config and isinstance(config, dict):
-            audio_path = config.get('audio_path')
-        
+        # audio path: auto-resolve Segmenter audio.wav if not provided
+        frames_dir = str(getattr(frame_manager, "frames_dir", "")) if getattr(frame_manager, "frames_dir", None) is not None else ""
+        audio_path = _resolve_audio_path(frames_dir, config)
+
         return self._process_video_frames(frame_manager, frame_indices, audio_path=audio_path)
     
     def _process_video_frames(self, frame_manager, frame_indices, audio_path=None):
@@ -1580,7 +2094,19 @@ class CutDetectionPipeline(BaseModule):
         Returns dict of features and detections
         """
         n = len(frame_indices)
-        duration_s = seconds_from_fps(n, self.fps)
+        times_s = _require_union_times_s(frame_manager, frame_indices)
+        video_length_s = _video_length_seconds(times_s)
+        if video_length_s <= 0.0:
+            raise RuntimeError("cut_detection | invalid video length from union_timestamps_sec (no-fallback)")
+        # Sampling quality check (decision): enforce reasonable max gap.
+        # With min=400 frames on 20min video average gap ~3s; allow up to 6s hard cap.
+        if times_s.size >= 2:
+            max_gap = float(np.max(np.diff(times_s)))
+            if max_gap > 6.0:
+                raise RuntimeError(
+                    f"cut_detection | sampling too sparse: max_gap_sec={max_gap:.2f} (>6.0). "
+                    "Increase cut_detection sampling budget in Segmenter."
+                )
         
         tik = time.time()
 
@@ -1603,41 +2129,98 @@ class CutDetectionPipeline(BaseModule):
         logger.info(f"Frame embeddings success | Time: {tok}")
         tik = time.time()
 
-        hard_idxs, hard_strengths = detect_hard_cuts(
+        # Optional fast-path: reuse core_optical_flow motion curve to avoid duplicate optical flow computation.
+        external_flow_mags = None
+        if bool(self.prefer_core_optical_flow) or bool(self.require_core_optical_flow):
+            try:
+                core_flow = self.load_core_provider("core_optical_flow", file_name="flow.npz")
+            except Exception as e:
+                core_flow = None
+                if bool(self.require_core_optical_flow):
+                    raise RuntimeError(f"cut_detection | require_core_optical_flow=true but core_optical_flow load failed: {e}") from e
+            if isinstance(core_flow, dict):
+                try:
+                    idx = np.asarray(core_flow.get("frame_indices"), dtype=np.int32).reshape(-1)
+                    mcurve = np.asarray(core_flow.get("motion_norm_per_sec_mean"), dtype=np.float32).reshape(-1)
+                    # Expect mcurve aligned with idx; first value is 0 for the first frame.
+                    if idx.size >= 2 and mcurve.size == idx.size:
+                        fi = np.asarray(frame_indices, dtype=np.int32).reshape(-1)
+                        if fi.size == idx.size and np.all(fi == idx):
+                            external_flow_mags = mcurve[1:]
+                            logger.info("cut_detection | using core_optical_flow motion curve (aligned frame_indices)")
+                        else:
+                            msg = f"core_optical_flow frame_indices mismatch: core_n={int(idx.size)} cut_n={int(fi.size)}"
+                            if bool(self.require_core_optical_flow):
+                                raise RuntimeError(f"cut_detection | require_core_optical_flow=true but {msg}")
+                            logger.warning("cut_detection | %s (falling back to local flow)", msg)
+                except Exception as e:
+                    if bool(self.require_core_optical_flow):
+                        raise
+                    logger.warning("cut_detection | failed to use core_optical_flow (fall back): %s", e)
+
+        hard_idxs, hard_strengths, hard_dbg = detect_hard_cuts(
             frame_manager=frame_manager,
             frame_indices=frame_indices,
             use_deep_features=self.use_deep_features,
             use_adaptive_thresholds=self.use_adaptive_thresholds,
             temporal_smoothing=True,
+            ssim_max_side=int(self.ssim_max_side),
+            flow_max_side=int(self.flow_max_side),
+            external_flow_mags=external_flow_mags,
             embed_model=self.embed_model,
             transform=self.transform,
-            device=self.device
+            device=self.device,
+            return_model_facing=True,
+            cascade_enabled=bool(self.hard_cuts_cascade),
+            cascade_keep_top_p=float(self.hard_cuts_cascade_keep_top_p),
+            cascade_hist_margin=float(self.hard_cuts_cascade_hist_margin),
         )
 
         tok = round(time.time() - tik, 2)
         logger.info(f"Hard cuts success | Time: {tok}")
         tik = time.time()
 
-        soft_events = detect_soft_cuts(
+        soft_events, soft_dbg = detect_soft_cuts(
             frame_manager=frame_manager,
             frame_indices=frame_indices,
-            fps=self.fps,
+            fps=self.fps,  # legacy arg; durations are recomputed below using union_timestamps_sec
             fade_threshold=self.fade_threshold,
             min_duration_frames=self.min_duration_frames,
             use_flow_consistency=self.use_flow_consistency,
+            flow_max_side=int(self.flow_max_side),
+            external_flow_mags=external_flow_mags,
+            return_model_facing=True,
         )
+        # Recompute duration_s for soft events using time-axis
+        for e in soft_events:
+            if not isinstance(e, dict):
+                continue
+            sp = e.get("start")
+            ep = e.get("end")
+            try:
+                sp_i = int(sp)
+                ep_i = int(ep)
+                sp_i = max(0, min(sp_i, n - 1))
+                ep_i = max(0, min(ep_i, n - 1))
+                e["duration_s"] = float(max(times_s[ep_i] - times_s[sp_i], 0.0))
+            except Exception:
+                e["duration_s"] = float("nan")
 
         tok = round(time.time() - tik, 2)
         logger.info(f"Soft cuts success | Time: {tok}")
         tik = time.time()
 
-        motion_idxs, motion_int, motion_types = detect_motion_based_cuts(
+        motion_idxs, motion_int, motion_types, motion_dbg = detect_motion_based_cuts(
             frame_manager=frame_manager,
             frame_indices=frame_indices,
             use_direction_analysis=True,
             adaptive_threshold=True,
             detect_speed_ramps=True,
-            use_camera_motion_compensation=True
+            use_camera_motion_compensation=True,
+            flow_max_side=int(self.flow_max_side),
+            external_flow_mags=external_flow_mags,
+            motion_cascade_enabled=True,
+            return_model_facing=True,
         )
 
         tok = round(time.time() - tik, 2)
@@ -1649,23 +2232,22 @@ class CutDetectionPipeline(BaseModule):
         if self.clip_detector is not None:
             candidate_windows = []
             candidate_scores = []
-            
-            prev_gray = cv2.cvtColor(frame_manager.get(frame_indices[0]), cv2.COLOR_RGB2GRAY)
-            for idx in range(1, min(n-1, len(frame_indices)-1)):
-                fA = frame_manager.get(frame_indices[idx-1])
-                fB = frame_manager.get(frame_indices[idx])
-                
-                hdiff = frame_histogram_diff(fA, fB)
-                ssim_drop = frame_ssim(fA, fB)
-                gray = cv2.cvtColor(fB, cv2.COLOR_RGB2GRAY)
-                flow_mag, _, _ = optical_flow_magnitude(prev_gray, gray)
-                prev_gray = gray
-                
-                candidate_score = hdiff + ssim_drop * 2.0 + min(flow_mag / 10.0, 1.0)
-                
-                if candidate_score > 0.3:  # Adaptive threshold could be percentile-based
-                    candidate_windows.append(idx)
-                    candidate_scores.append(candidate_score)
+
+            # Reuse already computed hard-cut curves (cheapest + consistent with core_optical_flow and cascade).
+            # We consider per-pair curves with index j=0..N-2; map to sampled-frame position idx=j+1.
+            h = np.asarray((hard_dbg or {}).get("hist_diff_l1") or np.zeros((max(0, n - 1),), dtype=np.float32), dtype=np.float32).reshape(-1)
+            sdrop = np.asarray((hard_dbg or {}).get("ssim_drop") or np.zeros((max(0, n - 1),), dtype=np.float32), dtype=np.float32).reshape(-1)
+            fmag = np.asarray((hard_dbg or {}).get("flow_mag") or np.zeros((max(0, n - 1),), dtype=np.float32), dtype=np.float32).reshape(-1)
+            # Candidate score heuristic (same as before; NaN treated as 0).
+            sdrop = np.nan_to_num(sdrop, nan=0.0, posinf=0.0, neginf=0.0)
+            fmag = np.nan_to_num(fmag, nan=0.0, posinf=0.0, neginf=0.0)
+            scores = h + (sdrop * 2.0) + np.minimum(fmag / 10.0, 1.0)
+
+            # Use the original threshold for now; can be made adaptive later.
+            for j in range(int(min(scores.size, max(0, n - 1)))):
+                if float(scores[j]) > 0.3:
+                    candidate_windows.append(int(j + 1))
+                    candidate_scores.append(float(scores[j]))
             
             logger.info(f"CLIP candidate-first: {len(candidate_windows)}/{n-1} windows selected")
             
@@ -1709,13 +2291,12 @@ class CutDetectionPipeline(BaseModule):
         tik = time.time()
 
         # 5. Jump cuts detection with improvements
-        jump_idxs, jump_scores = detect_jump_cuts(
+        # Jump cuts:
+        # Baseline policy (decision): compute jump-cuts only at hard cuts, using core_face_landmarks + core_object_detections if available.
+        jump_idxs, jump_scores = self._detect_jump_cuts_from_cores(
             frame_manager=frame_manager,
             frame_indices=frame_indices,
-            use_background_embedding=True,
-            embed_model=self.embed_model,
-            transform=self.transform,
-            device=self.device,
+            hard_cut_positions=hard_idxs,
         )
 
         tok = round(time.time() - tik, 2)
@@ -1833,8 +2414,20 @@ class CutDetectionPipeline(BaseModule):
             audio_spike_ratio = float(np.sum(onset_env > (np.mean(onset_env)+np.std(onset_env))) / (len(onset_env)+1e-9))
 
         # 9. Aggregation stats
-        cut_timing_stats_dict = cut_timing_statistics(hard_idxs, self.fps, duration_s)
-        shot_stats = shot_length_stats(shot_lengths, self.fps)
+        hard_cut_times_s = [float(times_s[int(p)]) for p in hard_idxs if 0 <= int(p) < int(times_s.size)]
+        cut_timing_stats_dict = _cut_timing_statistics_from_times(hard_cut_times_s, video_length_s)
+
+        # Shot duration stats in seconds using time-axis
+        shot_durations_s: List[float] = []
+        for a, b in zip(shot_boundaries_pos[:-1], shot_boundaries_pos[1:]):
+            a_i = int(max(0, min(int(a), n - 1)))
+            b_i = int(max(0, min(int(b), n)))
+            if b_i >= n:
+                dur = float(times_s[-1] - times_s[a_i])
+            else:
+                dur = float(times_s[b_i] - times_s[a_i])
+            shot_durations_s.append(float(max(dur, 0.0)))
+        shot_stats = _shot_length_stats_from_durations(shot_durations_s)
 
         tok = round(time.time() - tik, 2)
         logger.info(f"Audio assisted success | Time: {tok}")
@@ -1887,7 +2480,7 @@ class CutDetectionPipeline(BaseModule):
         # jump cuts
         features['jump_cuts_count'] = len(jump_idxs)
         features['jump_cut_intensity'] = float(np.mean(jump_scores)) if jump_scores else 0.0
-        features['jump_cut_ratio_per_minute'] = float(len(jump_idxs) / (duration_s/60.0+1e-9))
+        features['jump_cut_ratio_per_minute'] = float(len(jump_idxs) / (video_length_s/60.0+1e-9))
 
         # timing & rhythm
         features.update(cut_timing_stats_dict)
@@ -1981,7 +2574,7 @@ class CutDetectionPipeline(BaseModule):
         # Edit style classification based on statistics (from FEATURES.MD)
         edit_styles = classify_edit_style(
             cut_timing_stats_dict, shot_stats, len(motion_idxs), len(jump_idxs),
-            stylized_counts, len(hard_idxs), duration_s
+            stylized_counts, len(hard_idxs), video_length_s
         )
         features['edit_style_fast_prob'] = float(edit_styles.get('fast', 0.0))
         features['edit_style_slow_prob'] = float(edit_styles.get('slow', 0.0))
@@ -2021,5 +2614,463 @@ class CutDetectionPipeline(BaseModule):
             'scene_boundaries_shot_idx': scenes
         }
 
+        # -----------------------------
+        # Model-facing NPZ (v1): dense curves + unified events stream
+        # -----------------------------
+        model_facing_path = None
+        if bool(self.write_model_facing_npz):
+            try:
+                fi_np = np.asarray(frame_indices, dtype=np.int32).reshape(-1)
+                ts_np = np.asarray(times_s, dtype=np.float32).reshape(-1)
+                pair_times_s = (0.5 * (ts_np[1:] + ts_np[:-1])).astype(np.float32)
+                pair_dt_s = (ts_np[1:] - ts_np[:-1]).astype(np.float32)
+
+                dbg = hard_dbg or {}
+                exp_len = int(max(0, n - 1))
+
+                def _arr_1d(key: str, *, dtype, default_value: float = 0.0) -> np.ndarray:
+                    v = dbg.get(key, None)
+                    if v is None:
+                        return np.full((exp_len,), float(default_value), dtype=dtype)
+                    a = np.asarray(v, dtype=dtype).reshape(-1)
+                    if int(a.size) != exp_len:
+                        out = np.full((exp_len,), float(default_value), dtype=dtype)
+                        m = min(exp_len, int(a.size))
+                        if m > 0:
+                            out[:m] = a[:m]
+                        return out
+                    return a
+
+                hdiff = _arr_1d("hist_diff_l1", dtype=np.float32, default_value=0.0)
+                # In cascade mode the signal may be intentionally not computed -> prefer NaN + valid_mask.
+                ssim_drop = _arr_1d("ssim_drop", dtype=np.float32, default_value=float("nan"))
+                flow_mag = _arr_1d("flow_mag", dtype=np.float32, default_value=float("nan"))
+                deep_cosine_dist = _arr_1d("deep_cosine_dist", dtype=np.float32, default_value=float("nan"))
+                hard_score = _arr_1d("hard_score", dtype=np.float32, default_value=0.0)
+
+                # unified events arrays
+                ev_t: list[float] = []
+                ev_type: list[int] = []
+                ev_strength: list[float] = []
+                ev_pair: list[int] = []
+                ev_contrib: list[list[bool]] = []
+                ev_start: list[float] = []
+                ev_end: list[float] = []
+
+                def _nearest_pair_index(t: float) -> int:
+                    if pair_times_s.size == 0:
+                        return 0
+                    j = int(np.argmin(np.abs(pair_times_s - float(t))))
+                    return max(0, min(j, int(pair_times_s.size) - 1))
+
+                trig = dbg.get("triggers") or {}
+                trig_hist = np.asarray(trig.get("hist"), dtype=bool).reshape(-1) if trig.get("hist") is not None else np.zeros((exp_len,), dtype=bool)
+                trig_ssim = np.asarray(trig.get("ssim"), dtype=bool).reshape(-1) if trig.get("ssim") is not None else np.zeros((exp_len,), dtype=bool)
+                trig_flow = np.asarray(trig.get("flow"), dtype=bool).reshape(-1) if trig.get("flow") is not None else np.zeros((exp_len,), dtype=bool)
+                trig_deep = np.asarray(trig.get("deep"), dtype=bool).reshape(-1) if trig.get("deep") is not None else np.zeros((exp_len,), dtype=bool)
+                vmask = dbg.get("valid_mask") or {}
+                ssim_valid_mask = np.asarray(vmask.get("ssim"), dtype=bool).reshape(-1) if vmask.get("ssim") is not None else np.ones((exp_len,), dtype=bool)
+                flow_valid_mask = np.asarray(vmask.get("flow"), dtype=bool).reshape(-1) if vmask.get("flow") is not None else np.ones((exp_len,), dtype=bool)
+                deep_valid_mask = np.asarray(vmask.get("deep"), dtype=bool).reshape(-1) if vmask.get("deep") is not None else np.zeros((exp_len,), dtype=bool)
+
+                thr = dbg.get("thresholds") or {}
+                threshold_hist = np.full((exp_len,), float(thr.get("hist", float("nan"))), dtype=np.float32)
+                threshold_ssim = np.full((exp_len,), float(thr.get("ssim", float("nan"))), dtype=np.float32)
+                threshold_flow = np.full((exp_len,), float(thr.get("flow", float("nan"))), dtype=np.float32)
+                threshold_deep = np.full((exp_len,), float(thr.get("deep", float("nan"))), dtype=np.float32)
+                # If a signal was not computed at all (all mask=false), the threshold is semantically undefined.
+                if exp_len > 0 and not bool(np.any(ssim_valid_mask)):
+                    threshold_ssim[:] = np.nan
+                if exp_len > 0 and not bool(np.any(flow_valid_mask)):
+                    threshold_flow[:] = np.nan
+                if exp_len > 0 and not bool(np.any(deep_valid_mask)):
+                    threshold_deep[:] = np.nan
+
+                # Hard cuts (type_id=1)
+                for pos, strength in zip(hard_idxs or [], hard_strengths or []):
+                    try:
+                        p = int(pos) - 1
+                    except Exception:
+                        continue
+                    if p < 0 or p >= int(pair_times_s.size):
+                        continue
+                    ev_t.append(float(pair_times_s[p]))
+                    ev_type.append(1)
+                    ev_strength.append(float(strength))
+                    ev_pair.append(int(p))
+                    ev_contrib.append([bool(trig_hist[p]), bool(trig_ssim[p]), bool(trig_flow[p]), bool(trig_deep[p])])
+                    ev_start.append(float(pair_times_s[p]))
+                    ev_end.append(float(pair_times_s[p]))
+
+                # Soft events (fade/dissolve)
+                for e in soft_events or []:
+                    if not isinstance(e, dict):
+                        continue
+                    try:
+                        typ = str(e.get("type") or "")
+                        sp = int(e.get("start"))
+                        ep = int(e.get("end"))
+                    except Exception:
+                        continue
+                    sp = max(0, min(sp, n - 1))
+                    ep = max(0, min(ep, n - 1))
+                    t_mid = 0.5 * float(ts_np[sp] + ts_np[ep]) if ts_np.size else 0.0
+                    p = _nearest_pair_index(t_mid)
+                    if typ == "fade_in":
+                        tid = 2
+                    elif typ == "fade_out":
+                        tid = 3
+                    elif typ == "dissolve":
+                        tid = 4
+                    else:
+                        continue
+                    ev_t.append(float(t_mid))
+                    ev_type.append(int(tid))
+                    ev_strength.append(float(e.get("duration_s")) if e.get("duration_s") is not None else float("nan"))
+                    ev_pair.append(int(p))
+                    ev_start.append(float(ts_np[sp]) if ts_np.size else float(t_mid))
+                    ev_end.append(float(ts_np[ep]) if ts_np.size else float(t_mid))
+
+                # Motion events
+                for pos, strength, mtyp in zip(motion_idxs or [], motion_int or [], motion_types or []):
+                    try:
+                        p = int(pos) - 1
+                    except Exception:
+                        continue
+                    if p < 0 or p >= int(pair_times_s.size):
+                        continue
+                    mt = str(mtyp or "")
+                    if mt == "whip_pan":
+                        tid = 6
+                    elif mt == "zoom":
+                        tid = 7
+                    elif mt == "speed_ramp":
+                        tid = 8
+                    else:
+                        tid = 5
+                    ev_t.append(float(pair_times_s[p]))
+                    ev_type.append(int(tid))
+                    ev_strength.append(float(strength))
+                    ev_pair.append(int(p))
+                    ev_start.append(float(pair_times_s[p]))
+                    ev_end.append(float(pair_times_s[p]))
+
+                # Jump cuts (type_id=9)
+                for pos, strength in zip(jump_idxs or [], jump_scores or []):
+                    try:
+                        p = int(pos) - 1
+                    except Exception:
+                        continue
+                    if p < 0 or p >= int(pair_times_s.size):
+                        continue
+                    ev_t.append(float(pair_times_s[p]))
+                    ev_type.append(9)
+                    ev_strength.append(float(strength))
+                    ev_pair.append(int(p))
+                    ev_start.append(float(pair_times_s[p]))
+                    ev_end.append(float(pair_times_s[p]))
+
+                E = int(len(ev_t))
+                event_times_s = np.asarray(ev_t, dtype=np.float32).reshape(-1)
+                event_type_id = np.asarray(ev_type, dtype=np.int16).reshape(-1)
+                event_strength = np.asarray(ev_strength, dtype=np.float32).reshape(-1)
+                event_pair_index = np.asarray(ev_pair, dtype=np.int32).reshape(-1)
+                event_start_time_s = np.asarray(ev_start, dtype=np.float32).reshape(-1) if ev_start else np.zeros((E,), dtype=np.float32)
+                event_end_time_s = np.asarray(ev_end, dtype=np.float32).reshape(-1) if ev_end else np.zeros((E,), dtype=np.float32)
+                if ev_contrib:
+                    contrib = np.asarray(ev_contrib, dtype=bool)
+                    if contrib.ndim != 2 or contrib.shape[0] != E:
+                        contrib = np.zeros((E, 4), dtype=bool)
+                else:
+                    contrib = np.zeros((E, 4), dtype=bool)
+
+                model_facing = {
+                    "frame_indices": fi_np,
+                    "union_timestamps_sec": ts_np,
+                    "times_s": ts_np,
+                    "pair_times_s": pair_times_s,
+                    "pair_dt_s": pair_dt_s,
+                    "hist_diff_l1": hdiff,
+                    "ssim_drop": ssim_drop,
+                    "flow_mag": flow_mag,
+                    "hard_score": hard_score,
+                    "deep_cosine_dist": deep_cosine_dist,
+                "ssim_valid_mask": ssim_valid_mask,
+                "flow_valid_mask": flow_valid_mask,
+                "deep_valid_mask": deep_valid_mask,
+                "threshold_hist": threshold_hist,
+                "threshold_ssim": threshold_ssim,
+                "threshold_flow": threshold_flow,
+                "threshold_deep": threshold_deep,
+                    "event_times_s": event_times_s,
+                    "event_start_time_s": event_start_time_s,
+                    "event_end_time_s": event_end_time_s,
+                    "event_type_id": event_type_id,
+                    "event_strength": event_strength,
+                    "event_pair_index": event_pair_index,
+                    "event_contrib_mask": contrib,
+                }
+
+                # Optional: include soft/motion raw curves (model-facing inputs for encoder).
+                if isinstance(locals().get("soft_dbg"), dict):
+                    for k in (
+                        "soft_hsv_v",
+                        "soft_lab_l",
+                        "soft_hist_diff_l1",
+                        "soft_flow_mag",
+                        "soft_flow_valid_mask",
+                    ):
+                        if k in soft_dbg:
+                            model_facing[k] = soft_dbg[k]
+                if isinstance(locals().get("motion_dbg"), dict):
+                    for k in (
+                        "motion_flow_mag",
+                        "motion_dir_consistency",
+                        "motion_mag_variance",
+                        "motion_camera_motion_flag",
+                        "motion_dir_valid_mask",
+                        "motion_var_valid_mask",
+                        "motion_cam_valid_mask",
+                    ):
+                        if k in motion_dbg:
+                            model_facing[k] = motion_dbg[k]
+
+                # Save with BaseModule.save_results(), then rename to stable prefix.
+                frames_dir = str(getattr(frame_manager, "frames_dir", "")) if getattr(frame_manager, "frames_dir", None) is not None else ""
+                meta = self.load_metadata(frames_dir) if frames_dir else {}
+                save_meta = {
+                    "total_frames": meta.get("total_frames"),
+                    "processed_frames": int(len(frame_indices)),
+                    "frames_dir": frames_dir,
+                    "platform_id": meta.get("platform_id"),
+                    "video_id": meta.get("video_id"),
+                    "run_id": meta.get("run_id"),
+                    "sampling_policy_version": meta.get("sampling_policy_version"),
+                    "config_hash": meta.get("config_hash"),
+                    "dataprocessor_version": meta.get("dataprocessor_version"),
+                    "analysis_fps": meta.get("analysis_fps"),
+                    "analysis_width": meta.get("analysis_width"),
+                    "analysis_height": meta.get("analysis_height"),
+                    "schema_version": "cut_detection_model_facing_npz_v1",
+                    "cut_detection_config": {
+                        "ssim_max_side": int(self.ssim_max_side),
+                        "flow_max_side": int(self.flow_max_side),
+                        "prefer_core_optical_flow": bool(self.prefer_core_optical_flow),
+                        "require_core_optical_flow": bool(self.require_core_optical_flow),
+                        "use_deep_features": bool(self.use_deep_features),
+                        "use_adaptive_thresholds": bool(self.use_adaptive_thresholds),
+                        "temporal_smoothing": True,
+                        "hard_cuts_cascade": bool(self.hard_cuts_cascade),
+                        "hard_cuts_cascade_keep_top_p": float(self.hard_cuts_cascade_keep_top_p),
+                        "hard_cuts_cascade_hist_margin": float(self.hard_cuts_cascade_hist_margin),
+                    },
+                    "flow_source": str(dbg.get("flow_source") or "unknown"),
+                    "flow_mag_units": str(dbg.get("flow_mag_units") or "unknown"),
+                    "thresholds": dbg.get("thresholds") or {},
+                    "event_type_map": {
+                        1: "hard_cut",
+                        2: "fade_in",
+                        3: "fade_out",
+                        4: "dissolve",
+                        5: "motion_cut",
+                        6: "whip_pan",
+                        7: "zoom",
+                        8: "speed_ramp",
+                        9: "jump_cut",
+                    },
+                    "event_contrib_sources": ["hist", "ssim", "flow", "deep"],
+                }
+                try:
+                    save_meta["models_used"] = self.get_models_used(config={"clip_image_model_spec": self._clip_image_model_spec}, metadata=meta or {})
+                except Exception:
+                    save_meta["models_used"] = []
+
+                tmp_path = self.save_results(results=model_facing, metadata=save_meta, use_compressed=False)
+                base = os.path.basename(tmp_path)
+                prefix = f"{self.module_name}_features_"
+                if base.startswith(prefix):
+                    new_base = f"{self.module_name}_model_facing_" + base[len(prefix):]
+                else:
+                    new_base = f"{self.module_name}_model_facing_{base}"
+                new_path = os.path.join(os.path.dirname(tmp_path), new_base)
+                os.replace(tmp_path, new_path)
+                model_facing_path = new_path
+                logger.info("cut_detection | model-facing NPZ saved: %s", model_facing_path)
+            except Exception as e:
+                if bool(self.require_model_facing_npz):
+                    raise RuntimeError(f"cut_detection | require_model_facing_npz=true but write failed: {e}") from e
+                logger.warning("cut_detection | failed to write model-facing NPZ (non-fatal): %s", e)
+
         # Provide frame_indices for consumers (union-domain indices).
-        return {'frame_indices': np.asarray(frame_indices, dtype=np.int32), 'features': features, 'detections': detections}
+        return {
+            "frame_indices": np.asarray(frame_indices, dtype=np.int32),
+            "times_s": times_s,
+            "features": features,
+            "detections": detections,
+            "model_facing_npz_path": model_facing_path,
+        }
+
+    def _detect_jump_cuts_from_cores(
+        self,
+        *,
+        frame_manager: FrameManager,
+        frame_indices: List[int],
+        hard_cut_positions: List[int],
+        face_change_thresh: float = 0.35,
+        bg_ssim_thresh: float = 0.80,
+        person_score_thresh: float = 0.35,
+    ) -> tuple[List[int], List[float]]:
+        """
+        Jump cut = hard cut with strong face geometry change AND similar background.
+        Uses:
+        - core_face_landmarks: face_landmarks + face_present
+        - core_object_detections: person presence (optional gate)
+        If cores do not cover required frames, candidate is skipped (valid empty at sub-feature level).
+        Returns:
+            jump_idxs: positions in sampled sequence (same domain as hard_cut_positions)
+            jump_scores: float scores
+        """
+        if self.rs_path is None:
+            raise RuntimeError("cut_detection | rs_path is required to load core_* dependencies (no-fallback)")
+
+        # Load core_face_landmarks
+        try:
+            face_npz = self.load_core_provider("core_face_landmarks")
+        except Exception as e:
+            raise RuntimeError(f"cut_detection | failed to load core_face_landmarks artifact: {e}") from e
+        if not isinstance(face_npz, dict):
+            raise RuntimeError("cut_detection | core_face_landmarks artifact missing/invalid (no-fallback)")
+        fi_face = face_npz.get("frame_indices")
+        face_present = face_npz.get("face_present")
+        face_landmarks = face_npz.get("face_landmarks")
+        if fi_face is None or face_present is None or face_landmarks is None:
+            raise RuntimeError("cut_detection | core_face_landmarks missing required keys (no-fallback)")
+        fi_face = np.asarray(fi_face, dtype=np.int32)
+        face_present = np.asarray(face_present)
+        face_landmarks = np.asarray(face_landmarks)
+        face_map = {int(x): i for i, x in enumerate(fi_face.tolist())}
+
+        # Load core_object_detections (required in baseline per audit decision)
+        person_map: Dict[int, bool] = {}
+        try:
+            det_npz = self.load_core_provider("core_object_detections")
+        except Exception as e:
+            raise RuntimeError(f"cut_detection | failed to load core_object_detections artifact: {e}") from e
+        if not isinstance(det_npz, dict) or det_npz.get("frame_indices") is None:
+            raise RuntimeError("cut_detection | core_object_detections artifact missing/invalid (no-fallback)")
+        if isinstance(det_npz, dict) and det_npz.get("frame_indices") is not None:
+            d_fi = np.asarray(det_npz.get("frame_indices"), dtype=np.int32)
+            boxes = np.asarray(det_npz.get("boxes")) if det_npz.get("boxes") is not None else None
+            scores = np.asarray(det_npz.get("scores")) if det_npz.get("scores") is not None else None
+            class_ids = np.asarray(det_npz.get("class_ids")) if det_npz.get("class_ids") is not None else None
+            valid_mask = np.asarray(det_npz.get("valid_mask")) if det_npz.get("valid_mask") is not None else None
+            class_names = det_npz.get("class_names")
+            person_id = 0
+            try:
+                if isinstance(class_names, np.ndarray):
+                    names = [str(x) for x in class_names.tolist()]
+                    for s in names:
+                        if ":person" in s:
+                            person_id = int(s.split(":", 1)[0])
+                            break
+            except Exception:
+                person_id = 0
+            if boxes is not None and scores is not None and class_ids is not None and valid_mask is not None:
+                for i, ufi in enumerate(d_fi.tolist()):
+                    m = valid_mask[i].astype(bool) if valid_mask.ndim >= 2 else None
+                    if m is None:
+                        person_map[int(ufi)] = False
+                        continue
+                    ok = False
+                    for j in range(class_ids.shape[1]):
+                        if not bool(m[j]):
+                            continue
+                        if int(class_ids[i, j]) != int(person_id):
+                            continue
+                        if float(scores[i, j]) >= float(person_score_thresh):
+                            ok = True
+                            break
+                    person_map[int(ufi)] = bool(ok)
+            else:
+                raise RuntimeError("cut_detection | core_object_detections missing required arrays (no-fallback)")
+
+        def _landmark_xy(u_idx: int) -> Optional[np.ndarray]:
+            k = face_map.get(int(u_idx))
+            if k is None:
+                return None
+            # face_landmarks: (N, max_faces, max_landmarks, 3). Use first face.
+            if face_landmarks.ndim != 4:
+                return None
+            if face_present.ndim < 2:
+                return None
+            if not bool(face_present[k, 0]):
+                return None
+            pts = face_landmarks[k, 0, :, :2].astype(np.float32)  # normalized x,y
+            if pts.size == 0 or not np.isfinite(pts).any():
+                return None
+            return pts
+
+        def _face_change(a: np.ndarray, b: np.ndarray) -> float:
+            # a,b: (L,2) normalized. Center+scale then cosine distance.
+            a0 = a - np.nanmean(a, axis=0, keepdims=True)
+            b0 = b - np.nanmean(b, axis=0, keepdims=True)
+            na = float(np.linalg.norm(a0) + 1e-9)
+            nb = float(np.linalg.norm(b0) + 1e-9)
+            a1 = (a0 / na).reshape(-1)
+            b1 = (b0 / nb).reshape(-1)
+            sim = float(np.dot(a1, b1))
+            return float(max(0.0, 1.0 - sim))
+
+        # Evaluate only at hard cuts
+        jump_pos: List[int] = []
+        jump_score: List[float] = []
+        for p in hard_cut_positions:
+            p_i = int(p)
+            if p_i <= 0 or p_i >= len(frame_indices):
+                continue
+            u0 = int(frame_indices[p_i - 1])
+            u1 = int(frame_indices[p_i])
+
+            # person gate (needs both frames)
+            if not (person_map.get(u0, False) and person_map.get(u1, False)):
+                continue
+
+            lm0 = _landmark_xy(u0)
+            lm1 = _landmark_xy(u1)
+            if lm0 is None or lm1 is None:
+                continue
+            fc = _face_change(lm0, lm1)
+            if fc < float(face_change_thresh):
+                continue
+
+            # background similarity: blur face bbox (from landmarks) and compute SSIM
+            f0 = frame_manager.get(u0)
+            f1 = frame_manager.get(u1)
+            h, w = f0.shape[:2]
+            # bbox in pixels from normalized landmarks
+            x0 = float(np.nanmin(lm0[:, 0]))
+            y0 = float(np.nanmin(lm0[:, 1]))
+            x1 = float(np.nanmax(lm0[:, 0]))
+            y1 = float(np.nanmax(lm0[:, 1]))
+            # expand
+            ex = 0.15
+            xa = int(max(0, (x0 - ex) * w))
+            xb = int(min(w, (x1 + ex) * w))
+            ya = int(max(0, (y0 - ex) * h))
+            yb = int(min(h, (y1 + ex) * h))
+            f0m = f0.copy()
+            f1m = f1.copy()
+            if xb > xa and yb > ya:
+                f0m[ya:yb, xa:xb] = cv2.GaussianBlur(f0m[ya:yb, xa:xb], (15, 15), 5)
+                f1m[ya:yb, xa:xb] = cv2.GaussianBlur(f1m[ya:yb, xa:xb], (15, 15), 5)
+            # SSIM (reuse existing helper; it returns 1-SSIM drop)
+            drop = frame_ssim(f0m, f1m)
+            ssim_val = float(1.0 - drop)
+            if ssim_val < float(bg_ssim_thresh):
+                continue
+
+            jump_pos.append(p_i)
+            # score: face change weighted by bg similarity
+            jump_score.append(float(fc * ssim_val))
+
+        return jump_pos, jump_score

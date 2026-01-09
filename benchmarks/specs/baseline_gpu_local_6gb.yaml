@@ -1,0 +1,112 @@
+version: "bench_spec_v1"
+
+# Local baseline GPU (6GB-friendly).
+# This spec avoids the heaviest branches that are known to OOM on 6GB VRAM:
+# - RAFT 384/512
+# - YOLO11x 960
+#
+# IMPORTANT:
+# Even with this reduced set, running ALL models sequentially in a single Triton process may still
+# hit ORT CUDA OOM due to VRAM caching/fragmentation across different models.
+# For reproducible results on 6GB, prefer grouped specs + restart Triton between groups:
+# - benchmarks/specs/baseline_gpu_local_group_clip_places.yaml
+# - benchmarks/specs/baseline_gpu_local_group_midas_raft.yaml
+# - benchmarks/specs/baseline_gpu_local_group_yolo.yaml
+#
+# For full superset (may OOM), use: benchmarks/specs/baseline_gpu_local.yaml
+
+defaults:
+  warmup: 5
+  repeats: 30
+  timeout_sec: 10.0
+
+models:
+  # NOTE: order matters on small VRAM GPUs (ORT CUDA caching/fragmentation).
+  # We run heavier models first, then CLIP/Places.
+
+  # --- MiDaS depth ---
+  - name: midas_256
+    model_spec_name: midas_256_triton
+    kind: single_input
+    input: { dtype: UINT8, shape: [1, 256, 256, 3], layout: nhwc, value: random_int, int_range: [0, 256] }
+    output: { name: OUTPUT__0 }
+
+  - name: midas_384
+    model_spec_name: midas_384_triton
+    kind: single_input
+    input: { dtype: UINT8, shape: [1, 384, 384, 3], layout: nhwc, value: random_int, int_range: [0, 256] }
+    output: { name: OUTPUT__0 }
+
+  - name: midas_512
+    model_spec_name: midas_512_triton
+    kind: single_input
+    input: { dtype: UINT8, shape: [1, 512, 512, 3], layout: nhwc, value: random_int, int_range: [0, 256] }
+    output: { name: OUTPUT__0 }
+
+  # --- RAFT optical flow (6GB: only 256 is stable) ---
+  - name: raft_256
+    model_spec_name: raft_256_triton
+    kind: two_inputs
+    input0: { dtype: UINT8, shape: [1, 256, 256, 3], layout: nhwc, value: random_int, int_range: [0, 256] }
+    input1: { dtype: UINT8, shape: [1, 256, 256, 3], layout: nhwc, value: random_int, int_range: [0, 256] }
+    output: { name: OUTPUT__0 }
+
+  # --- YOLO (6GB: 320/640) ---
+  - name: yolo11x_320
+    model_spec_name: yolo11x_320_triton
+    kind: single_input
+    input: { dtype: FP32, shape: [1, 3, 320, 320], layout: nchw, value: random_uniform, float_range: [0.0, 1.0] }
+    output: { name: output0 }
+
+  - name: yolo11x_640
+    model_spec_name: yolo11x_640_triton
+    kind: single_input
+    input: { dtype: FP32, shape: [1, 3, 640, 640], layout: nchw, value: random_uniform, float_range: [0.0, 1.0] }
+    output: { name: output0 }
+
+  # --- CLIP image ---
+  - name: clip_image_224
+    model_spec_name: clip_image_224_triton
+    kind: single_input
+    input: { dtype: UINT8, shape: [1, 224, 224, 3], layout: nhwc, value: random_int, int_range: [0, 256] }
+    output: { name: OUTPUT__0 }
+
+  - name: clip_image_336
+    model_spec_name: clip_image_336_triton
+    kind: single_input
+    input: { dtype: UINT8, shape: [1, 336, 336, 3], layout: nhwc, value: random_int, int_range: [0, 256] }
+    output: { name: OUTPUT__0 }
+
+  - name: clip_image_448
+    model_spec_name: clip_image_448_triton
+    kind: single_input
+    input: { dtype: UINT8, shape: [1, 448, 448, 3], layout: nhwc, value: random_int, int_range: [0, 256] }
+    output: { name: OUTPUT__0 }
+
+  # --- CLIP text ---
+  - name: clip_text
+    model_spec_name: clip_text_triton
+    kind: single_input
+    input: { dtype: INT64, shape: [1, 77], layout: tokens, value: random_int, int_range: [0, 49408] }
+    output: { name: OUTPUT__0 }
+
+  # --- Places365 ---
+  - name: places365_resnet50_224
+    model_spec_name: places365_resnet50_224_triton
+    kind: single_input
+    input: { dtype: UINT8, shape: [1, 224, 224, 3], layout: nhwc, value: random_int, int_range: [0, 256] }
+    output: { name: OUTPUT__0 }
+
+  - name: places365_resnet50_336
+    model_spec_name: places365_resnet50_336_triton
+    kind: single_input
+    input: { dtype: UINT8, shape: [1, 336, 336, 3], layout: nhwc, value: random_int, int_range: [0, 256] }
+    output: { name: OUTPUT__0 }
+
+  - name: places365_resnet50_448
+    model_spec_name: places365_resnet50_448_triton
+    kind: single_input
+    input: { dtype: UINT8, shape: [1, 448, 448, 3], layout: nhwc, value: random_int, int_range: [0, 256] }
+    output: { name: OUTPUT__0 }
+
+

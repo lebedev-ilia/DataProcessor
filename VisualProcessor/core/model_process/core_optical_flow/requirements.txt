@@ -1,0 +1,5 @@
+# core_optical_flow (Triton-only)
+numpy
+opencv-python
+requests
+

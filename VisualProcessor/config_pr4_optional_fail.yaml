@@ -1,0 +1,36 @@
+core_providers:
+  core_clip: false
+  core_face_landmarks: false
+  core_depth_midas: false
+  core_object_detections: false
+  core_optical_flow: false
+
+modules:
+  # required=true in profile
+  cut_detection: true
+  # required=false in profile (intentional failure)
+  failing_module: true
+
+global:
+  root_path: null
+  frames_dir: null
+  rs_path: null
+  max_parallel_modules: 1
+  gpu_max_concurrent: "auto"
+
+cut_detection:
+  device: "cpu"
+  use_clip: false
+  use_deep_features: false
+  sampling:
+    target_frames: 120
+    min_frames: 60
+    max_frames: 200
+
+failing_module:
+  sampling:
+    target_frames: 30
+    min_frames: 10
+    max_frames: 60
+
+

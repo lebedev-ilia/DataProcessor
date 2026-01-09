@@ -11,6 +11,7 @@ import torch
 
 from src.core.base_extractor import BaseExtractor
 from src.core.metrics import system_snapshot, process_memory_bytes
+from src.core.path_utils import default_artifacts_dir, default_cache_dir
 
 try:
     from sentence_transformers import CrossEncoder  # type: ignore
@@ -43,19 +44,20 @@ class EmbeddingPairTopKExtractor(BaseExtractor):
 
     def __init__(
         self,
-        artifacts_dir: str = "/home/ilya/Рабочий стол/DataProcessor/TextProcessor/.artifacts",
-        cache_dir: str = "/home/ilya/Рабочий стол/DataProcessor/TextProcessor/.cache/transcript_embed",
+        artifacts_dir: str | None = None,
+        cache_dir: str | None = None,
         top_k: int = 5,
         use_cross_encoder: bool = True,
         temperature: float = 0.1,
-        device: Optional[str] = None,
+        device: Optional[str] = "cpu",
     ) -> None:
-        self.artifacts_dir = Path(artifacts_dir)
-        self.cache_dir = Path(cache_dir)
+        self.artifacts_dir = Path(artifacts_dir).expanduser().resolve() if artifacts_dir else default_artifacts_dir()
+        self.cache_dir = Path(cache_dir).expanduser().resolve() if cache_dir else (default_cache_dir() / "transcript_embed")
         self.top_k = top_k
         self.temperature = temperature
-        self.device = device or ("cuda" if torch.cuda.is_available() else "cpu")
-        self.use_cross_encoder = use_cross_encoder and CrossEncoder is not None
+        self.device = str(device or "cpu")
+        # Privacy policy: TranscriptChunkEmbedder does not store raw chunk texts → cross-encoder rerank is disabled by default.
+        self.use_cross_encoder = False
         self.cross_model = None
 
         self._ensure_cross_model()
@@ -94,7 +96,7 @@ class EmbeddingPairTopKExtractor(BaseExtractor):
         except Exception:
             return None
 
-    def _load_transcript_chunks(self) -> Tuple[Optional[np.ndarray], Optional[List[str]]]:
+    def _load_transcript_chunks(self) -> Tuple[Optional[np.ndarray], None]:
         # Prefer whisper → youtube
         for source in ["whisper", "youtube_auto"]:
             p = _latest(str(self.artifacts_dir / f"transcript_{source}_embedding_*.npy"))
@@ -103,18 +105,7 @@ class EmbeddingPairTopKExtractor(BaseExtractor):
             try:
                 m = np.load(p)
                 m = np.asarray(m, dtype=np.float32)
-                # derive meta (chunks) by hash from filename
-                name = p.name
-                h = name.split("_")[-1].split(".")[0]
-                meta_path = self.cache_dir / f"{h}.json"
-                chunk_texts: Optional[List[str]] = None
-                if meta_path.exists():
-                    try:
-                        data = json.loads(meta_path.read_text())
-                        chunk_texts = data.get("chunks")
-                    except Exception:
-                        chunk_texts = None
-                return m, chunk_texts
+                return m, None
             except Exception:
                 continue
         return None, None

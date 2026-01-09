@@ -2,7 +2,11 @@
 
 ## Общее описание
 
-Модуль optical_flow использует модель RAFT (Recurrent All-Pairs Field Transforms) из torchvision для вычисления оптического потока между последовательными кадрами видео. Модуль предоставляет комплексный анализ движения, включая покадровые статистики, пространственный анализ, временной анализ, анализ движения камеры и продвинутые фичи.
+Update (production policy):
+- Модуль `optical_flow` больше НЕ вычисляет RAFT сам и НЕ пишет JSON в `result_store`.
+- Источник истины по движению — `core_optical_flow/flow.npz` (Triton-only), этот модуль теперь является consumer'ом и пишет только NPZ.
+
+Ниже описан legacy-набор фичей (для справки). Полуфинально: используем только stable NPZ output и агрегаты, остальные фичи будут возвращены позже при необходимости.
 
 ### Что обновилось
 - Покадровый вектор для трансформера сжат до ~12 численных признаков: `magnitude_mean_px_sec_norm`, `magnitude_std_px_sec_norm`, `magnitude_p95_px_sec_norm`, `dir_sin_mean`, `dir_cos_mean`, `dir_dispersion`, `dx_mean_norm`, `dy_mean_norm`, `moving_pixels_1.0` (px/sec), `moving_pixels_rel`, `flow_confidence_mean_norm`, `occlusion_fraction`, `fb_error_mean_norm`, `flow_consistency`.

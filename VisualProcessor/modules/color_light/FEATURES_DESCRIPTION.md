@@ -10,7 +10,7 @@
 ```json
 {
   "frames": {
-    "scene_label": {
+    "scene_key": {  // scene_key = "{scene_label}__{scene_id}" from scene_classification
       "frame_idx": {
         "frame_idx": 45,
         "features": { "...": "frame-level фичи" }
@@ -18,7 +18,7 @@
     }
   },
   "scenes": {
-    "scene_label": { "...": "scene-level агрегаты" }
+    "scene_key": { "...": "scene-level агрегаты (+scene_label, +scene_id)" }
   },
   "video_features": { "...": "video-level агрегаты" },
   "sequence_inputs": {

@@ -30,12 +30,15 @@ class EmbeddingStatsExtractor(BaseExtractor):
 
     def __init__(
         self,
-        artifacts_dir: str = "/home/ilya/Рабочий стол/DataProcessor/TextProcessor/.artifacts",
-        cache_dir: str = "/home/ilya/Рабочий стол/DataProcessor/TextProcessor/.cache/transcript_embed",
+        artifacts_dir: str | None = None,
+        cache_dir: str | None = None,
         topk: int = 5,
     ) -> None:
-        self.artifacts_dir = Path(artifacts_dir)
-        self.cache_dir = Path(cache_dir)
+        from src.core.path_utils import default_artifacts_dir, default_cache_dir  # local import
+
+        self.artifacts_dir = Path(artifacts_dir).expanduser().resolve() if artifacts_dir else default_artifacts_dir()
+        base_cache = default_cache_dir() / "transcript_embed"
+        self.cache_dir = Path(cache_dir).expanduser().resolve() if cache_dir else base_cache
         self.topk = topk
 
     def _load_chunks(self) -> Tuple[Optional[np.ndarray], Optional[Path]]:

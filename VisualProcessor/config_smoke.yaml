@@ -35,20 +35,27 @@ global:
 
 core_clip:
   model_name: "ViT-B/32"
-  batch_size: "auto"
+  # Controlled by scheduler (DynamicBatching, in development). For now must be explicit.
+  batch_size: 16
   sampling:
     target_frames: 120
     min_frames: 60
     max_frames: 200
 
 core_depth_midas:
-  device: "auto"
-  out_width: 256
-  out_height: 256
-  batch_size: "auto"
+  runtime: "triton"
+  triton_http_url: "http://triton:8000"
+  triton_model_name: "midas_384"
+  triton_model_version: null
+  triton_input_name: "INPUT__0"
+  triton_output_name: "OUTPUT__0"
+  triton_datatype: "FP32"
+  triton_preprocess_preset: "midas_384"
+  out_width: 384
+  out_height: 384
+  # Controlled by scheduler (DynamicBatching, in development). For now must be explicit.
+  batch_size: 16
   frames_bgr: false
-  save_full_res: false
-  model_name: "MiDaS_small"
   sampling:
     target_frames: 120
     min_frames: 60
@@ -65,10 +72,9 @@ core_face_landmarks:
     max_frames: 200
 
 core_object_detections:
-  # YOLO path (no OWL queries) for smoke
-  use_queries: false
   model: "yolov8n.pt"
-  batch_size: "auto"
+  # Controlled by scheduler (DynamicBatching, in development). For now must be explicit.
+  batch_size: 16
   device: "auto"
   box_threshold: 0.6
   iou-threshold: 0.3
@@ -78,9 +84,18 @@ core_object_detections:
     max_frames: 200
 
 core_optical_flow:
-  device: "auto"
-  model: "small"
-  max_dim: 256
+  runtime: "triton"
+  triton_http_url: "http://triton:8000"
+  triton_model_name: "raft_256"
+  triton_model_version: null
+  triton_input0_name: "INPUT0__0"
+  triton_input1_name: "INPUT1__0"
+  triton_output_name: "OUTPUT__0"
+  triton_datatype: "FP32"
+  triton_preprocess_preset: "raft_256"
+  model_version: "unknown"
+  weights_digest: "unknown"
+  precision: "fp32"
   sampling:
     target_frames: 120
     min_frames: 60

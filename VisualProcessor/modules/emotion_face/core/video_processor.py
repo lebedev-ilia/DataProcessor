@@ -2,8 +2,8 @@
 Основной класс для обработки видео и анализа эмоций.
 
 Все TODO выполнены:
-    1. ✅ Интеграция с внешними зависимостями через BaseModule (face_detection)
-    2. ✅ Использование результатов face_detection вместо прямых вызовов
+    1. ✅ Интеграция с внешними зависимостями через BaseModule (core_face_landmarks)
+    2. ✅ Использование face presence из core_face_landmarks (вместо устаревшего face_detection)
     3. ✅ Интеграция с BaseModule через класс EmotionFaceModule
     4. ✅ Единый формат вывода для сохранения в npz
 """
@@ -141,7 +141,11 @@ class VideoEmotionProcessor:
         self.batch_process_very_high = batch_process_very_high
 
         # Загружаем frames_with_face с поддержкой BaseModule
-        self.frames_with_face = self.frames_with_face_load("auto", rs_path=rs_path, load_func=load_dependency_func)
+        self.frames_with_face = self.frames_with_face_load(
+            "auto",
+            rs_path=rs_path,
+            load_func=load_dependency_func,
+        )
 
         if emo_path == "None" or emo_path is None:
             import os
@@ -161,7 +165,7 @@ class VideoEmotionProcessor:
         
     def frames_with_face_load(self, filename, rs_path: Optional[str] = None, load_func: Optional[callable] = None):
         """
-        Загружает список кадров с лицами из результатов face_detection.
+        Загружает список кадров с лицами из результатов core provider `core_face_landmarks`.
         
         Args:
             filename: Имя файла или "auto" для автоматического поиска
@@ -171,70 +175,45 @@ class VideoEmotionProcessor:
         Returns:
             Список индексов кадров с лицами
         """
-        # Вариант 1: через BaseModule (если доступна функция загрузки)
-        if load_func is not None and rs_path:
-            try:
-                face_data = load_func("face_detection", format="json")
-                if face_data and isinstance(face_data, dict):
-                    frames_with_face = face_data.get("frames_with_face", [])
-                    if not frames_with_face:
-                        # Альтернативный формат: frames -> keys
-                        frames = face_data.get("frames", {})
-                        if frames:
-                            frames_with_face = [int(k) for k, v in frames.items() if v and len(v) > 0]
-                    
-                    logger.info(f"VideoEmotionProcessor | frames_with_face_load | Загружено {len(frames_with_face)} кадров через BaseModule")
-                    return sorted(frames_with_face)
-            except Exception as e:
-                logger.warning(f"VideoEmotionProcessor | frames_with_face_load | Ошибка загрузки через BaseModule: {e}, используем fallback")
-        
-        # Вариант 2: прямой доступ к файлу (fallback для обратной совместимости)
-        if rs_path:
-            face_detection_dir = os.path.join(rs_path, "face_detection")
-            if os.path.exists(face_detection_dir):
-                json_files = list(Path(face_detection_dir).glob("*.json"))
-                if json_files:
-                    if filename == "auto":
-                        json_file = max(json_files, key=lambda p: p.stat().st_mtime)
-                    else:
-                        json_file = Path(face_detection_dir) / filename
-                        if not json_file.exists():
-                            logger.warning(f"VideoEmotionProcessor | frames_with_face_load | Файл {json_file} не найден")
-                            return []
-                    
-                    try:
-                        with open(json_file, "r", encoding="utf-8") as f:
-                            face_data = json.load(f)
-                        frames_with_face = face_data.get("frames_with_face", [])
-                        logger.info(f"VideoEmotionProcessor | frames_with_face_load | Загружено {len(frames_with_face)} кадров (fallback)")
-                        return sorted(frames_with_face)
-                    except Exception as e:
-                        logger.error(f"VideoEmotionProcessor | frames_with_face_load | Ошибка чтения файла: {e}")
-                        return []
-        
-        # Вариант 3: старый метод (для обратной совместимости)
-        p = f"{os.path.dirname(os.path.dirname(os.path.dirname(os.path.dirname(__file__))))}/result_store/face_detection"
+        if not rs_path or load_func is None:
+            logger.warning(
+                "VideoEmotionProcessor | frames_with_face_load | rs_path/load_func not set; "
+                "cannot load core_face_landmarks. Returning empty list."
+            )
+            return []
+
         try:
-            if os.path.exists(p):
-                if filename == "auto":
-                    files = os.listdir(p)
-                    if files:
-                        filename = files[-1]
-                    else:
-                        logger.warning("VideoEmotionProcessor | frames_with_face_load | Нет файлов в директории")
-                        return []
-                file_path = os.path.join(p, filename)
-                if os.path.exists(file_path):
-                    with open(file_path, "r", encoding="utf-8") as f:
-                        face_data = json.load(f)
-                    frames_with_face = face_data.get("frames_with_face", [])
-                    logger.info(f"VideoEmotionProcessor | frames_with_face_load | Загружено {len(frames_with_face)} кадров (legacy)")
-                    return sorted(frames_with_face)
+            core = load_func("core_face_landmarks", format="npz")
         except Exception as e:
-            logger.error(f"VideoEmotionProcessor | frames_with_face_load | Error: {e}")
-        
-        logger.warning("VideoEmotionProcessor | frames_with_face_load | Не удалось загрузить frames_with_face, возвращаем пустой список")
-        return []
+            logger.warning(f"VideoEmotionProcessor | frames_with_face_load | Failed to load core_face_landmarks: {e}")
+            return []
+
+        if not isinstance(core, dict):
+            return []
+
+        fi = core.get("frame_indices")
+        face_present = core.get("face_present")
+        if fi is None or face_present is None:
+            logger.warning("VideoEmotionProcessor | frames_with_face_load | core_face_landmarks missing frame_indices/face_present")
+            return []
+
+        try:
+            fi_np = np.asarray(fi, dtype=np.int32)
+            fp_np = np.asarray(face_present, dtype=bool)
+            if fi_np.shape[0] != fp_np.shape[0]:
+                logger.warning(
+                    "VideoEmotionProcessor | frames_with_face_load | "
+                    f"shape mismatch: frame_indices={fi_np.shape} face_present={fp_np.shape}"
+                )
+                return []
+            frames_with_face = [int(x) for x in fi_np[fp_np].tolist()]
+            logger.info(
+                f"VideoEmotionProcessor | frames_with_face_load | loaded {len(frames_with_face)} face frames from core_face_landmarks"
+            )
+            return sorted(frames_with_face)
+        except Exception as e:
+            logger.warning(f"VideoEmotionProcessor | frames_with_face_load | parse error: {e}")
+            return []
 
     def load_emonet(self, path: str, n_expression: int = 8):
         from models.emonet.emonet.models.emonet import EmoNet
@@ -826,7 +805,7 @@ class EmotionFaceModule(BaseModule):
     Использует VideoEmotionProcessor для обработки видео.
     
     Зависимости:
-    - face_detection (обязательная) - для получения списка кадров с лицами
+    - core_face_landmarks (обязательная) - face_present + landmarks, используется для выбора кадров с лицами
     """
     
     def __init__(
@@ -933,9 +912,9 @@ class EmotionFaceModule(BaseModule):
         Возвращает список зависимостей модуля.
         
         Обязательные:
-        - face_detection: для получения списка кадров с лицами
+        - core_face_landmarks: для получения списка кадров с лицами (face_present)
         """
-        return ["face_detection"]
+        return ["core_face_landmarks"]
     
     def process(
         self,
@@ -949,7 +928,7 @@ class EmotionFaceModule(BaseModule):
         Args:
             frame_manager: Менеджер кадров
             frame_indices: Список индексов кадров для обработки (не используется напрямую,
-                          VideoEmotionProcessor использует frames_with_face из face_detection)
+                          VideoEmotionProcessor использует frames_with_face из core_face_landmarks)
             config: Конфигурация модуля (не используется, параметры заданы в __init__)
             
         Returns:
@@ -958,7 +937,7 @@ class EmotionFaceModule(BaseModule):
             - sequence_features: последовательности эмоций для VisualTransformer
             - summary: метаданные обработки
         """
-        # VideoEmotionProcessor использует frames_with_face из face_detection,
+        # VideoEmotionProcessor использует frames_with_face из core_face_landmarks,
         # поэтому frame_indices игнорируется (процессор сам выбирает кадры)
         
         # Создаем временный путь для сохранения (VideoEmotionProcessor требует save_path)

@@ -1,0 +1,17 @@
+version: "pr4_profile_v1"
+
+processors:
+  audio:
+    enabled: false
+    required: false
+  text:
+    enabled: false
+    required: false
+
+visual:
+  cfg_path: "./VisualProcessor/config_pr4_optional_fail.yaml"
+  requirements:
+    cut_detection: true
+    failing_module: false
+
+

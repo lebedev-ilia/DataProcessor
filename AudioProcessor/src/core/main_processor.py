@@ -38,6 +38,11 @@ class MainProcessor:
         max_workers: int = 4,
         gpu_memory_limit: float = 0.8,
         sample_rate: int = 22050,
+        asr_model_size: str = "small",
+        diarization_model_size: str = "small",
+        emotion_model_size: str = "small",
+        source_separation_model_size: str = "small",
+        speech_analysis_pitch_enabled: bool = False,
         save_debug_results: bool = False,
         enabled_extractors: Optional[List[str]] = None,
         write_legacy_manifest: bool = True,
@@ -55,6 +60,11 @@ class MainProcessor:
         self.max_workers = max_workers
         self.gpu_memory_limit = gpu_memory_limit
         self.sample_rate = sample_rate
+        self.asr_model_size = str(asr_model_size or "small")
+        self.diarization_model_size = str(diarization_model_size or "small")
+        self.emotion_model_size = str(emotion_model_size or "small")
+        self.source_separation_model_size = str(source_separation_model_size or "small")
+        self.speech_analysis_pitch_enabled = bool(speech_analysis_pitch_enabled)
         self.save_debug_results = save_debug_results
         self.write_legacy_manifest = bool(write_legacy_manifest)
         
@@ -186,6 +196,16 @@ class MainProcessor:
                 "clap": lambda: __import__(
                     "src.extractors.clap_extractor", fromlist=["CLAPExtractor"]
                 ).CLAPExtractor(device=self.device, sample_rate=48000),
+                "asr": lambda: __import__(
+                    "src.extractors.asr_extractor", fromlist=["ASRExtractor"]
+                ).ASRExtractor(device=self.device, model_size=self.asr_model_size, sample_rate=16000),
+                "speaker_diarization": lambda: __import__(
+                    "src.extractors.speaker_diarization_extractor", fromlist=["SpeakerDiarizationExtractor"]
+                ).SpeakerDiarizationExtractor(
+                    device=self.device,
+                    model_size=self.diarization_model_size,
+                    sample_rate=16000,
+                ),
                 "tempo": lambda: __import__(
                     "src.extractors.tempo_extractor", fromlist=["TempoExtractor"]
                 ).TempoExtractor(device=self.device, sample_rate=self.sample_rate),
@@ -224,17 +244,19 @@ class MainProcessor:
                 ).SpectralEntropyExtractor(device=self.device, sample_rate=self.sample_rate),
                 "source_separation": lambda: __import__(
                     "src.extractors.source_separation_extractor", fromlist=["SourceSeparationExtractor"]
-                ).SourceSeparationExtractor(device=self.device, sample_rate=44100),
+                ).SourceSeparationExtractor(device=self.device, model_size=self.source_separation_model_size, batch_size=8),
                 "emotion_diarization": lambda: __import__(
                     "src.extractors.emotion_diarization_extractor", fromlist=["EmotionDiarizationExtractor"]
-                ).EmotionDiarizationExtractor(device=self.device, sample_rate=16000),
+                ).EmotionDiarizationExtractor(device=self.device, model_size=self.emotion_model_size, sample_rate=16000, batch_size=16),
                 "speech_analysis": lambda: __import__(
                     "src.extractors.speech_analysis_extractor", fromlist=["SpeechAnalysisExtractor"]
                 ).SpeechAnalysisExtractor(
                     device=self.device,
+                    asr_model_size=self.asr_model_size,
+                    diarization_model_size=self.diarization_model_size,
                     sample_rate=16000,
+                    pitch_enabled=bool(self.speech_analysis_pitch_enabled),
                     pitch_backend=("torchcrepe" if str(self.device).lower() == "cuda" else "classic"),
-                    pitch_enabled=(str(self.device).lower() == "cuda"),
                 ),
             }
 
@@ -247,7 +269,8 @@ class MainProcessor:
                 if ensure_sa and "speech_analysis" not in requested:
                     requested.append("speech_analysis")
                 # Убираем виртуальные из инициализации, они будут опубликованы после run(speech_analysis)
-                requested = [n for n in requested if n not in virtuals]
+                # If an extractor exists as a real factory (e.g., asr / speaker_diarization), do NOT treat it as virtual.
+                requested = [n for n in requested if not (n in virtuals and n not in extractor_factories)]
 
             self.extractors = {}
             for name in requested:

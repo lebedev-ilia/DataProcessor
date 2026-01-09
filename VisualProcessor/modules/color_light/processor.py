@@ -1064,20 +1064,14 @@ class ColorLightProcessor(BaseModule):
                 f"rs_path: {self.rs_path}"
             )
         
-        # Извлекаем scenes из данных
-        # Формат может быть разным, проверяем несколько вариантов
+        # Canonical contract (audit): scene_classification exports `scenes` (dict) in NPZ.
         scenes = None
         if isinstance(scene_data, dict):
-            # Пробуем найти scenes в разных местах
-            if "scenes" in scene_data:
-                scenes = scene_data["scenes"]
-            elif "aggregated" in scene_data and "scenes" in scene_data["aggregated"]:
-                scenes = scene_data["aggregated"]["scenes"]
-            else:
-                # Возможно, весь словарь и есть scenes
-                # Проверяем структуру: должны быть ключи с "indices"
-                if all(isinstance(v, dict) and "indices" in v for v in scene_data.values()):
-                    scenes = scene_data
+            if isinstance(scene_data.get("scenes"), dict):
+                scenes = scene_data.get("scenes")
+            elif isinstance(scene_data.get("scenes_raw"), dict):
+                # legacy alias
+                scenes = scene_data.get("scenes_raw")
         
         if scenes is None:
             raise ValueError(
@@ -1089,9 +1083,18 @@ class ColorLightProcessor(BaseModule):
         all_frame_features = {}
         all_scene_features = {}
         
-        for i, (scene_label, frame_range) in enumerate(scenes.items()):
-                start_frame = frame_range["indices"][0]
-                end_frame = frame_range["indices"][-1]
+        for i, (scene_id, scene) in enumerate(scenes.items()):
+                if not isinstance(scene, dict) or "indices" not in scene:
+                    continue
+                indices = list(scene.get("indices") or [])
+                if not indices:
+                    continue
+                scene_label = str(scene.get("scene_label") or "unknown")
+                # Avoid collisions when the same label appears in multiple disjoint scenes.
+                scene_key = f"{scene_label}__{scene_id}"
+
+                start_frame = int(indices[0])
+                end_frame = int(indices[-1])
 
                 num_frames_in_scene = end_frame - start_frame + 1
 
@@ -1115,7 +1118,7 @@ class ColorLightProcessor(BaseModule):
                 # Убираем дубликаты и сортируем
                 frame_indices = np.unique(frame_indices)
 
-                all_frame_features[scene_label] = {}
+                all_frame_features[scene_key] = {}
                 scene_frame_features = []
 
                 # ==== FEATURE EXTRACTION ====
@@ -1125,7 +1128,7 @@ class ColorLightProcessor(BaseModule):
                         frame_feat = self.extract_frame_features(frame, frame_idx)
 
                         scene_frame_features.append(frame_feat)
-                        all_frame_features[scene_label][frame_idx] = frame_feat
+                        all_frame_features[scene_key][frame_idx] = frame_feat
 
                         logger.info(
                             f"Сцена {i+1}/{len(scenes)} | Кадр {k+1}/{len(frame_indices)} обработан"
@@ -1141,7 +1144,10 @@ class ColorLightProcessor(BaseModule):
                         start_frame,
                         end_frame
                     )
-                    all_scene_features[scene_label] = scene_feat
+                    scene_feat = dict(scene_feat or {})
+                    scene_feat["scene_label"] = scene_label
+                    scene_feat["scene_id"] = str(scene_id)
+                    all_scene_features[scene_key] = scene_feat
 
                 logger.info(f"Сцена {i+1}/{len(scenes)} | Scene-level фичи извлечены")
         

@@ -1,0 +1,12 @@
+model_name: shared_tokenizer_v1
+model_version: "1"
+role: nlp_tokenizer
+runtime: inprocess
+engine: tokenizers
+precision: "na"
+device_policy: cpu
+weights_digest: auto
+local_artifacts:
+  - kind: file
+    path: "text/shared_tokenizer_v1/tokenizer.json"
+

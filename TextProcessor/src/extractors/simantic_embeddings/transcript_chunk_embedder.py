@@ -12,75 +12,53 @@ TranscriptChunkEmbedder — извлекает эмбеддинги по чан�
 
 from __future__ import annotations
 
-import json
 import hashlib
+import json
+import os
+import re
 from pathlib import Path
 from typing import List, Dict, Any, Optional
 
 import numpy as np
 import torch
 
-try:
-    import nltk
-    from nltk.tokenize import sent_tokenize
-except Exception as e:  # pragma: no cover
-    raise ImportError("Requires nltk. Install with: pip install nltk") from e
-
-from sentence_transformers import SentenceTransformer
 from src.core.model_registry import get_model
 
 from src.core.base_extractor import BaseExtractor
 from src.core.metrics import system_snapshot, process_memory_bytes
 from src.schemas.models import VideoDocument
 from src.core.text_utils import normalize_whitespace
+from src.core.path_utils import default_artifacts_dir, default_cache_dir
 
 
 class TranscriptChunkEmbedder(BaseExtractor):
     VERSION = "1.0.0"
 
+    _SENT_SPLIT_RE = re.compile(r"(?<=[.!?])\s+")
+
     def __init__(
         self,
-        model_name: str = "intfloat/multilingual-e5-large",
-        cache_dir: str = "/home/ilya/Рабочий стол/DataProcessor/TextProcessor/.cache/transcript_embed",
-        artifacts_dir: str = "/home/ilya/Рабочий стол/DataProcessor/TextProcessor/.artifacts",
-        device: Optional[str] = None,
+        model_name: str = "sentence-transformers/all-MiniLM-L6-v2",
+        cache_dir: Optional[str] = None,
+        artifacts_dir: Optional[str] = None,
+        device: Optional[str] = "cpu",
         fp16: bool = True,
         batch_size: int = 64,
         max_chunk_tokens: int = 3,
         overlap_ratio: float = 0.15,
     ) -> None:
-        # Ensure punkt is available but don't spam downloads
-        try:
-            nltk.data.find("tokenizers/punkt")
-        except Exception:
-            try:
-                nltk.download("punkt", quiet=True)
-            except Exception as e:
-                print(f"Error downloading nltk punkt: {e}")
-                raise e
-
-        try:
-            nltk.data.find("tokenizers/punkt_tab")
-        except Exception:
-            try:
-                nltk.download("punkt_tab", quiet=True)
-            except Exception as e:
-                print(f"Error downloading nltk punkt_tab: {e}")
-                raise e
-
         self.model_name = model_name
-        self.cache_dir = Path(cache_dir)
-        self.artifacts_dir = Path(artifacts_dir)
+        # No-network policy: cache/artifacts live under TextProcessor folder by default (configurable via env).
+        base_cache = default_cache_dir() / "transcript_embed"
+        self.cache_dir = Path(cache_dir).expanduser().resolve() if cache_dir else base_cache
+        self.artifacts_dir = Path(artifacts_dir).expanduser().resolve() if artifacts_dir else default_artifacts_dir()
         self.batch_size = batch_size
         self.max_chunk_tokens = max_chunk_tokens
         self.overlap_ratio = overlap_ratio
         self.cache_dir.mkdir(parents=True, exist_ok=True)
         self.artifacts_dir.mkdir(parents=True, exist_ok=True)
 
-        if device is None:
-            self.device = "cuda" if torch.cuda.is_available() else "cpu"
-        else:
-            self.device = device
+        self.device = str(device or "cpu")
         self.fp16 = fp16 and ("cuda" in self.device)
 
         # metrics: init snapshots
@@ -98,20 +76,8 @@ class TranscriptChunkEmbedder(BaseExtractor):
         }
 
     def _load_model(self) -> None:
-        try:
-            self.model = get_model(self.model_name, self.device, self.fp16)
-        except Exception as e:
-            # Auto-fallback to CPU on CUDA OOM or similar GPU init failures
-            print(f"Error loading model on {self.device}: {e}. Auto-fallback to CPU.")
-            msg = str(e)
-            if ("CUDA out of memory" in msg or "CUDA" in msg) and self.device and "cuda" in self.device:
-                self.device = "cpu"
-                self.fp16 = False
-                # reduce batch size defensively on CPU
-                self.batch_size = min(self.batch_size, 16)
-                self.model = get_model(self.model_name, self.device, self.fp16)
-            else:
-                raise
+        # No-fallback policy: if requested device/model can't load, fail-fast.
+        self.model = get_model(self.model_name, self.device, self.fp16)
 
     # release_resources removed: models are shared via registry and persist
 
@@ -120,8 +86,17 @@ class TranscriptChunkEmbedder(BaseExtractor):
         payload = (model_name + "||" + text.strip()).encode("utf-8")
         return hashlib.sha256(payload).hexdigest()
 
+    @classmethod
+    def _sent_split(cls, text: str) -> List[str]:
+        # Lightweight sentence split without nltk (no downloads).
+        t = normalize_whitespace(text)
+        if not t:
+            return []
+        parts = cls._SENT_SPLIT_RE.split(t)
+        return [p.strip() for p in parts if p and p.strip()]
+
     def _split_into_chunks(self, text: str) -> List[str]:
-        sents = sent_tokenize(text)
+        sents = self._sent_split(text)
         chunks: List[str] = []
         current_tokens: List[str] = []
         token_count = 0
@@ -237,7 +212,7 @@ class TranscriptChunkEmbedder(BaseExtractor):
                     results_by_source[source_key] = {
                         "embeddings_path": str(artifacts_vec_path.resolve()) if artifacts_vec_path.exists() else "",
                         "meta_path": str(cache_meta_path.resolve()),
-                        "n_chunks": int(meta.get("n_chunks", len(meta.get("chunks", [])))),
+                        "n_chunks": int(meta.get("n_chunks", 0)),
                         "embedding_dim": int(meta.get("embedding_dim", 0)),
                     }
                     cached_ok = True
@@ -253,16 +228,19 @@ class TranscriptChunkEmbedder(BaseExtractor):
                 np.save(tmp_vec, embeddings.astype(np.float32))
                 tmp_vec.replace(artifacts_vec_path)
 
+                # Privacy: do NOT store raw text chunks in cache meta by default.
                 meta = {
                     "source": source_key,
-                    "chunks": chunks,
                     "hash": h,
                     "model": self.model_name,
                     "device": self.device,
                     "n_chunks": len(chunks),
                     "embedding_dim": int(embeddings.shape[1]) if embeddings.size > 0 else 0,
+                    "chunk_word_counts": [int(len(c.split())) for c in chunks],
                 }
-                cache_meta_path.write_text(json.dumps(meta, ensure_ascii=False, indent=2))
+                tmp_meta = cache_meta_path.with_suffix(".tmp.json")
+                tmp_meta.write_text(json.dumps(meta, ensure_ascii=False, indent=2), encoding="utf-8")
+                os.replace(str(tmp_meta), str(cache_meta_path))
 
                 results_by_source[source_key] = {
                     "embeddings_path": str(artifacts_vec_path.resolve()),

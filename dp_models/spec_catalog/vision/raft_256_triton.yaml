@@ -1,0 +1,21 @@
+model_name: raft_256_triton
+model_version: "1"
+role: optical_flow_raft
+runtime: triton
+engine: triton
+precision: fp16
+device_policy: cuda
+weights_digest: provided_by_deploy
+local_artifacts: []
+runtime_params:
+  triton_http_url: "${TRITON_HTTP_URL}"
+  triton_timeout_sec: 60.0
+  triton_model_name: "raft_256"
+  triton_model_version: "1"
+  triton_input0_name: "INPUT0__0"
+  triton_input1_name: "INPUT1__0"
+  triton_input_datatype: "UINT8"
+  triton_output_name: "OUTPUT__0"
+  triton_output_datatype: "FP32"
+
+

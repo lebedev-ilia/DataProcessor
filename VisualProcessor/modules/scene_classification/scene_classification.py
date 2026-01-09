@@ -16,60 +16,18 @@ from collections import defaultdict
 import os
 import cv2
 import numpy as np
-import requests
 import torch
 import torch.nn.functional as F
 from PIL import Image
-from torchvision import models, transforms
+from torchvision import transforms
+
+from dp_models.manager import get_global_model_manager
+from dp_models.errors import ModelManagerError
 
 from modules.base_module import BaseModule
 
-try:
-    import timm
-    TIMM_AVAILABLE = True
-except ImportError:
-    TIMM_AVAILABLE = False
-
-try:
-    from transformers import CLIPProcessor, CLIPModel
-    CLIP_AVAILABLE = True
-except ImportError:
-    CLIP_AVAILABLE = False
-    
 from utils.logger import get_logger
 logger = get_logger("Places365SceneClassifier")
-
-
-def _load_core_clip_embeddings(rs_path: Optional[str], frame_index: int) -> Optional[np.ndarray]:
-    """
-    Загружает CLIP эмбеддинги из core_clip для конкретного кадра.
-    Возвращает None, если core данные недоступны.
-    """
-    if not rs_path:
-        return None
-    
-    core_path = os.path.join(rs_path, "core_clip", "embeddings.npz")
-    if not os.path.isfile(core_path):
-        return None
-    
-    try:
-        # Strict alignment by frame_indices (union-domain) — no positional assumptions.
-        data = np.load(core_path, allow_pickle=True)
-        core_idx = data.get("frame_indices")
-        core_emb = data.get("frame_embeddings")
-        if core_idx is None or core_emb is None:
-            return None
-        core_idx = np.asarray(core_idx, dtype=np.int32)
-        core_emb = np.asarray(core_emb, dtype=np.float32)
-
-        mapping = {int(fi): i for i, fi in enumerate(core_idx.tolist())}
-        pos = mapping.get(int(frame_index), None)
-        if pos is None:
-            return None
-        return core_emb[int(pos)]
-    except Exception as e:
-        logger.warning(f"Places365SceneClassifier | _load_core_clip_embeddings | Error loading core data: {e}")
-        return None
 
 class Places365SceneClassifier(BaseModule):
     """
@@ -79,13 +37,7 @@ class Places365SceneClassifier(BaseModule):
     the top-K scene predictions per frame.
     """
 
-    CATEGORY_URL = "https://raw.githubusercontent.com/CSAILVision/places365/master/categories_places365.txt"
-    MODEL_URLS = {
-        "resnet18": "http://places2.csail.mit.edu/models_places365/resnet18_places365.pth.tar",
-        "resnet50": "http://places2.csail.mit.edu/models_places365/resnet50_places365.pth.tar",
-    }
-    # Современные модели через timm (предобученные на ImageNet, можно дообучить на Places365)
-    # Или использовать предобученные на Places365 из timm
+    # Supported architectures (must be backed by dp_models specs; no downloads allowed).
     TIMM_MODELS = {
         # EfficientNet - эффективные и точные
         "efficientnet_b0": "efficientnet_b0",
@@ -113,14 +65,14 @@ class Places365SceneClassifier(BaseModule):
     def __init__(
         self,
         *,
+        runtime: str = "inprocess",
+        triton_model_spec: str = "places365_resnet50_224_triton",
         model_arch: str = "resnet50",
         use_timm: bool = False,
         min_scene_length: int = 30,
         min_scene_seconds: Optional[float] = None,
         batch_size: int = 1,
         device: Optional[str] = None,
-        categories_path: Optional[str] = None,
-        cache_dir: Optional[str] = None,
         gpu_memory_threshold: float = 0.9,
         log_metrics_every_n_frames: int = 10,
         # Quality improvement options
@@ -145,8 +97,8 @@ class Places365SceneClassifier(BaseModule):
         :param top_k: number of predictions to return per frame
         :param batch_size: number of frames to process simultaneously
         :param device: torch device ('cuda', 'cpu', etc.), autodetected when None
-        :param categories_path: optional local path to categories_places365.txt
-        :param cache_dir: optional directory where helper files will be cached
+        :param categories_path: (removed) categories are resolved via ModelManager (DP_MODELS_ROOT)
+        :param cache_dir: (removed) no implicit downloads/caching; local artifacts must exist
         :param gpu_memory_threshold: BaseExtractor GPU memory threshold
         :param log_metrics_every_n_frames: resource logging cadence
         :param input_size: input image size (224, 256, 320, etc.). Larger = better accuracy, slower
@@ -156,8 +108,8 @@ class Places365SceneClassifier(BaseModule):
         :param smoothing_window: window size for temporal smoothing (number of frames)
         :param min_scene_seconds: minimal scene length in seconds (fps‑aware). If None,
             value will be derived from ``min_scene_length`` and runtime FPS.
-        :param enable_advanced_features: enable advanced features (indoor/outdoor, time of day, etc.)
-        :param use_clip_for_semantics: use CLIP for semantic features (aesthetic, atmosphere)
+        :param enable_advanced_features: enable advanced features (ontology + core_clip semantics)
+        :param use_clip_for_semantics: kept for compatibility; semantics is always core_clip-only (no local CLIP, no heuristics)
         """
         # BaseModule init (results store, logging, metadata helpers)
         super().__init__(rs_path=rs_path, logger_name="scene_classification", **kwargs)
@@ -174,16 +126,13 @@ class Places365SceneClassifier(BaseModule):
         self.use_multi_crop = use_multi_crop
         self.temporal_smoothing = temporal_smoothing
         self.smoothing_window = max(1, smoothing_window)
-        self.use_timm = use_timm
-        self.cache_dir = Path(cache_dir) if cache_dir else Path.home() / ".cache" / "places365"
-        self.cache_dir.mkdir(parents=True, exist_ok=True)
+        self.use_timm = bool(use_timm)
         
-        # Advanced features
-        self.enable_advanced_features = enable_advanced_features
-        # CLIP features may still partially work via heuristics when transformers aren't available.
+        # Advanced features policy:
+        # - heuristics are forbidden (audit rule)
+        # - semantics is computed strictly from core_clip embeddings + core_clip-provided prompt embeddings
+        self.enable_advanced_features = bool(enable_advanced_features)
         self.use_clip_for_semantics = bool(use_clip_for_semantics)
-        self._clip_model = None
-        self._clip_processor = None
 
         # core_clip integration (cache provider output once, not per-frame)
         self._core_clip_path: Optional[str] = None
@@ -213,20 +162,72 @@ class Places365SceneClassifier(BaseModule):
                         "Will fallback to per-frame loader."
                     )
 
-        # Cached (normalized) text embeddings for core_clip mode
-        self._core_text_embeddings: Dict[str, np.ndarray] = {}
+        # core_clip text embeddings for scene semantics (provided by core_clip NPZ)
+        self._scene_aesthetic_text_embeddings: Optional[np.ndarray] = None
+        self._scene_luxury_text_embeddings: Optional[np.ndarray] = None
+        self._scene_atmosphere_text_embeddings: Optional[np.ndarray] = None
+        self._last_core_clip_models_used: List[Dict[str, Any]] = []
+        self._last_places_models_used: List[Dict[str, Any]] = []
         
         # Initialize indoor/outdoor and nature/urban mappings
         self._init_scene_mappings()
 
-        if use_timm and not TIMM_AVAILABLE:
-            raise ImportError(
-                "timm library is required for modern architectures. "
-                "Install it with: pip install timm"
-            )
+        self.runtime = str(runtime or "inprocess").strip().lower()
+        self.triton_model_spec = str(triton_model_spec or "").strip()
 
-        self.categories = self._load_categories(categories_path)
-        self.model = self._load_model(model_arch)
+        # --- Load Places365 via ModelManager (strict local-only) ---
+        self._mm = get_global_model_manager()
+        model_arch = str(model_arch or "").strip().lower()
+        if self.runtime == "triton":
+            if self.input_size not in (224, 336, 448):
+                raise ValueError("scene_classification(triton) supports only input_size in {224,336,448} (fixed-shape Triton branches).")
+            if self.use_timm:
+                raise ValueError("scene_classification(triton): use_timm is not supported (baseline=Places365 ResNet50).")
+            if self.use_tta or self.use_multi_crop:
+                raise ValueError("scene_classification(triton): TTA/multi-crop are not supported (keep defaults).")
+            if not self.triton_model_spec:
+                raise ValueError("scene_classification(triton): triton_model_spec is empty.")
+            try:
+                resolved = self._mm.get(model_name=self.triton_model_spec)
+            except ModelManagerError as e:
+                raise RuntimeError(f"scene_classification | failed to load Places365 Triton spec via ModelManager: {e}") from e
+            self._triton_handle = resolved.handle  # dict with {"client", "triton_model_name", ...}
+            self._triton_rp = dict(resolved.spec.runtime_params or {})
+            self.model = None
+        elif self.use_timm:
+            if model_arch not in self.TIMM_MODELS:
+                available = ", ".join(sorted(self.TIMM_MODELS.keys()))
+                raise ValueError(f"Unsupported timm model_arch '{model_arch}'. Available: {available}")
+            spec_name = f"places365_timm_{model_arch}"
+        else:
+            if model_arch not in ("resnet18", "resnet50"):
+                raise ValueError("Unsupported Places365 model_arch (no-network). Use resnet18/resnet50, or set use_timm=true.")
+            spec_name = f"places365_{model_arch}"
+
+        if self.runtime != "triton":
+            try:
+                resolved = self._mm.get(model_name=spec_name)
+            except ModelManagerError as e:
+                raise RuntimeError(f"scene_classification | failed to load Places365 via ModelManager: {e}") from e
+            self.model = resolved.handle
+            self._triton_handle = None
+            self._triton_rp = {}
+        # Resolve categories file from spec runtime_params.categories_relpath
+        rp = (resolved.spec.runtime_params or {}) if "resolved" in locals() else (self._triton_rp or {})
+        cat_rel = rp.get("categories_relpath")
+        if not isinstance(cat_rel, str) or not cat_rel.strip():
+            raise RuntimeError("scene_classification | ModelSpec missing runtime_params.categories_relpath")
+        cat_abs = (resolved.resolved_artifacts.get(cat_rel) if "resolved" in locals() else None)
+        if not cat_abs and isinstance(self._mm, object):
+            # For Triton spec, categories are a local_artifact; ModelManager should resolve it too.
+            try:
+                cat_abs = getattr(resolved, "resolved_artifacts", {}).get(cat_rel) if "resolved" in locals() else None
+            except Exception:
+                cat_abs = None
+        if not cat_abs:
+            raise RuntimeError(f"scene_classification | categories file is not resolved: {cat_rel}")
+        self.categories = self._parse_categories(Path(cat_abs).read_text(encoding="utf-8"))
+        self._last_places_models_used = [resolved.models_used_entry] if "resolved" in locals() else []
         
         # Base preprocessing (used for single inference)
         resize_size = int(self.input_size * 1.143)  # ~256 for 224, ~366 for 320
@@ -257,16 +258,10 @@ class Places365SceneClassifier(BaseModule):
                 ]),
             ]
         
-        self.model.eval()
+        if self.model is not None:
+            self.model.eval()
         
-        # Load CLIP if needed (только если не используем core_clip).
-        # If transformers isn't available, we'll silently fallback to heuristics.
-        if self.enable_advanced_features and self.use_clip_for_semantics and (not self._use_core_clip) and CLIP_AVAILABLE:
-            self._load_clip_model()
-        elif self._use_core_clip:
-            logger.info("Places365SceneClassifier | Используется core_clip для семантических фичей")
-            # Precompute text embeddings once (optional; closes TODOs for core_clip mode)
-            self._maybe_prepare_core_text_embeddings()
+        # NOTE: semantics is strictly core_clip-only. If core_clip is missing, module will fail-fast in process().
 
     @property
     def module_name(self) -> str:
@@ -274,20 +269,77 @@ class Places365SceneClassifier(BaseModule):
         return "scene_classification"
 
     def required_dependencies(self) -> List[str]:
-        # core_clip is optional. If it's present we use it; otherwise we fallback to internal CLIP or heuristics.
-        return []
+        # Strict policy: semantics must be computed from core_clip (no local CLIP, no heuristics).
+        return ["core_clip"]
+
+    def get_models_used(self, config: Dict[str, Any], metadata: Dict[str, Any]) -> List[Dict[str, Any]]:
+        # Deterministic: include both the Places365 classifier and the upstream core_clip model mapping.
+        out: List[Dict[str, Any]] = []
+        if self._last_places_models_used:
+            out.extend(self._last_places_models_used)
+        if self._last_core_clip_models_used:
+            out.extend(self._last_core_clip_models_used)
+        return out
 
     def process(self, frame_manager, frame_indices: List[int], config: Dict[str, Any]) -> Dict[str, Any]:
         """
         BaseModule entrypoint.
         Returns a npz-friendly dict (numeric arrays where possible).
         """
+        if len(frame_indices) < 2:
+            raise RuntimeError("scene_classification | frame_indices пустой/меньше 2 (no-fallback)")
+
+        # Enforce time-axis source-of-truth
+        union_ts = frame_manager.meta.get("union_timestamps_sec")
+        if not isinstance(union_ts, list) or len(union_ts) <= max(frame_indices):
+            raise RuntimeError("scene_classification | missing/invalid union_timestamps_sec in frames metadata (no-fallback)")
+
+        # Strict dependency: core_clip must exist and must contain required embeddings.
+        self._load_core_clip_dependency()
+
         # Apply lightweight runtime overrides (do not rebuild model by default)
         if config:
             self._apply_runtime_config(config)
 
         agg = self.classify_with_advanced_features(frame_manager, frame_indices)
         return self._pack_npz_result(agg)
+
+    def _load_core_clip_dependency(self) -> None:
+        """
+        Load core_clip artifacts required for semantics:
+        - frame_embeddings aligned by frame_indices (union domain)
+        - scene_*_text_embeddings exported by core_clip
+        """
+        core = self.load_core_provider("core_clip")
+        if core is None:
+            raise RuntimeError("scene_classification | core_clip is required but not found (no-fallback)")
+
+        core_idx = core.get("frame_indices")
+        core_emb = core.get("frame_embeddings")
+        if core_idx is None or core_emb is None:
+            raise RuntimeError("scene_classification | core_clip missing frame_indices/frame_embeddings (no-fallback)")
+
+        core_idx = np.asarray(core_idx, dtype=np.int32)
+        core_emb = np.asarray(core_emb, dtype=np.float32)
+        self._core_clip_frame_indices = core_idx
+        self._core_clip_frame_embeddings = core_emb
+        self._core_clip_index_map = {int(fi): i for i, fi in enumerate(core_idx.tolist())}
+        self._use_core_clip = True
+
+        # Required scene semantics embeddings (exported by core_clip)
+        aes = core.get("scene_aesthetic_text_embeddings")
+        lux = core.get("scene_luxury_text_embeddings")
+        atm = core.get("scene_atmosphere_text_embeddings")
+        if aes is None or lux is None or atm is None:
+            raise RuntimeError("scene_classification | core_clip missing scene_*_text_embeddings (upgrade core_clip) (no-fallback)")
+        self._scene_aesthetic_text_embeddings = np.asarray(aes, dtype=np.float32)
+        self._scene_luxury_text_embeddings = np.asarray(lux, dtype=np.float32)
+        self._scene_atmosphere_text_embeddings = np.asarray(atm, dtype=np.float32)
+
+        # Capture models_used from core_clip meta for reproducibility chaining.
+        meta = core.get("meta")
+        if isinstance(meta, dict) and isinstance(meta.get("models_used"), list):
+            self._last_core_clip_models_used = meta.get("models_used") or []
 
     def _apply_runtime_config(self, config: Dict[str, Any]) -> None:
         """Apply safe runtime overrides that don't require model rebuild."""
@@ -298,8 +350,6 @@ class Places365SceneClassifier(BaseModule):
                 self.min_scene_length_frames = max(1, int(config["min_scene_length"]))
             if "enable_advanced_features" in config and config["enable_advanced_features"] is not None:
                 self.enable_advanced_features = bool(config["enable_advanced_features"])
-            if "use_clip_for_semantics" in config and config["use_clip_for_semantics"] is not None:
-                self.use_clip_for_semantics = bool(config["use_clip_for_semantics"])
         except Exception as e:
             logger.warning(f"Places365SceneClassifier | _apply_runtime_config | Failed to apply overrides: {e}")
 
@@ -314,65 +364,49 @@ class Places365SceneClassifier(BaseModule):
                 return emb
             except Exception:
                 return None
-        # Fallback to legacy per-frame loader
-        return _load_core_clip_embeddings(self.rs_path, frame_index)
+        return None
 
-    def _maybe_prepare_core_text_embeddings(self) -> None:
+    def _core_clip_probs(self, *, frame_index: int, text_embeddings: np.ndarray) -> np.ndarray:
         """
-        Precompute normalized text embeddings for core_clip mode.
-        This allows computing aesthetic/luxury/atmosphere scores without loading CLIP per-frame.
+        Compute softmax probabilities for a set of CLIP text embeddings using core_clip image embeddings.
+        Assumes both image embeddings and text_embeddings are in the same space and L2-normalized (core_clip contract).
         """
-        if not (self._use_core_clip and self.use_clip_for_semantics):
-            return
-        if not CLIP_AVAILABLE:
-            return
-        if self._core_text_embeddings:
-            return
+        if text_embeddings is None:
+            raise RuntimeError("scene_classification | core_clip text embeddings are missing (no-fallback)")
+        img = self._get_core_clip_embedding(frame_index)
+        if img is None:
+            raise RuntimeError(f"scene_classification | core_clip embedding missing for frame_index={frame_index} (no-fallback)")
+        img = np.asarray(img, dtype=np.float32)
+        img = img / (np.linalg.norm(img) + 1e-9)
+        te = np.asarray(text_embeddings, dtype=np.float32)
+        # (P,) logits
+        logits = img @ te.T
+        logits = logits - float(np.max(logits))
+        exp = np.exp(logits)
+        probs = exp / (float(np.sum(exp)) + 1e-9)
+        return probs.astype(np.float32)
 
-        try:
-            # Compute on CPU to reduce GPU memory pressure (core_clip already provides image embeddings).
-            model = CLIPModel.from_pretrained("openai/clip-vit-base-patch32")
-            processor = CLIPProcessor.from_pretrained("openai/clip-vit-base-patch32")
-            model.eval()
+    def _core_clip_binary_score(
+        self,
+        *,
+        frame_index: int,
+        text_embeddings: Optional[np.ndarray],
+        pos_indices: Tuple[int, int] = (0, 1),
+    ) -> float:
+        te = np.asarray(text_embeddings, dtype=np.float32) if text_embeddings is not None else None
+        probs = self._core_clip_probs(frame_index=frame_index, text_embeddings=te)
+        s = float(probs[int(pos_indices[0])] + probs[int(pos_indices[1])])
+        return float(np.clip(s, 0.0, 1.0))
 
-            prompt_sets = {
-                "aesthetic": [
-                    "aesthetic beautiful scene",
-                    "professional photography",
-                    "ugly unappealing scene",
-                    "amateur photography",
-                ],
-                "luxury": [
-                    "luxury expensive high-end scene",
-                    "premium elegant sophisticated",
-                    "cheap low-quality scene",
-                    "budget affordable scene",
-                ],
-                "atmosphere": [
-                    "cozy warm comfortable scene",
-                    "scary frightening dark scene",
-                    "epic grand majestic scene",
-                    "neutral ordinary scene",
-                ],
-            }
-
-            for key, texts in prompt_sets.items():
-                inputs = processor(text=texts, return_tensors="pt", padding=True)
-                with torch.no_grad():
-                    feats = model.get_text_features(**inputs)
-                feats = feats / (feats.norm(dim=-1, keepdim=True) + 1e-9)
-                self._core_text_embeddings[key] = feats.cpu().numpy().astype(np.float32)
-
-            # Free memory
-            del model
-            del processor
-            if torch.cuda.is_available():
-                try:
-                    torch.cuda.empty_cache()
-                except Exception:
-                    pass
-        except Exception as e:
-            logger.warning(f"Places365SceneClassifier | core text embeddings init failed: {e}")
+    def _core_clip_atmosphere(self, *, frame_index: int) -> Dict[str, float]:
+        te = self._scene_atmosphere_text_embeddings
+        probs = self._core_clip_probs(frame_index=frame_index, text_embeddings=np.asarray(te, dtype=np.float32))
+        return {
+            "cozy": float(probs[0]),
+            "scary": float(probs[1]),
+            "epic": float(probs[2]),
+            "neutral": float(probs[3]),
+        }
 
     def _pack_npz_result(self, agg: Dict[str, Any]) -> Dict[str, Any]:
         """
@@ -418,13 +452,6 @@ class Places365SceneClassifier(BaseModule):
             "mean_outdoor": f32("mean_outdoor"),
             "mean_nature": f32("mean_nature"),
             "mean_urban": f32("mean_urban"),
-            # time-of-day
-            "mean_morning": f32("mean_morning"),
-            "mean_day": f32("mean_day"),
-            "mean_evening": f32("mean_evening"),
-            "mean_night": f32("mean_night"),
-            "time_of_day_top": np.asarray([s.get("time_of_day_top", "") for s in scenes], dtype=object),
-            "time_of_day_confidence": f32("time_of_day_confidence"),
             # aesthetics / luxury
             "mean_aesthetic_score": f32("mean_aesthetic_score"),
             "aesthetic_std": f32("aesthetic_std"),
@@ -436,10 +463,6 @@ class Places365SceneClassifier(BaseModule):
             "mean_epic": f32("mean_epic"),
             "mean_neutral": f32("mean_neutral"),
             "atmosphere_entropy": f32("atmosphere_entropy"),
-            # geometry
-            "mean_openness": f32("mean_openness"),
-            "mean_clutter": f32("mean_clutter"),
-            "mean_depth_cues": f32("mean_depth_cues"),
             # stability
             "scene_change_score": f32("scene_change_score"),
             "label_stability": f32("label_stability"),
@@ -447,7 +470,9 @@ class Places365SceneClassifier(BaseModule):
             "indices": np.asarray([s.get("indices", []) for s in scenes], dtype=object),
             "dominant_places_topk_ids": np.asarray([s.get("dominant_places_topk_ids", []) for s in scenes], dtype=object),
             "dominant_places_topk_probs": np.asarray([s.get("dominant_places_topk_probs", []) for s in scenes], dtype=object),
-            # keep raw for backwards compatibility/debug
+            # canonical raw mapping for downstream modules
+            "scenes": np.asarray(agg, dtype=object),
+            # legacy alias (kept)
             "scenes_raw": np.asarray(agg, dtype=object),
         }
         return payload
@@ -461,6 +486,9 @@ class Places365SceneClassifier(BaseModule):
         Returns a list of dicts, one per frame:
             { "label": str, "score": float }
         """
+
+        if self.runtime == "triton":
+            return self._classify_triton(frame_manager, frame_indices)
 
         # Output results indexed by position (not frame index)
         raw_predictions: List[Dict[str, Any]] = [None] * len(frame_indices)
@@ -530,6 +558,127 @@ class Places365SceneClassifier(BaseModule):
         return raw_predictions
 
     __call__ = classify
+
+    def _preprocess_places365_u8_nhwc_fixed(self, frame: np.ndarray) -> Optional[np.ndarray]:
+        """
+        Match torchvision pipeline (Resize ~256 on shorter side + CenterCrop 224),
+        but output UINT8 NHWC for Triton ensemble input.
+        """
+        if frame is None or not isinstance(frame, np.ndarray):
+            return None
+
+        # FrameManager.get() contract: RGB
+        if frame.ndim == 2:
+            rgb = cv2.cvtColor(frame, cv2.COLOR_GRAY2RGB)
+        elif frame.ndim == 3 and frame.shape[2] == 4:
+            try:
+                rgb = cv2.cvtColor(frame, cv2.COLOR_RGBA2RGB)
+            except Exception:
+                rgb = cv2.cvtColor(frame, cv2.COLOR_BGRA2RGB)
+        else:
+            rgb = frame
+
+        if rgb.dtype != np.uint8:
+            rgb = np.clip(rgb, 0, 255).astype(np.uint8)
+
+        h, w = int(rgb.shape[0]), int(rgb.shape[1])
+        if h <= 0 or w <= 0:
+            return None
+
+        # torchvision.transforms.Resize(resize_size) keeps aspect ratio (smaller edge -> resize_size)
+        resize_size = int(self.input_size * 1.143)  # same heuristic as inprocess path
+        min_edge = min(h, w)
+        if min_edge != resize_size:
+            scale = float(resize_size) / float(min_edge)
+            new_w = max(1, int(round(w * scale)))
+            new_h = max(1, int(round(h * scale)))
+            rgb = cv2.resize(rgb, (new_w, new_h), interpolation=cv2.INTER_LINEAR)
+            h, w = int(rgb.shape[0]), int(rgb.shape[1])
+
+        crop = int(self.input_size)
+        if h < crop or w < crop:
+            # Safety: if resize produced smaller due to rounding, pad by resizing to exact crop.
+            rgb = cv2.resize(rgb, (crop, crop), interpolation=cv2.INTER_LINEAR)
+            h, w = crop, crop
+
+        y0 = max(0, (h - crop) // 2)
+        x0 = max(0, (w - crop) // 2)
+        rgb = rgb[y0 : y0 + crop, x0 : x0 + crop, :]
+
+        # Triton expects (1,S,S,3) where S is fixed branch size
+        return np.expand_dims(rgb, axis=0)
+
+    def _softmax_np(self, logits: np.ndarray) -> np.ndarray:
+        x = np.asarray(logits, dtype=np.float32).reshape(-1)
+        x = x - float(np.max(x))
+        ex = np.exp(x)
+        return (ex / (float(np.sum(ex)) + 1e-9)).astype(np.float32)
+
+    def _classify_triton(self, frame_manager, frame_indices) -> List[Dict[str, Any]]:
+        if not isinstance(self._triton_handle, dict) or "client" not in self._triton_handle:
+            raise RuntimeError("scene_classification(triton) | triton handle is missing (no-fallback)")
+
+        rp = self._triton_rp or {}
+        model_name = str(rp.get("triton_model_name") or self._triton_handle.get("triton_model_name") or "").strip()
+        model_version = str(rp.get("triton_model_version") or "1").strip()
+        input_name = str(rp.get("triton_input_name") or "INPUT__0").strip()
+        input_dt = str(rp.get("triton_input_datatype") or "UINT8").strip().upper()
+        output_name = str(rp.get("triton_output_name") or "OUTPUT__0").strip()
+        output_dt = str(rp.get("triton_output_datatype") or "FP32").strip().upper()
+        if not model_name:
+            raise RuntimeError("scene_classification(triton) | missing triton_model_name (no-fallback)")
+
+        client = self._triton_handle["client"]
+
+        raw_predictions: List[Dict[str, Any]] = [None] * len(frame_indices)
+        for pos, frame_idx in enumerate(frame_indices):
+            frame = frame_manager.get(frame_idx)
+            x = self._preprocess_places365_u8_nhwc_fixed(frame)
+            if x is None:
+                raw_predictions[pos] = None
+                continue
+            try:
+                res = client.infer(
+                    model_name=model_name,
+                    model_version=model_version,
+                    input_name=input_name,
+                    input_tensor=x.astype(np.uint8, copy=False),
+                    output_name=output_name,
+                    datatype=input_dt,
+                )
+            except Exception as e:
+                raise RuntimeError(f"scene_classification(triton) | infer failed: {e}") from e
+
+            logits = np.asarray(res.output, dtype=np.float32).reshape(-1)
+            probs = self._softmax_np(logits)
+
+            # Confidence stats
+            entropy_val = float(-np.sum(probs * np.log(probs + 1e-8)))
+            top_k = int(min(5, probs.shape[0]))
+            topk_idx = np.argpartition(-probs, top_k - 1)[:top_k]
+            topk_idx = topk_idx[np.argsort(-probs[topk_idx])]
+            topk_probs = probs[topk_idx]
+
+            top1_idx = int(topk_idx[0])
+            top1_prob_val = float(topk_probs[0])
+            top2_prob_val = float(topk_probs[1]) if top_k > 1 else 0.0
+            top1_top2_gap = float(max(0.0, top1_prob_val - top2_prob_val))
+
+            label = self.categories[top1_idx] if 0 <= top1_idx < len(self.categories) else f"class_{top1_idx}"
+            pred: Dict[str, Any] = {
+                "label": label,
+                "score": top1_prob_val,
+                "entropy": entropy_val,
+                "top1_prob": top1_prob_val,
+                "top2_prob": top2_prob_val,
+                "top1_top2_gap": top1_top2_gap,
+                "class_idx": top1_idx,
+                "topk_class_indices": [int(i) for i in topk_idx.tolist()],
+                "topk_class_probs": [float(v) for v in topk_probs.tolist()],
+            }
+            raw_predictions[pos] = pred
+
+        return raw_predictions
 
 
     def _prepare_frame(self, frame: np.ndarray) -> Optional[torch.Tensor | List[torch.Tensor]]:
@@ -624,96 +773,6 @@ class Places365SceneClassifier(BaseModule):
 
         return batch_predictions
 
-
-    def _load_model(self, model_arch: str) -> torch.nn.Module:
-        model_arch = model_arch.lower()
-        
-        # Load from timm (modern architectures)
-        if self.use_timm:
-            if model_arch not in self.TIMM_MODELS:
-                available = ", ".join(self.TIMM_MODELS.keys())
-                raise ValueError(
-                    f"Unsupported timm model_arch '{model_arch}'. "
-                    f"Available options: {available}"
-                )
-            
-            timm_name = self.TIMM_MODELS[model_arch]
-            logger.info(f"Loading timm model: {timm_name} (pretrained on ImageNet)")
-            
-            # Create model with ImageNet pretrained weights and Places365 classifier
-            model = timm.create_model(
-                timm_name,
-                pretrained=True,
-                num_classes=len(self.categories),  # Directly set to Places365 classes
-            )
-            
-            logger.info(
-                f"Model loaded from timm. Note: Using ImageNet pretrained weights. "
-                f"For best results, fine-tune on Places365 dataset."
-            )
-            return model.to(self.device)
-        
-        # Load from Places365 (original method)
-        if model_arch not in self.MODEL_URLS:
-            raise ValueError(
-                f"Unsupported model_arch '{model_arch}'. "
-                f"Available options: {', '.join(self.MODEL_URLS.keys())}"
-            )
-
-        if not hasattr(models, model_arch):
-            raise ValueError(f"torchvision.models has no '{model_arch}' implementation")
-
-        constructor = getattr(models, model_arch)
-        try:
-            model = constructor(weights=None, num_classes=len(self.categories))
-        except TypeError:
-            model = constructor(weights=None)
-            if not hasattr(model, "fc"):
-                raise RuntimeError(f"Model '{model_arch}' does not expose an 'fc' attribute")
-            in_features = model.fc.in_features
-            model.fc = torch.nn.Linear(in_features, len(self.categories))
-
-        state_dict = torch.hub.load_state_dict_from_url(
-            self.MODEL_URLS[model_arch], map_location="cpu", progress=True
-        )
-        if "state_dict" in state_dict:
-            state_dict = state_dict["state_dict"]
-
-        cleaned_state = {}
-        for key, value in state_dict.items():
-            new_key = key.replace("module.", "") if key.startswith("module.") else key
-            cleaned_state[new_key] = value
-
-        missing, unexpected = model.load_state_dict(cleaned_state, strict=False)
-        if missing:
-            logger.warning("Missing keys while loading Places365 weights: %s", missing)
-        if unexpected:
-            logger.warning("Unexpected keys while loading Places365 weights: %s", unexpected)
-
-        return model.to(self.device)
-
-    def _load_categories(self, categories_path: Optional[str]) -> List[str]:
-        if categories_path:
-            path = Path(categories_path)
-            if not path.exists():
-                raise FileNotFoundError(f"Categories file not found: {categories_path}")
-            return self._parse_categories(path.read_text(encoding="utf-8"))
-
-        cache_file = self.cache_dir / "categories_places365.txt"
-        if cache_file.exists():
-            return self._parse_categories(cache_file.read_text(encoding="utf-8"))
-
-        try:
-            response = requests.get(self.CATEGORY_URL, timeout=30)
-            response.raise_for_status()
-            cache_file.write_text(response.text, encoding="utf-8")
-            return self._parse_categories(response.text)
-        except Exception as exc:
-            logger.warning(
-                "Failed to load Places365 categories (%s). Falling back to generic labels.",
-                exc,
-            )
-            return [f"class_{idx}" for idx in range(365)]
 
     def _get_multi_crops(self, image: Image.Image) -> List[Image.Image]:
         """Generate 5 crops: center + 4 corners."""
@@ -849,25 +908,6 @@ class Places365SceneClassifier(BaseModule):
             "hotel", "office", "factory", "warehouse", "parking", "lot", "urban"
         ]
     
-    def _load_clip_model(self) -> None:
-        """Load CLIP model for semantic features."""
-        import os
-        p = os.path.dirname(__file__)
-
-        if not CLIP_AVAILABLE:
-            logger.warning("CLIP not available. Install transformers for semantic features.")
-            return
-        try:
-            logger.info("Loading CLIP model for semantic features...")
-            self._clip_model = CLIPModel.from_pretrained(f"{p}/models/clip_vit_base_patch32")
-            self._clip_processor = CLIPProcessor.from_pretrained("openai/clip-vit-base-patch32")
-            self._clip_model = self._clip_model.to(self.device)
-            self._clip_model.eval()
-            logger.info("CLIP model loaded successfully")
-        except Exception as e:
-            logger.warning(f"Failed to load CLIP model: {e}. Semantic features will be limited.")
-            self.use_clip_for_semantics = False
-    
     def _ontology_indoor_outdoor(
         self,
         topk_labels: Sequence[str],
@@ -945,383 +985,7 @@ class Places365SceneClassifier(BaseModule):
             "urban": float(urban_score / total),
         }
     
-    def _detect_time_of_day(self, frame: np.ndarray) -> Dict[str, float]:
-        """
-        Detect time of day from frame brightness and color analysis.
-        
-        :param frame: RGB frame (FrameManager.get contract)
-        :return: Dictionary with time of day probabilities
-        """
-        # Calculate brightness
-        gray = cv2.cvtColor(frame, cv2.COLOR_RGB2GRAY)
-        mean_brightness = np.mean(gray) / 255.0
-        
-        # Analyze color distribution (warm vs cool)
-        hsv = cv2.cvtColor(frame, cv2.COLOR_RGB2HSV)
-        hue = hsv[:, :, 0].flatten()
-        
-        # Warm colors (sunset/sunrise): hue 0-30, 150-180
-        warm_pixels = np.sum((hue < 30) | (hue > 150))
-        warm_ratio = warm_pixels / len(hue) if len(hue) > 0 else 0
-        
-        # Calculate probabilities
-        # Morning: medium brightness, warm colors
-        morning_score = mean_brightness * 0.6 * (1 + warm_ratio * 0.5)
-        
-        # Day: high brightness, neutral colors
-        day_score = mean_brightness * (1 - warm_ratio * 0.3)
-        
-        # Evening: medium-low brightness, warm colors
-        evening_score = (1 - mean_brightness) * 0.7 * (1 + warm_ratio * 0.8)
-        
-        # Night: low brightness, cool colors
-        night_score = (1 - mean_brightness) * (1 - warm_ratio * 0.5)
-        
-        # Normalize
-        total = morning_score + day_score + evening_score + night_score
-        if total == 0:
-            return {"morning": 0.25, "day": 0.25, "evening": 0.25, "night": 0.25}
-        
-        return {
-            "morning": morning_score / total,
-            "day": day_score / total,
-            "evening": evening_score / total,
-            "night": night_score / total
-        }
-    
-    def _calculate_aesthetic_score(self, frame: np.ndarray, scene_label: str, frame_index: Optional[int] = None) -> float:
-        """
-        Calculate aesthetic score for the scene.
-        
-        :param frame: RGB frame (FrameManager.get contract)
-        :param scene_label: Scene label
-        :param frame_index: Frame index for core_clip lookup
-        :return: Aesthetic score (0-1)
-        """
-        if not self.use_clip_for_semantics:
-            return self._calculate_aesthetic_score_heuristic(frame, scene_label)
-        if self._use_core_clip and frame_index is not None:
-            return self._calculate_aesthetic_score_core_clip(frame_index)
-        if self._clip_model is not None:
-            return self._calculate_aesthetic_score_clip(frame)
-        raise RuntimeError(
-            "Places365SceneClassifier | use_clip_for_semantics=True but neither core_clip nor transformers CLIP is available"
-        )
-    
-    def _calculate_aesthetic_score_core_clip(self, frame_index: int) -> float:
-        """Calculate aesthetic score using core_clip embeddings."""
-        try:
-            img_feat = self._get_core_clip_embedding(frame_index)
-            if img_feat is None:
-                raise RuntimeError(f"core_clip embedding not found for frame_index={frame_index}")
-            
-            img_feat = np.asarray(img_feat, dtype=np.float32)
-            img_feat = img_feat / (np.linalg.norm(img_feat) + 1e-9)
-
-            self._maybe_prepare_core_text_embeddings()
-            text_emb = self._core_text_embeddings.get("aesthetic")
-            if text_emb is None:
-                raise RuntimeError("core_clip semantic prompts not available (transformers CLIP missing?)")
-
-            logits = img_feat @ text_emb.T  # (4,)
-            logits = logits - float(np.max(logits))
-            probs = np.exp(logits) / (np.sum(np.exp(logits)) + 1e-9)
-            # Positive prompts: [0,1]
-            return float(np.clip(float(probs[0] + probs[1]), 0.0, 1.0))
-        except Exception as e:
-            raise
-    
-    def _calculate_aesthetic_score_clip(self, frame: np.ndarray) -> float:
-        """Calculate aesthetic score using CLIP."""
-        try:
-            image = Image.fromarray(frame.astype(np.uint8))
-            
-            texts = [
-                "aesthetic beautiful scene",
-                "professional photography",
-                "ugly unappealing scene",
-                "amateur photography"
-            ]
-            
-            inputs = self._clip_processor(
-                text=texts,
-                images=image,
-                return_tensors="pt",
-                padding=True
-            ).to(self.device)
-            
-            with torch.no_grad():
-                outputs = self._clip_model(**inputs)
-                logits_per_image = outputs.logits_per_image
-                probs = logits_per_image.softmax(dim=1)
-            
-            # Positive scores (aesthetic, professional)
-            aesthetic_score = (probs[0][0] + probs[0][1]).item()
-            return float(aesthetic_score)
-        except Exception as e:
-            raise
-    
-    def _calculate_aesthetic_score_heuristic(self, frame: np.ndarray, scene_label: str) -> float:
-        """Calculate aesthetic score using heuristics."""
-        # Analyze image quality metrics
-        gray = cv2.cvtColor(frame, cv2.COLOR_RGB2GRAY)
-        
-        # Sharpness (Laplacian variance)
-        laplacian_var = cv2.Laplacian(gray, cv2.CV_64F).var()
-        sharpness_score = min(1.0, laplacian_var / 500.0)
-        
-        # Contrast
-        contrast = np.std(gray) / 255.0
-        
-        # Colorfulness
-        rgb_flat = frame.reshape(-1, 3).astype(np.float32)
-        std_r = np.std(rgb_flat[:, 0])
-        std_g = np.std(rgb_flat[:, 1])
-        std_b = np.std(rgb_flat[:, 2])
-        colorfulness = (std_r + std_g + std_b) / 3.0 / 255.0
-        
-        # Brightness balance
-        mean_brightness = np.mean(gray) / 255.0
-        brightness_score = 1.0 - abs(mean_brightness - 0.5) * 2.0
-        
-        # Combine scores
-        aesthetic = (sharpness_score * 0.3 + contrast * 0.3 + colorfulness * 0.2 + brightness_score * 0.2)
-        return float(np.clip(aesthetic, 0.0, 1.0))
-    
-    def _calculate_luxury_score(self, frame: np.ndarray, scene_label: str, frame_index: Optional[int] = None) -> float:
-        """
-        Calculate luxury score for the scene.
-        
-        :param frame: RGB frame (FrameManager.get contract)
-        :param scene_label: Scene label
-        :param frame_index: Frame index for core_clip lookup
-        :return: Luxury score (0-1)
-        """
-        if not self.use_clip_for_semantics:
-            return self._calculate_luxury_score_heuristic(frame, scene_label)
-        if self._use_core_clip and frame_index is not None:
-            return self._calculate_luxury_score_core_clip(frame_index)
-        if self._clip_model is not None:
-            return self._calculate_luxury_score_clip(frame)
-        raise RuntimeError(
-            "Places365SceneClassifier | use_clip_for_semantics=True but neither core_clip nor transformers CLIP is available"
-        )
-    
-    def _calculate_luxury_score_core_clip(self, frame_index: int) -> float:
-        """Calculate luxury score using core_clip embeddings."""
-        try:
-            img_feat = self._get_core_clip_embedding(frame_index)
-            if img_feat is None:
-                raise RuntimeError(f"core_clip embedding not found for frame_index={frame_index}")
-
-            img_feat = np.asarray(img_feat, dtype=np.float32)
-            img_feat = img_feat / (np.linalg.norm(img_feat) + 1e-9)
-
-            self._maybe_prepare_core_text_embeddings()
-            text_emb = self._core_text_embeddings.get("luxury")
-            if text_emb is None:
-                raise RuntimeError("core_clip semantic prompts not available (transformers CLIP missing?)")
-
-            logits = img_feat @ text_emb.T
-            logits = logits - float(np.max(logits))
-            probs = np.exp(logits) / (np.sum(np.exp(logits)) + 1e-9)
-            return float(np.clip(float(probs[0] + probs[1]), 0.0, 1.0))
-        except Exception as e:
-            raise
-    
-    def _calculate_luxury_score_clip(self, frame: np.ndarray) -> float:
-        """Calculate luxury score using CLIP."""
-        try:
-            image = Image.fromarray(frame.astype(np.uint8))
-            
-            texts = [
-                "luxury expensive high-end scene",
-                "premium elegant sophisticated",
-                "cheap low-quality scene",
-                "budget affordable scene"
-            ]
-            
-            inputs = self._clip_processor(
-                text=texts,
-                images=image,
-                return_tensors="pt",
-                padding=True
-            ).to(self.device)
-            
-            with torch.no_grad():
-                outputs = self._clip_model(**inputs)
-                logits_per_image = outputs.logits_per_image
-                probs = logits_per_image.softmax(dim=1)
-            
-            luxury_score = (probs[0][0] + probs[0][1]).item()
-            return float(luxury_score)
-        except Exception as e:
-            raise
-    
-    def _calculate_luxury_score_heuristic(self, frame: np.ndarray, scene_label: str) -> float:
-        """Calculate luxury score using heuristics."""
-        label_lower = scene_label.lower()
-        luxury_keywords = ["luxury", "premium", "elegant", "sophisticated", "high-end", "expensive"]
-        
-        # Check label
-        label_score = 0.3 if any(kw in label_lower for kw in luxury_keywords) else 0.0
-        
-        # Analyze image quality (luxury scenes often have high quality)
-        gray = cv2.cvtColor(frame, cv2.COLOR_RGB2GRAY)
-        sharpness = cv2.Laplacian(gray, cv2.CV_64F).var()
-        quality_score = min(1.0, sharpness / 500.0) * 0.4
-        
-        # Color richness
-        std_colors = np.std(frame.reshape(-1, 3).astype(np.float32), axis=0)
-        color_score = np.mean(std_colors) / 255.0 * 0.3
-        
-        return float(np.clip(label_score + quality_score + color_score, 0.0, 1.0))
-    
-    def _detect_atmosphere_sentiment(self, frame: np.ndarray, frame_index: Optional[int] = None) -> Dict[str, float]:
-        """
-        Detect atmosphere sentiment (cozy, scary, epic, neutral).
-        
-        :param frame: RGB frame (FrameManager.get contract)
-        :param frame_index: Frame index for core_clip lookup
-        :return: Dict with atmosphere probabilities
-        """
-        if not self.use_clip_for_semantics:
-            return self._detect_atmosphere_heuristic(frame)
-        if self._use_core_clip and frame_index is not None:
-            return self._detect_atmosphere_core_clip(frame_index)
-        if self._clip_model is not None:
-            return self._detect_atmosphere_clip(frame)
-        raise RuntimeError(
-            "Places365SceneClassifier | use_clip_for_semantics=True but neither core_clip nor transformers CLIP is available"
-        )
-    
-    def _detect_atmosphere_core_clip(self, frame_index: int) -> Dict[str, float]:
-        """Detect atmosphere using core_clip embeddings."""
-        try:
-            img_feat = self._get_core_clip_embedding(frame_index)
-            if img_feat is None:
-                raise RuntimeError(f"core_clip embedding not found for frame_index={frame_index}")
-
-            img_feat = np.asarray(img_feat, dtype=np.float32)
-            img_feat = img_feat / (np.linalg.norm(img_feat) + 1e-9)
-
-            self._maybe_prepare_core_text_embeddings()
-            text_emb = self._core_text_embeddings.get("atmosphere")
-            if text_emb is None:
-                raise RuntimeError("core_clip semantic prompts not available (transformers CLIP missing?)")
-
-            logits = img_feat @ text_emb.T
-            logits = logits - float(np.max(logits))
-            probs = np.exp(logits) / (np.sum(np.exp(logits)) + 1e-9)
-            return {
-                "cozy": float(probs[0]),
-                "scary": float(probs[1]),
-                "epic": float(probs[2]),
-                "neutral": float(probs[3]),
-            }
-        except Exception as e:
-            raise
-    
-    def _detect_atmosphere_clip(self, frame: np.ndarray) -> Dict[str, float]:
-        """Detect atmosphere using CLIP."""
-        try:
-            image = Image.fromarray(frame.astype(np.uint8))
-            
-            texts = [
-                "cozy warm comfortable scene",
-                "scary frightening dark scene",
-                "epic grand majestic scene",
-                "neutral ordinary scene"
-            ]
-            
-            inputs = self._clip_processor(
-                text=texts,
-                images=image,
-                return_tensors="pt",
-                padding=True
-            ).to(self.device)
-            
-            with torch.no_grad():
-                outputs = self._clip_model(**inputs)
-                logits_per_image = outputs.logits_per_image
-                probs = logits_per_image.softmax(dim=1)
-            
-            return {
-                "cozy": float(probs[0][0].item()),
-                "scary": float(probs[0][1].item()),
-                "epic": float(probs[0][2].item()),
-                "neutral": float(probs[0][3].item())
-            }
-        except Exception as e:
-            raise
-    
-    def _detect_atmosphere_heuristic(self, frame: np.ndarray) -> Dict[str, float]:
-        """Detect atmosphere using heuristics."""
-        gray = cv2.cvtColor(frame, cv2.COLOR_RGB2GRAY)
-        mean_brightness = np.mean(gray) / 255.0
-        
-        # Cozy: medium brightness, warm colors
-        hsv = cv2.cvtColor(frame, cv2.COLOR_RGB2HSV)
-        hue = hsv[:, :, 0].flatten()
-        warm_ratio = np.sum((hue < 30) | (hue > 150)) / len(hue) if len(hue) > 0 else 0
-        cozy_score = mean_brightness * 0.6 * (1 + warm_ratio * 0.5)
-        
-        # Scary: low brightness, high contrast
-        contrast = np.std(gray) / 255.0
-        scary_score = (1 - mean_brightness) * 0.7 * (1 + contrast * 0.5)
-        
-        # Epic: high brightness, wide dynamic range
-        dynamic_range = (np.max(gray) - np.min(gray)) / 255.0
-        epic_score = mean_brightness * 0.8 * (1 + dynamic_range * 0.3)
-        
-        # Normalize
-        total = cozy_score + scary_score + epic_score
-        if total == 0:
-            return {"cozy": 0.33, "scary": 0.33, "epic": 0.34, "neutral": 0.0}
-        
-        return {
-            "cozy": float(cozy_score / total),
-            "scary": float(scary_score / total),
-            "epic": float(epic_score / total),
-            "neutral": float(1.0 - (cozy_score + scary_score + epic_score) / total)
-        }
-    
-    def _calculate_geometric_features(self, frame: np.ndarray) -> Dict[str, float]:
-        """
-        Calculate geometric features: openness, clutter, depth cues.
-        
-        :param frame: RGB frame (FrameManager.get contract)
-        :return: Dictionary with geometric features
-        """
-        gray = cv2.cvtColor(frame, cv2.COLOR_RGB2GRAY)
-        height, width = gray.shape
-        
-        # Openness: measure of visible sky/horizon
-        # Simplified: analyze top portion of image
-        top_portion = gray[:height//3, :]
-        top_brightness = np.mean(top_portion) / 255.0
-        openness = top_brightness * 0.6 + (1 - np.std(gray) / 255.0) * 0.4
-        
-        # Clutter: measure of visual complexity
-        # Use edge density
-        edges = cv2.Canny(gray, 50, 150)
-        edge_density = np.sum(edges > 0) / (height * width)
-        clutter = min(1.0, edge_density * 2.0)
-        
-        # Depth cues: simplified using gradient analysis
-        # Strong gradients suggest depth
-        grad_x = cv2.Sobel(gray, cv2.CV_64F, 1, 0, ksize=3)
-        grad_y = cv2.Sobel(gray, cv2.CV_64F, 0, 1, ksize=3)
-        gradient_magnitude = np.sqrt(grad_x**2 + grad_y**2)
-        depth_cues = min(1.0, np.mean(gradient_magnitude) / 100.0)
-        
-        return {
-            "openness": float(np.clip(openness, 0.0, 1.0)),
-            "clutter": float(np.clip(clutter, 0.0, 1.0)),
-            "depth_cues": float(np.clip(depth_cues, 0.0, 1.0))
-        }
-    
-    def aggregate_scenes(self, res, fps: float) -> Dict[str, Any]:
+    def aggregate_scenes(self, res, *, fps: float, union_timestamps_sec: List[float]) -> Dict[str, Any]:
         """
         Aggregate consecutive frames with the same scene label.
 
@@ -1341,11 +1005,9 @@ class Places365SceneClassifier(BaseModule):
                 "advanced_features": {
                     "indoor_outdoor": {"indoor": float, "outdoor": float},
                     "nature_urban": {"nature": float, "urban": float},
-                    "time_of_day": {"morning": float, "day": float, "evening": float, "night": float},
                     "aesthetic_score": float,
                     "luxury_score": float,
                     "atmosphere_sentiment": {"cozy": float, "scary": float, "epic": float, "neutral": float},
-                    "geometric_features": {"openness": float, "clutter": float, "depth_cues": float}
                 }
             }
             fps: frames per second for current video (used for time‑based stats)
@@ -1371,10 +1033,8 @@ class Places365SceneClassifier(BaseModule):
                 "top1_prob": [], "top2_prob": [], "top1_top2_gap": [],
                 "indoor": [], "outdoor": [],
                 "nature": [], "urban": [],
-                "morning": [], "day": [], "evening": [], "night": [],
                 "aesthetic_score": [], "luxury_score": [],
                 "cozy": [], "scary": [], "epic": [], "neutral": [],
-                "openness": [], "clutter": [], "depth_cues": [],
                 "labels": [],
             }
 
@@ -1382,10 +1042,8 @@ class Places365SceneClassifier(BaseModule):
             """Return aggregated segment dict."""
             if not indices:
                 return None
-            # FPS‑aware duration
             length_frames = len(indices)
             fps_safe = float(fps) if fps and fps > 0 else 30.0
-            length_seconds = float(length_frames) / fps_safe
 
             # Determine minimal duration in seconds
             if self.min_scene_seconds is not None:
@@ -1394,25 +1052,18 @@ class Places365SceneClassifier(BaseModule):
                 # Backwards‑compatible: interpret frame threshold at runtime FPS
                 min_len_s = float(self.min_scene_length_frames) / fps_safe
 
-            if length_seconds < min_len_s:
-                return None
-
             start_frame = int(indices[0])
             end_frame = int(indices[-1])
+            # Time-axis source-of-truth: union timestamps.
+            try:
+                start_ts = float(union_timestamps_sec[start_frame])
+                end_ts = float(union_timestamps_sec[end_frame])
+                length_seconds = float(max(0.0, end_ts - start_ts))
+            except Exception:
+                length_seconds = float(length_frames) / fps_safe
 
-            # Scene‑level time‑of‑day distribution
-            tod_vec = np.array([
-                np.mean(values["morning"]),
-                np.mean(values["day"]),
-                np.mean(values["evening"]),
-                np.mean(values["night"]),
-            ], dtype=np.float32)
-            tod_sum = float(tod_vec.sum()) or 1.0
-            tod_probs = (tod_vec / tod_sum).tolist()
-            tod_top_idx = int(np.argmax(tod_vec))
-            tod_labels = ["morning", "day", "evening", "night"]
-            tod_top_label = tod_labels[tod_top_idx]
-            tod_conf = float(tod_vec[tod_top_idx])
+            if length_seconds < min_len_s:
+                return None
 
             # Aesthetic / luxury aggregates
             aesthetic_arr = np.asarray(values["aesthetic_score"], dtype=np.float32)
@@ -1499,18 +1150,6 @@ class Places365SceneClassifier(BaseModule):
                 "mean_outdoor": float(np.mean(values["outdoor"])),
                 "mean_nature": float(np.mean(values["nature"])),
                 "mean_urban": float(np.mean(values["urban"])),
-                "mean_morning": float(np.mean(values["morning"])),
-                "mean_day": float(np.mean(values["day"])),
-                "mean_evening": float(np.mean(values["evening"])),
-                "mean_night": float(np.mean(values["night"])),
-                "time_of_day_probs": {
-                    "morning": tod_probs[0],
-                    "day": tod_probs[1],
-                    "evening": tod_probs[2],
-                    "night": tod_probs[3],
-                },
-                "time_of_day_top": tod_top_label,
-                "time_of_day_confidence": tod_conf,
                 "mean_aesthetic_score": aesthetic_mean,
                 "aesthetic_std": aesthetic_std,
                 "aesthetic_frac_high": aesthetic_frac_high,
@@ -1520,9 +1159,6 @@ class Places365SceneClassifier(BaseModule):
                 "mean_epic": float(np.mean(values["epic"])),
                 "mean_neutral": float(np.mean(values["neutral"])),
                 "atmosphere_entropy": atm_entropy,
-                "mean_openness": float(np.mean(values["openness"])),
-                "mean_clutter": float(np.mean(values["clutter"])),
-                "mean_depth_cues": float(np.mean(values["depth_cues"])),
                 "scene_change_score": scene_change_score,
                 "label_stability": label_stability,
                 "dominant_places_topk_ids": dominant_topk_ids,
@@ -1540,7 +1176,8 @@ class Places365SceneClassifier(BaseModule):
                         current_topk_indices, current_topk_probs,
                     )
                     if segment:
-                        aggregated[f"{current_label}_{current_indices[0]}"] = segment
+                        scene_id = f"s{len(aggregated):04d}"
+                        aggregated[scene_id] = segment
                 # Start new segment
                 current_label = label
                 current_indices = [idx]
@@ -1569,11 +1206,6 @@ class Places365SceneClassifier(BaseModule):
             current_values["outdoor"].append(adv["indoor_outdoor"]["outdoor"])
             current_values["nature"].append(adv["nature_urban"]["nature"])
             current_values["urban"].append(adv["nature_urban"]["urban"])
-            tod = adv["time_of_day"]
-            current_values["morning"].append(tod["morning"])
-            current_values["day"].append(tod["day"])
-            current_values["evening"].append(tod["evening"])
-            current_values["night"].append(tod["night"])
             current_values["aesthetic_score"].append(adv["aesthetic_score"])
             current_values["luxury_score"].append(adv["luxury_score"])
             atm = adv["atmosphere_sentiment"]
@@ -1581,10 +1213,6 @@ class Places365SceneClassifier(BaseModule):
             current_values["scary"].append(atm["scary"])
             current_values["epic"].append(atm["epic"])
             current_values["neutral"].append(atm["neutral"])
-            geo = adv["geometric_features"]
-            current_values["openness"].append(geo["openness"])
-            current_values["clutter"].append(geo["clutter"])
-            current_values["depth_cues"].append(geo["depth_cues"])
 
         # Final segment
         if current_label is not None:
@@ -1593,7 +1221,8 @@ class Places365SceneClassifier(BaseModule):
                 current_topk_indices, current_topk_probs,
             )
             if segment:
-                aggregated[f"{current_label}_{current_indices[0]}"] = segment
+                scene_id = f"s{len(aggregated):04d}"
+                aggregated[scene_id] = segment
 
         return aggregated
 
@@ -1631,20 +1260,14 @@ class Places365SceneClassifier(BaseModule):
                 if pred is not None
             }
             fps = getattr(frame_manager, "fps", 30.0)
-            return self.aggregate_scenes(results, fps=fps)
+            union_ts = [float(x) for x in (frame_manager.meta.get("union_timestamps_sec") or [])]
+            return self.aggregate_scenes(results, fps=fps, union_timestamps_sec=union_ts)
 
         # Allocate output dict indexed by frame ID
         results: Dict[int, Dict[str, Any]] = {}
 
         for frame_idx, pred in zip(frame_indices, base_predictions):
-            frame = frame_manager.get(frame_idx)
-
-            # No frame OR no prediction → no features
-            if frame is None or pred is None:
-                results[frame_idx] = {
-                    "predictions": pred,
-                    "advanced_features": None
-                }
+            if pred is None:
                 continue
 
             # Best scene prediction and top‑K info
@@ -1661,11 +1284,14 @@ class Places365SceneClassifier(BaseModule):
 
             advanced["indoor_outdoor"] = self._ontology_indoor_outdoor(topk_labels, topk_probs)
             advanced["nature_urban"] = self._ontology_nature_urban(topk_labels, topk_probs)
-            advanced["time_of_day"] = self._detect_time_of_day(frame)
-            advanced["aesthetic_score"] = self._calculate_aesthetic_score(frame, top_scene, frame_index=frame_idx)
-            advanced["luxury_score"] = self._calculate_luxury_score(frame, top_scene, frame_index=frame_idx)
-            advanced["atmosphere_sentiment"] = self._detect_atmosphere_sentiment(frame, frame_index=frame_idx)
-            advanced["geometric_features"] = self._calculate_geometric_features(frame)
+            # semantics strictly from core_clip (no heuristics, no local CLIP)
+            advanced["aesthetic_score"] = self._core_clip_binary_score(
+                frame_index=frame_idx, text_embeddings=self._scene_aesthetic_text_embeddings, pos_indices=(0, 1)
+            )
+            advanced["luxury_score"] = self._core_clip_binary_score(
+                frame_index=frame_idx, text_embeddings=self._scene_luxury_text_embeddings, pos_indices=(0, 1)
+            )
+            advanced["atmosphere_sentiment"] = self._core_clip_atmosphere(frame_index=frame_idx)
 
             results[frame_idx] = {
                 "predictions": pred,
@@ -1673,7 +1299,8 @@ class Places365SceneClassifier(BaseModule):
             }
 
         fps = getattr(frame_manager, "fps", 30.0)
-        agg_result = self.aggregate_scenes(results, fps=fps)
+        union_ts = [float(x) for x in (frame_manager.meta.get("union_timestamps_sec") or [])]
+        agg_result = self.aggregate_scenes(results, fps=fps, union_timestamps_sec=union_ts)
 
         return agg_result
 

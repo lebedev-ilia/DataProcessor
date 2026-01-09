@@ -1,0 +1,22 @@
+model_name: source_separation_large_triton
+model_version: "1"
+role: source_separation
+runtime: triton
+engine: triton
+precision: fp16
+device_policy: cuda
+weights_digest: provided_by_deploy
+local_artifacts: []
+runtime_params:
+  triton_http_url: "${TRITON_HTTP_URL}"
+  triton_model_name: "source_separation_large"
+  triton_model_version: null
+  triton_input_name: "MEL__0"
+  triton_input_datatype: "FP32"
+  triton_output_energy_name: "ENERGY__0"
+  triton_output_energy_datatype: "FP32"
+  sample_rate: 44100
+  n_fft: 2048
+  hop_length: 512
+  n_mels: 64
+

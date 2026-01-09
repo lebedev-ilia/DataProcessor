@@ -9,6 +9,7 @@ import numpy as np
 
 from src.core.base_extractor import BaseExtractor
 from src.core.metrics import system_snapshot, process_memory_bytes
+from src.core.path_utils import default_artifacts_dir, textprocessor_root
 
 try:
     import faiss  # type: ignore
@@ -35,15 +36,16 @@ class SemanticClusterExtractor(BaseExtractor):
 
     def __init__(
         self,
-        artifacts_dir: str = "/home/ilya/Рабочий стол/DataProcessor/TextProcessor/.artifacts",
-        cluster_model_path: str = "/home/ilya/Рабочий стол/DataProcessor/TextProcessor/models/centroids.npy",
-        pca_model_path: str = "/home/ilya/Рабочий стол/DataProcessor/TextProcessor/models/pca.npy",
+        artifacts_dir: str | None = None,
+        cluster_model_path: str | None = None,
+        pca_model_path: str | None = None,
         use_hdbscan: bool = False,
         source: str = "title",  # which embedding to use by default: title|description|hashtag
     ) -> None:
-        self.artifacts_dir = Path(artifacts_dir)
-        self.cluster_model_path = Path(cluster_model_path)
-        self.pca_model_path = Path(pca_model_path)
+        base_models = textprocessor_root() / "models"
+        self.artifacts_dir = Path(artifacts_dir).expanduser().resolve() if artifacts_dir else default_artifacts_dir()
+        self.cluster_model_path = Path(cluster_model_path).expanduser().resolve() if cluster_model_path else (base_models / "centroids.npy")
+        self.pca_model_path = Path(pca_model_path).expanduser().resolve() if pca_model_path else (base_models / "pca.npy")
         self.use_hdbscan = use_hdbscan
         self.source = source
 

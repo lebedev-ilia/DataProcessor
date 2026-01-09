@@ -1,31 +1,69 @@
+# Docs index
+
+- Components index: `docs/COMPONENTS_INDEX.md`
+- Baseline models (CPU vs GPU): `docs/models_docs/BASELINE_MODELS.md`
+- Baseline GPU branches (fixed-shape) + Triton plan: `docs/models_docs/BASELINE_GPU_BRANCHES.md`
 # DataProcessor — документация (полуфинальные контракты)
 
-Эта папка — “свод правил” проекта TrendFlow/DataProcessor, собранный из `VisualProcessor/docs/project_questions.md`.
+Эта папка — “свод правил” проекта TrendFlow/DataProcessor, собранный из `docs/reference/project_questions.md`.
 
 ## Что где лежит
 
-- `BASELINE_IMPLEMENTATION_PLAN.md` — единый подробный пошаговый план работ до baseline (по всем контрактам).
-- `DATAPROCESSOR_AUDIT.md` — единый чеклист полного аудита DataProcessor (критерии + параметры проверки по всем процессорам).
-- `CONTRACTS_OVERVIEW.md` — короткая карта всех ключевых контрактов и терминов.
-- `ARTIFACTS_AND_SCHEMAS.md` — NPZ, meta-поля, версии, валидатор, структура `result_store`, `manifest.json`.
-- `SEGMENTER_CONTRACT.md` — time-domain семплинг, budgets per component, union кадры, RGB контракт.
-- `ORCHESTRATION_AND_CACHING.md` — DAG, required/optional (fail-fast vs best-effort), idempotency, artifact index.
-- `PRODUCT_CONTRACT.md` — продуктовые контракты (MVP UX, профили анализа/конфиги, LLM как presentation layer, платформа v1, валидация входных данных).
-- `PRODUCTION_ARCHITECTURE.md` — целевая архитектура сервиса (backend/worker/storage/DB/Triton/LLM, коммуникация, батчинг, масштабирование, мониторинг, безопасность).
-- `BILLING_AND_PRICING.md` — биллинг и ценообразование (единица биллинга, списание кредитов, прайс-лист, оценка стоимости).
-- `ERROR_HANDLING_AND_EDGE_CASES.md` — обработка ошибок, retry политики, edge cases (повреждённые файлы, видео без звука, таймауты).
-- `ML_TARGETS_AND_TRAINING.md` — multi-target/multi-horizon, delta targets, split, cold-start stratification, reproducibility.
-- `MODEL_SYSTEM_RULES.md` — канонические правила по моделям (model_signature/models_used, Triton mapping, кэш, детерминизм, multi-GPU, prediction fallback, observability).
-- `MODEL_LICENSES.md` — инвентарь моделей и лицензий (template).
-- `LLM_RENDERING.md` — LLM как presentation layer, воспроизводимость, кэширование, guardrails.
-- `PRIVACY_AND_RETENTION.md` — хранение raw текста/комментов, OAuth-верификация владельца канала, retention caps.
-- `SITE_DESIGN.md` — дизайн и UX сайта (цветовая палитра, структура страниц, компоненты, адаптивность).
-- `BASELINE_RUN_CHECKLIST.md` — короткий чеклист инвариантов перед первым прогоном baseline.
+- **baseline**:
+  - `docs/baseline/BASELINE_IMPLEMENTATION_PLAN.md` — единый подробный пошаговый план работ до baseline (по всем контрактам).
+  - `docs/baseline/BASELINE_RUN_CHECKLIST.md` — короткий чеклист инвариантов перед первым прогоном baseline.
+  - `docs/baseline/BASELINE_TO_TRAINING_ROADMAP.md` — roadmap baseline → training.
+  - `docs/baseline/BASELINE_PRODUCTION_EXECUTION_PLAN.md` — prod-run execution plan.
+  - `docs/baseline/ML_TARGETS_AND_TRAINING.md` — multi-target/multi-horizon, delta targets, split, reproducibility.
+  - `docs/baseline/REMAINING_BASELINE_TASKS.md` — текущий backlog baseline задач.
+- **contracts**:
+  - `docs/contracts/CONTRACTS_OVERVIEW.md`
+  - `docs/contracts/ARTIFACTS_AND_SCHEMAS.md`
+  - `docs/contracts/SEGMENTER_CONTRACT.md`
+  - `docs/contracts/ORCHESTRATION_AND_CACHING.md`
+  - `docs/contracts/ERROR_HANDLING_AND_EDGE_CASES.md`
+  - `docs/contracts/PRODUCT_CONTRACT.md`
+  - `docs/contracts/LLM_RENDERING.md`
+  - `docs/contracts/PRIVACY_AND_RETENTION.md`
+  - `docs/contracts/PER_COMPONENT.md`
+- **models**:
+  - `docs/models_docs/BASELINE_MODELS.md` — baseline models (CPU vs GPU).
+  - `docs/models_docs/MODEL_SYSTEM_RULES.md`
+  - `docs/models_docs/FEATURE_ENCODER_CONTRACT.md` — контракт encoder’а, который приводит variable-length фичи компонентов к fixed-size для transformer’ов
+  - `docs/models_docs/MODEL_MANAGER_PLAN.md`
+  - `docs/models_docs/MODEL_INVENTORY.md`
+  - `docs/models_docs/MODEL_LICENSES.md`
+  - `docs/models_docs/MODELS_Q.md`
+  - `docs/models_docs/DynamicBatching_Q_A.md`
+- **architecture**:
+  - `docs/architecture/PRODUCTION_ARCHITECTURE.md`
+  - `docs/architecture/BILLING_AND_PRICING.md`
+- **prs**:
+  - `docs/prs/PR0_LOCAL_STACK.md`
+  - `docs/prs/PR1_STORAGE_ADAPTER.md`
+  - `docs/prs/PR2_1_ENVIRONMENTS.md`
+  - `docs/prs/PR4_REQUIRED_OPTIONAL_PROFILES.md`
+  - `docs/prs/PR5_STATE_FILES_AND_MANAGERS.md`
+  - `docs/prs/PR6_DAG_RUNNER.md`
+  - `docs/prs/PR7_CELERY_AND_HEALTH.md`
+  - `docs/prs/PR8_TRITON_INTEGRATION.md`
+  - `docs/prs/PR9_MODEL_OPTIMIZATIONS.md`
+  - `docs/prs/PR10_MODULE_AUDIT_SPLIT.md`
+- **audits**:
+  - `docs/audits/DATAPROCESSOR_AUDIT.md` — единый чеклист полного аудита DataProcessor.
+- **reference**:
+  - `docs/reference/component_graph.yaml` — декларативный DAG компонентов.
+  - `docs/reference/GLOBAL.md` — общий большой “комбайн” (исторически).
+  - `docs/reference/project_questions.md` — исходный Q&A (рабочий документ).
+- **site**:
+  - `docs/site/SITE_DESIGN.md`
+  - `docs/site/SITE_SPECIFICATION.md`
+  - `docs/site/SITE_Q.md`
 
 ## Связанные документы внутри процессоров
 
 - `VisualProcessor/docs/MODULE_STANDARDS.md` — стандарты реализации модулей (BaseModule, sampling contract, no-fallback, empty outputs).
-- `VisualProcessor/docs/project_questions.md` — исходный Q&A (рабочий документ).
+- `docs/reference/project_questions.md` — исходный Q&A (рабочий документ).
 
 ## Быстрый ориентир по CLI (baseline v0)
 

@@ -1,0 +1,28 @@
+version: "pr8_triton_baseline_gpu_places365_fast_local_v1"
+
+processors:
+  audio:
+    enabled: false
+    required: false
+  text:
+    enabled: false
+    required: false
+
+visual:
+  cfg_path: "./VisualProcessor/config_triton_baseline_gpu_places365_local_fast.yaml"
+  requirements:
+    core_clip: true
+    scene_classification: true
+
+resolved_model_mapping:
+  core_clip:
+    runtime: triton
+    triton_image_model_spec: "clip_image_224_triton"
+    triton_text_model_spec: "clip_text_triton"
+    triton_preprocess_preset: "openai_clip_224"
+
+  scene_classification:
+    runtime: triton
+    triton_model_spec: "places365_resnet50_224_triton"
+
+

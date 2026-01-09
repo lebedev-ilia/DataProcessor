@@ -7,11 +7,10 @@ from typing import Any, Dict, List, Optional
 import numpy as np
 import torch
 
-from sentence_transformers import SentenceTransformer  # noqa: F401
-
 from src.core.base_extractor import BaseExtractor
 from src.core.metrics import system_snapshot, process_memory_bytes
 from src.core.model_registry import get_model
+from src.core.path_utils import default_artifacts_dir
 from src.schemas.models import VideoDocument
 
 
@@ -20,16 +19,16 @@ class HashtagEmbedder(BaseExtractor):
 
     def __init__(
         self,
-        model_name: str = "intfloat/multilingual-e5-large",
-        artifacts_dir: str = "/home/ilya/Рабочий стол/DataProcessor/TextProcessor/.artifacts",
-        device: Optional[str] = None,
+        model_name: str = "sentence-transformers/all-MiniLM-L6-v2",
+        artifacts_dir: Optional[str] = None,
+        device: Optional[str] = "cpu",
         fp16: bool = True,
         batch_size: int = 128,
     ) -> None:
         self.model_name = model_name
-        self.artifacts_dir = Path(artifacts_dir)
+        self.artifacts_dir = Path(artifacts_dir).expanduser().resolve() if artifacts_dir else default_artifacts_dir()
         self.artifacts_dir.mkdir(parents=True, exist_ok=True)
-        self.device = device or ("cuda" if torch.cuda.is_available() else "cpu")
+        self.device = str(device or "cpu")
         self.fp16 = fp16 and ("cuda" in self.device)
         self.batch_size = batch_size
         self._model = get_model(self.model_name, self.device, self.fp16)

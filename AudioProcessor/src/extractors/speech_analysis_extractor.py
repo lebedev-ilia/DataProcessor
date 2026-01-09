@@ -1,454 +1,219 @@
 """
-Комбинированный экстрактор для анализа речи с сопоставлением ASR и диаризации.
+SpeechAnalysisExtractor (non-baseline, production-safe).
+
+Goal:
+- Provide a compact "speech overview" by combining:
+  - ASR token IDs (Triton-backed) on Segmenter families.asr windows
+  - Speaker diarization (Triton-backed) on Segmenter families.diarization windows
+  - Optional pitch (signal processing) on full audio
+
+Important:
+- No raw transcript text is stored.
+- No "alignment" between ASR tokens and diarization speakers is attempted (Whisper token timing is not available).
+- No runtime downloads (ModelManager enforced by sub-extractors).
+
+Empty/Error policy:
+- If audio is < 5 sec -> error.
+- If audio is truly silent -> empty (payload.status="empty", empty_reason="audio_silent").
 """
+
+from __future__ import annotations
+
 import time
 import logging
+from typing import Any, Dict, List, Optional
+
 import numpy as np
-from typing import Dict, Any, Optional, List, Tuple
-from pathlib import Path
 
 from src.core.base_extractor import BaseExtractor, ExtractorResult
 from src.core.audio_utils import AudioUtils
 from src.extractors.asr_extractor import ASRExtractor
 from src.extractors.speaker_diarization_extractor import SpeakerDiarizationExtractor
 from src.extractors.pitch_extractor import PitchExtractor
-from src.utils.prof import timeit
 
 logger = logging.getLogger(__name__)
 
 
 class SpeechAnalysisExtractor(BaseExtractor):
-    """Комбинированный экстрактор для анализа речи с сопоставлением ASR и диаризации."""
-    
     name = "speech_analysis_extractor"
-    version = "1.1.0"
-    description = "Комбинированный анализ речи: ASR + диаризация + сопоставление"
+    version = "2.0.0"
+    description = "Speech analysis bundle: ASR token stats + diarization + optional pitch (no raw text)"
     category = "speech"
-    dependencies = ["torch", "whisper", "resemblyzer", "librosa", "scikit-learn"]
-    estimated_duration = 8.0  # ASR + диаризация + сопоставление
-    
-    # Предпочитает GPU для обеих моделей
+    dependencies = ["dp_models", "dp_triton", "numpy", "librosa"]
+    estimated_duration = 10.0
+
     gpu_required = False
     gpu_preferred = True
-    gpu_memory_required = 1.5  # 1.5GB для обеих моделей
-    
+    gpu_memory_required = 0.0  # Triton-backed ASR/diarization; pitch is CPU
+
     def __init__(
-        self, 
+        self,
         device: str = "auto",
+        *,
         asr_model_size: str = "small",
-        asr_language: Optional[str] = None,
-        asr_task: str = "transcribe",
-        diarization_segment_duration: float = 2.0,
-        diarization_min_speakers: int = 1,
-        diarization_max_speakers: int = 10,
-        pitch_fmin: float = 50.0,
-        pitch_fmax: float = 2000.0,
-        pitch_backend: str = "classic",
-        pitch_enabled: bool = True,
+        diarization_model_size: str = "small",
         sample_rate: int = 16000,
-        average_channels_for_asr: bool = True
+        pitch_enabled: bool = False,
+        pitch_backend: str = "classic",
     ):
-        """
-        Инициализация комбинированного экстрактора.
-        
-        Args:
-            device: Устройство для обработки
-            asr_model_size: Размер модели Whisper
-            asr_language: Язык для ASR
-            asr_task: Тип задачи ASR
-            diarization_segment_duration: Длительность сегмента для диаризации
-            diarization_min_speakers: Минимальное количество спикеров
-            diarization_max_speakers: Максимальное количество спикеров
-            pitch_fmin: Минимальная частота для pitch анализа
-            pitch_fmax: Максимальная частота для pitch анализа
-            pitch_backend: Backend для pitch анализа
-            sample_rate: Частота дискретизации
-        """
         super().__init__(device=device)
-        
-        self.sample_rate = sample_rate
-        
-        # Инициализируем подэкстракторы
-        self.asr_extractor = ASRExtractor(
-            device=device,
-            model_size=asr_model_size,
-            language=asr_language,
-            task=asr_task,
-            sample_rate=sample_rate
-        )
-        
+        self.sample_rate = int(sample_rate)
+        self.pitch_enabled = bool(pitch_enabled)
+
+        self.audio_utils = AudioUtils(device=device, sample_rate=self.sample_rate)
+
+        # Sub-extractors (already audited):
+        self.asr_extractor = ASRExtractor(device=device, model_size=str(asr_model_size), sample_rate=self.sample_rate)
         self.diarization_extractor = SpeakerDiarizationExtractor(
             device=device,
-            segment_duration=diarization_segment_duration,
-            min_speakers=diarization_min_speakers,
-            max_speakers=diarization_max_speakers,
-            sample_rate=sample_rate
+            model_size=str(diarization_model_size),
+            sample_rate=self.sample_rate,
         )
-        
-        self.pitch_enabled = bool(pitch_enabled)
         self.pitch_extractor = PitchExtractor(
             device=device,
-            sample_rate=sample_rate,
-            fmin=pitch_fmin,
-            fmax=pitch_fmax,
-            backend=pitch_backend
+            sample_rate=self.sample_rate,
+            backend=str(pitch_backend or "classic"),
         )
-        
-        self.audio_utils = AudioUtils(device=device, sample_rate=sample_rate)
-        self.average_channels_for_asr = bool(average_channels_for_asr)
-    
-    def run(self, input_uri: str, tmp_path: str) -> ExtractorResult:
-        """
-        Комбинированный анализ речи.
-        
-        Args:
-            input_uri: Путь к аудио файлу
-            tmp_path: Временная директория
-            
-        Returns:
-            ExtractorResult с полным анализом речи
-        """
+
+    @staticmethod
+    def _rms_and_peak(x: np.ndarray) -> tuple[float, float]:
+        x = np.asarray(x, dtype=np.float32).reshape(-1)
+        if x.size == 0:
+            return 0.0, 0.0
+        rms = float(np.sqrt(float(np.mean(x * x)) + 1e-12))
+        peak = float(np.max(np.abs(x)) + 1e-12)
+        return rms, peak
+
+    def run_bundle(self, input_uri: str, tmp_path: str, *, asr_segments: List[Dict[str, Any]], diar_segments: List[Dict[str, Any]]) -> ExtractorResult:
         start_time = time.time()
-        
         try:
-            # Валидация входного файла
             if not self._validate_input(input_uri):
-                return self._create_result(
-                    success=False,
-                    error="Некорректный входной файл",
-                    processing_time=time.time() - start_time
+                return self._create_result(False, error="Некорректный входной файл", processing_time=time.time() - start_time)
+            if not isinstance(asr_segments, list) or not asr_segments:
+                raise ValueError("speech_analysis | asr_segments is empty (no-fallback)")
+            if not isinstance(diar_segments, list) or not diar_segments:
+                raise ValueError("speech_analysis | diar_segments is empty (no-fallback)")
+
+            dur_sec = float(
+                max(
+                    max((float(s.get("end_sec", 0.0)) for s in asr_segments), default=0.0),
+                    max((float(s.get("end_sec", 0.0)) for s in diar_segments), default=0.0),
                 )
-            
-            self._log_extraction_start(input_uri)
-            
-            # Запускаем ASR с опциональным усреднением стерео каналов
-            # self.logger.info("Запуск ASR анализа...")
-            asr_start = time.time()
-            if self.average_channels_for_asr:
-                try:
-                    with timeit("speech_analysis: load_audio for ASR"):
-                        wav_t, sr = self.audio_utils.load_audio(input_uri, self.sample_rate)
-                    y = self.audio_utils.to_numpy(wav_t)
-                    if y.ndim == 2:
-                        with timeit("speech_analysis: avg stereo->mono"):
-                            y = np.mean(y, axis=0)
-                    # сохраняем во временный WAV для корректной работы текущего ASRExtractor
-                    import soundfile as sf
-                    tmp_wav = str(Path(tmp_path) / f"{Path(input_uri).stem}_mono_avg.wav")
-                    Path(tmp_path).mkdir(parents=True, exist_ok=True)
-                    with timeit("speech_analysis: write tmp wav"):
-                        sf.write(tmp_wav, y.astype(np.float32), sr)
-                    with timeit("speech_analysis: ASR run"):
-                        asr_result = self.asr_extractor.run(tmp_wav, tmp_path)
-                except Exception:
-                    # fallback на исходный файл
-                    with timeit("speech_analysis: ASR run (fallback)"):
-                        asr_result = self.asr_extractor.run(input_uri, tmp_path)
-            else:
-                with timeit("speech_analysis: ASR run"):
-                    asr_result = self.asr_extractor.run(input_uri, tmp_path)
-            asr_time = time.time() - asr_start
-            
-            if not asr_result.success:
-                return self._create_result(
-                    success=False,
-                    error=f"ASR анализ не удался: {asr_result.error}",
-                    processing_time=time.time() - start_time
+            )
+            if dur_sec < 5.0:
+                raise RuntimeError(f"speech_analysis | audio too short (<5s): duration_sec={dur_sec:.3f}")
+
+            # Silence detection on a small probe window (first diar window): load segment and check rms/peak.
+            # We do not want to accidentally mask broken extraction; load_audio_segment will fail on broken files.
+            try:
+                probe = diar_segments[0]
+                wav_t, _sr = self.audio_utils.load_audio_segment(
+                    input_uri,
+                    start_sample=int(probe.get("start_sample")),
+                    end_sample=int(probe.get("end_sample")),
+                    target_sr=self.sample_rate,
                 )
-            
-            # Запускаем диаризацию и pitch анализ параллельно
-            # self.logger.info("Запуск диаризации спикеров и pitch анализа...")
-            
-            # Запускаем диаризацию
-            diar_start = time.time()
-            with timeit("speech_analysis: diarization run"):
-                diarization_result = self.diarization_extractor.run(input_uri, tmp_path)
-            diar_time = time.time() - diar_start
-            
-            if not diarization_result.success:
-                return self._create_result(
-                    success=False,
-                    error=f"Диаризация не удалась: {diarization_result.error}",
-                    processing_time=time.time() - start_time
-                )
-            
-            # Запускаем pitch анализ (опционально)
-            pitch_result = None
-            pitch_start = time.time()
+                wav = self.audio_utils.to_numpy(wav_t)
+                wav = wav[0] if wav.ndim == 2 else wav.reshape(-1)
+                rms, peak = self._rms_and_peak(wav)
+            except Exception as e:
+                raise RuntimeError(f"speech_analysis | failed to probe audio for silence detection: {e}") from e
+
+            if peak < 1e-3 and rms < 1e-4:
+                payload: Dict[str, Any] = {
+                    "status": "empty",
+                    "empty_reason": "audio_silent",
+                    "duration_sec": float(dur_sec),
+                    "sample_rate": int(self.sample_rate),
+                    "device_used": "cuda",
+                }
+                return self._create_result(True, payload=payload, processing_time=time.time() - start_time)
+
+            # Run sub-extractors (segments-driven)
+            asr_res = self.asr_extractor.run_segments(input_uri, tmp_path, asr_segments)
+            if not asr_res.success:
+                raise RuntimeError(f"speech_analysis | asr failed: {asr_res.error}")
+            diar_res = self.diarization_extractor.run_segments(input_uri, tmp_path, diar_segments)
+            if not diar_res.success:
+                raise RuntimeError(f"speech_analysis | diarization failed: {diar_res.error}")
+
+            pitch_payload = None
             if self.pitch_enabled:
-                with timeit("speech_analysis: pitch run"):
-                    pitch_result = self.pitch_extractor.run(input_uri, tmp_path)
-                if not pitch_result.success:
-                    self.logger.warning(f"Pitch анализ не удался: {pitch_result.error}, продолжаем без него")
-                    pitch_result = None
-            pitch_time = time.time() - pitch_start if self.pitch_enabled else 0.0
-            
-            # Сопоставляем результаты
-            # self.logger.info("Сопоставление ASR и диаризации...")
-            aligned_result = self._align_asr_and_diarization(
-                asr_result.payload,
-                diarization_result.payload
-            )
+                p = self.pitch_extractor.run(input_uri, tmp_path)
+                if p.success and isinstance(p.payload, dict):
+                    pitch_payload = p.payload
 
-            processing_time = time.time() - start_time
+            asr_payload = asr_res.payload or {}
+            diar_payload = diar_res.payload or {}
 
-            payload = {
-                "asr_result": asr_result.payload,
-                "diarization_result": diarization_result.payload,
-                "pitch_result": pitch_result.payload if pitch_result else None,
-                "aligned_speech": aligned_result,
-                "total_processing_time": processing_time,
-                "asr_processing_time": asr_result.processing_time or asr_time,
-                "diarization_processing_time": diarization_result.processing_time or diar_time,
-                "pitch_processing_time": pitch_time,
-                "device_used": self.device
-            }
-            
-            self._log_extraction_success(input_uri, processing_time)
-            
-            return self._create_result(
-                success=True,
-                payload=payload,
-                processing_time=processing_time
-            )
-            
-        except Exception as e:
-            processing_time = time.time() - start_time
-            error_msg = f"Ошибка комбинированного анализа речи: {str(e)}"
-            self._log_extraction_error(input_uri, error_msg, processing_time)
-            
-            return self._create_result(
-                success=False,
-                error=error_msg,
-                processing_time=processing_time
-            )
-    
-    def _align_asr_and_diarization(
-        self, 
-        asr_payload: Dict[str, Any], 
-        diarization_payload: Dict[str, Any]
-    ) -> Dict[str, Any]:
-        """Сопоставление результатов ASR и диаризации."""
-        try:
-            asr_segments = asr_payload.get("segments", [])
-            speaker_segments = diarization_payload.get("speaker_segments", [])
-            segment_duration = diarization_payload.get("segment_duration", 2.0)
-            
-            # Создаем результирующие сегменты с присвоенными спикерами
-            aligned_segments = []
-            
-            for asr_segment in asr_segments:
-                seg_start = asr_segment.get("start", 0.0)
-                seg_end = asr_segment.get("end", 0.0)
-                seg_text = asr_segment.get("text", "").strip()
-                
-                # Находим среднее время сегмента
-                seg_mid = (seg_start + seg_end) / 2
-                
-                # Находим соответствующий сегмент диаризации
-                speaker_id = self._find_speaker_for_time(
-                    seg_mid, 
-                    speaker_segments, 
-                    segment_duration
-                )
-                # Попробуем достать уверенность диаризации, если доступна
-                speaker_confidence = None
-                try:
-                    if 0 <= int(seg_mid // segment_duration) < len(speaker_segments):
-                        speaker_confidence = speaker_segments[int(seg_mid // segment_duration)].get("confidence")
-                except Exception:
-                    speaker_confidence = None
-                
-                # Создаем выровненный сегмент
-                aligned_segment = {
-                    "start": seg_start,
-                    "end": seg_end,
-                    "text": seg_text,
-                    "speaker_id": speaker_id,
-                    "duration": seg_end - seg_start,
-                    "confidence": asr_segment.get("avg_logprob", 0.0),
-                    "no_speech_prob": asr_segment.get("no_speech_prob", 0.0),
-                    "tokens": asr_segment.get("tokens", []),
-                    "speaker_confidence": speaker_confidence
-                }
-                
-                aligned_segments.append(aligned_segment)
-            
-            # Группируем по спикерам
-            speaker_groups = self._group_segments_by_speaker(aligned_segments)
-            
-            # Вычисляем статистики
-            stats = self._compute_speech_statistics(aligned_segments, speaker_groups)
-            
-            return {
-                "aligned_segments": aligned_segments,
-                "speaker_groups": speaker_groups,
-                "statistics": stats,
-                "total_speakers": len(speaker_groups),
-                "total_segments": len(aligned_segments)
-            }
-            
-        except Exception as e:
-            self.logger.error(f"Ошибка сопоставления ASR и диаризации: {e}")
-            return {
-                "aligned_segments": [],
-                "speaker_groups": {},
-                "statistics": {},
-                "total_speakers": 0,
-                "total_segments": 0
-            }
-    
-    def _find_speaker_for_time(
-        self, 
-        time: float, 
-        speaker_segments: List[Dict[str, Any]], 
-        segment_duration: float
-    ) -> int:
-        """Поиск спикера для заданного времени."""
-        try:
-            # Вычисляем индекс сегмента диаризации
-            segment_index = int(time // segment_duration)
-            
-            # Проверяем границы
-            if 0 <= segment_index < len(speaker_segments):
-                return speaker_segments[segment_index].get("speaker_id", 0)
+            # ASR token stats (token IDs are stored in asr_extractor NPZ; here we keep small summaries)
+            token_ids_by_segment = asr_payload.get("token_ids_by_segment") or []
+            if isinstance(token_ids_by_segment, list):
+                token_counts = np.asarray([len(x or []) for x in token_ids_by_segment], dtype=np.float32)
             else:
-                # Fallback к ближайшему сегменту
-                if segment_index < 0:
-                    return speaker_segments[0].get("speaker_id", 0) if speaker_segments else 0
-                else:
-                    return speaker_segments[-1].get("speaker_id", 0) if speaker_segments else 0
-                    
+                token_counts = np.zeros((0,), dtype=np.float32)
+
+            lang_ids = np.asarray(asr_payload.get("lang_id_by_segment") or [], dtype=np.int32).reshape(-1)
+
+            token_total = float(np.sum(token_counts)) if token_counts.size else 0.0
+            token_mean = float(np.mean(token_counts)) if token_counts.size else 0.0
+            token_std = float(np.std(token_counts)) if token_counts.size else 0.0
+            token_density = float(token_total / max(1e-6, dur_sec))
+
+            # Diarization stats
+            speaker_segments = diar_payload.get("speaker_segments") or []
+            if not isinstance(speaker_segments, list):
+                speaker_segments = []
+            speaker_ids = np.asarray(diar_payload.get("speaker_ids") or [], dtype=np.int32).reshape(-1)
+            speaker_count = int(diar_payload.get("speaker_count") or (len(set(int(s.get("speaker_id", 0)) for s in speaker_segments)) if speaker_segments else 0))
+
+            # Dominant speaker share by total duration over diar windows
+            dur_by_spk: Dict[int, float] = {}
+            for s in speaker_segments:
+                try:
+                    sid = int(s.get("speaker_id", 0))
+                    d = float(s.get("duration", float(s.get("end", 0.0)) - float(s.get("start", 0.0))) or 0.0)
+                    dur_by_spk[sid] = dur_by_spk.get(sid, 0.0) + max(0.0, d)
+                except Exception:
+                    continue
+            total_speech_dur = float(sum(dur_by_spk.values())) if dur_by_spk else 0.0
+            dominant_share = float(max(dur_by_spk.values()) / max(1e-6, total_speech_dur)) if dur_by_spk else 0.0
+
+            # Pitch summaries (if present)
+            pitch_f0_mean = float(pitch_payload.get("f0_mean", 0.0) or 0.0) if isinstance(pitch_payload, dict) else 0.0
+            pitch_f0_std = float(pitch_payload.get("f0_std", 0.0) or 0.0) if isinstance(pitch_payload, dict) else 0.0
+
+            payload_out: Dict[str, Any] = {
+                "duration_sec": float(dur_sec),
+                "sample_rate": int(self.sample_rate),
+                "device_used": "cuda",
+                # ASR summaries
+                "asr_segments_count": int(asr_payload.get("segments_count") or len(token_counts)),
+                "asr_token_total": float(token_total),
+                "asr_token_mean": float(token_mean),
+                "asr_token_std": float(token_std),
+                "asr_token_density_per_sec": float(token_density),
+                "asr_lang_id_by_segment": lang_ids.tolist(),
+                # Diarization summaries
+                "diar_segments_count": int(diar_payload.get("segments_count") or len(speaker_segments)),
+                "speaker_count": int(speaker_count),
+                "dominant_speaker_share": float(dominant_share),
+                "speaker_ids": speaker_ids.tolist(),
+                # Optional pitch
+                "pitch_enabled": bool(self.pitch_enabled and pitch_payload is not None),
+                "pitch_f0_mean": float(pitch_f0_mean),
+                "pitch_f0_std": float(pitch_f0_std),
+            }
+
+            return self._create_result(True, payload=payload_out, processing_time=time.time() - start_time)
         except Exception as e:
-            self.logger.warning(f"Ошибка поиска спикера для времени {time}: {e}")
-            return 0
-    
-    def _group_segments_by_speaker(
-        self, 
-        aligned_segments: List[Dict[str, Any]]
-    ) -> Dict[int, List[Dict[str, Any]]]:
-        """Группировка сегментов по спикерам."""
-        try:
-            speaker_groups = {}
-            
-            for segment in aligned_segments:
-                speaker_id = segment.get("speaker_id", 0)
-                
-                if speaker_id not in speaker_groups:
-                    speaker_groups[speaker_id] = []
-                
-                speaker_groups[speaker_id].append(segment)
-            
-            return speaker_groups
-            
-        except Exception as e:
-            self.logger.error(f"Ошибка группировки сегментов по спикерам: {e}")
-            return {}
-    
-    def _compute_speech_statistics(
-        self, 
-        aligned_segments: List[Dict[str, Any]], 
-        speaker_groups: Dict[int, List[Dict[str, Any]]]
-    ) -> Dict[str, Any]:
-        """Вычисление статистик речи."""
-        try:
-            stats = {
-                "total_duration": 0.0,
-                "total_words": 0,
-                "speaker_stats": {},
-                "speech_activity": {},
-                "confidence_stats": {}
-            }
-            
-            # Общие статистики
-            total_duration = 0.0
-            total_words = 0
-            confidences = []
-            
-            for segment in aligned_segments:
-                duration = segment.get("duration", 0.0)
-                text = segment.get("text", "")
-                confidence = segment.get("confidence", 0.0)
-                
-                total_duration += duration
-                total_words += len(text.split())
-                confidences.append(confidence)
-            
-            stats["total_duration"] = total_duration
-            stats["total_words"] = total_words
-            stats["confidence_stats"] = {
-                "mean": np.mean(confidences) if confidences else 0.0,
-                "std": np.std(confidences) if confidences else 0.0,
-                "min": np.min(confidences) if confidences else 0.0,
-                "max": np.max(confidences) if confidences else 0.0
-            }
-            
-            # Статистики по спикерам
-            for speaker_id, segments in speaker_groups.items():
-                speaker_duration = sum(seg.get("duration", 0.0) for seg in segments)
-                speaker_words = sum(len(seg.get("text", "").split()) for seg in segments)
-                speaker_confidences = [seg.get("confidence", 0.0) for seg in segments]
-                
-                stats["speaker_stats"][speaker_id] = {
-                    "duration": speaker_duration,
-                    "words": speaker_words,
-                    "segments_count": len(segments),
-                    "speech_percentage": (speaker_duration / total_duration * 100) if total_duration > 0 else 0.0,
-                    "average_confidence": np.mean(speaker_confidences) if speaker_confidences else 0.0
-                }
-            
-            # Активность речи (временные интервалы)
-            speech_intervals = []
-            for segment in aligned_segments:
-                if segment.get("text", "").strip():
-                    speech_intervals.append({
-                        "start": segment.get("start", 0.0),
-                        "end": segment.get("end", 0.0),
-                        "speaker_id": segment.get("speaker_id", 0)
-                    })
-            
-            stats["speech_activity"] = {
-                "intervals": speech_intervals,
-                "total_intervals": len(speech_intervals)
-            }
-            
-            return stats
-            
-        except Exception as e:
-            self.logger.error(f"Ошибка вычисления статистик речи: {e}")
-            return {
-                "total_duration": 0.0,
-                "total_words": 0,
-                "speaker_stats": {},
-                "speech_activity": {},
-                "confidence_stats": {}
-            }
-    
-    def _validate_input(self, input_uri: str) -> bool:
-        """Валидация входного файла."""
-        if not super()._validate_input(input_uri):
-            return False
-        
-        # Проверяем, что это аудио/видео файл
-        media_extensions = {'.wav', '.mp3', '.flac', '.m4a', '.mp4', '.avi', '.mov'}
-        if not any(input_uri.lower().endswith(ext) for ext in media_extensions):
-            self.logger.error(f"Файл не является поддерживаемым медиа форматом: {input_uri}")
-            return False
-        
-        return True
-    
-    def get_extractors_info(self) -> Dict[str, Any]:
-        """Получение информации о подэкстракторах."""
-        return {
-            "asr_extractor": self.asr_extractor.get_model_info(),
-            "diarization_extractor": self.diarization_extractor.get_encoder_info(),
-            "pitch_extractor": {
-                "fmin": self.pitch_extractor.fmin,
-                "fmax": self.pitch_extractor.fmax,
-                "backend": self.pitch_extractor.backend,
-                "sample_rate": self.pitch_extractor.sample_rate,
-                "device": self.pitch_extractor.device
-            },
-            "device": self.device,
-            "sample_rate": self.sample_rate
-        }
+            return self._create_result(False, error=str(e), processing_time=time.time() - start_time)
+
+    def run(self, input_uri: str, tmp_path: str) -> ExtractorResult:
+        return self._create_result(
+            success=False,
+            error="speech_analysis_extractor | requires Segmenter window families; use run_bundle(asr_segments, diar_segments).",
+            processing_time=0.0,
+        )
+
+

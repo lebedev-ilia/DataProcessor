@@ -27,6 +27,7 @@ def main(argv: Optional[List[str]] = None) -> int:
     parser.add_argument("--frames-dir", required=True, help="Директория с кадрами (с metadata.json)")
     parser.add_argument("--rs-path", required=True, help="Папка result_store для артефактов")
     parser.add_argument("--repeat-threshold", type=float, default=0.97, help="Порог max-sim для repetition_ratio")
+    parser.add_argument("--max-frames", type=int, default=200, help="Fail-fast лимит на число sampled кадров (N) для NxN similarity")
     parser.add_argument("--log-level", type=str, default="INFO", help="DEBUG/INFO/WARN/ERROR")
 
     args = parser.parse_args(argv)
@@ -38,8 +39,12 @@ def main(argv: Optional[List[str]] = None) -> int:
         logger.warning("Не удалось установить log-level: %s", args.log_level)
 
     try:
-        module = UniquenessBaselineModule(rs_path=args.rs_path, repeat_threshold=float(args.repeat_threshold))
-        config: Dict[str, Any] = {"repeat_threshold": float(args.repeat_threshold)}
+        module = UniquenessBaselineModule(
+            rs_path=args.rs_path,
+            repeat_threshold=float(args.repeat_threshold),
+            max_frames=int(args.max_frames),
+        )
+        config: Dict[str, Any] = {"repeat_threshold": float(args.repeat_threshold), "max_frames": int(args.max_frames)}
         saved_path = module.run(frames_dir=args.frames_dir, config=config)
         logger.info("Готово. Результаты сохранены: %s", saved_path)
         return 0
@@ -56,5 +61,4 @@ def main(argv: Optional[List[str]] = None) -> int:
 
 if __name__ == "__main__":
     raise SystemExit(main())
-    logger.info(f"VisualProcessor | {name} | main | Results stored successfully")
 

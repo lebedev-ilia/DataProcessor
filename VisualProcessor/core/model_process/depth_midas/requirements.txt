@@ -1,0 +1,5 @@
+# core_depth_midas (Triton-only)
+numpy
+opencv-python
+requests
+

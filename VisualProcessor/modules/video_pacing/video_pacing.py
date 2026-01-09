@@ -8,9 +8,7 @@ video_pacing
 
 from __future__ import annotations
 
-import math
 import os
-import json
 
 import cv2
 import numpy as np
@@ -26,6 +24,37 @@ warnings.filterwarnings("ignore")
 
 from modules.base_module import BaseModule
 from utils.frame_manager import FrameManager
+
+
+def _require_union_times_s(frame_manager: FrameManager, frame_indices: List[int]) -> np.ndarray:
+    """
+    Segmenter contract: union_timestamps_sec is source-of-truth for time axis.
+    No-fallback: if missing/invalid -> error.
+    """
+    meta = getattr(frame_manager, "meta", None)
+    if not isinstance(meta, dict):
+        raise RuntimeError("video_pacing | FrameManager.meta missing (requires union_timestamps_sec)")
+    ts = meta.get("union_timestamps_sec")
+    if not isinstance(ts, list) or not ts:
+        raise RuntimeError("video_pacing | union_timestamps_sec missing/empty in frames metadata (no-fallback)")
+    uts = np.asarray(ts, dtype=np.float32)
+    fi = np.asarray([int(i) for i in frame_indices], dtype=np.int32)
+    if fi.size == 0:
+        raise RuntimeError("video_pacing | frame_indices is empty (no-fallback)")
+    if int(np.max(fi)) >= int(uts.shape[0]):
+        raise RuntimeError("video_pacing | union_timestamps_sec does not cover frame_indices (no-fallback)")
+    times_s = uts[fi]
+    if times_s.size >= 2 and np.any(np.diff(times_s) < -1e-3):
+        raise RuntimeError("video_pacing | union_timestamps_sec is not monotonic for frame_indices (no-fallback)")
+    return times_s.astype(np.float32)
+
+
+def _mad(x: np.ndarray) -> float:
+    """Median absolute deviation (robust scale)."""
+    if x.size == 0:
+        return 0.0
+    med = float(np.median(x))
+    return float(np.median(np.abs(x - med)))
 
 
 def gini_coefficient(values: np.ndarray) -> float:
@@ -56,12 +85,12 @@ def _load_core_optical_flow_npz(rs_path: Optional[str]) -> Optional[Dict[str, An
     try:
         data = np.load(p, allow_pickle=True)
         idx = data.get("frame_indices")
-        curve = data.get("motion_px_per_sec_mean")
+        curve = data.get("motion_norm_per_sec_mean")
         if idx is None or curve is None:
             return None
         return {
             "frame_indices": np.asarray(idx, dtype=np.int32),
-            "motion_px_per_sec_mean": np.asarray(curve, dtype=np.float32),
+            "motion_norm_per_sec_mean": np.asarray(curve, dtype=np.float32),
             "meta": data.get("meta"),
         }
     except Exception:
@@ -108,6 +137,7 @@ class VideoPacingPipelineVisualOptimized:
         batch_size: int = 32,
         downscale_factor: float = 0.25,
         min_shot_length_seconds: float = 0.15,
+        shot_detect_k: float = 6.0,
         rs_path: Optional[str] = None,
     ):
         """
@@ -119,19 +149,19 @@ class VideoPacingPipelineVisualOptimized:
 
         # Загружаем кадры через FrameManager
         self.frame_manager = frame_manager
-        self.frame_indices = frame_indices
+        self.frame_indices = [int(i) for i in frame_indices]
         self.total_frames = len(frame_indices)
-        self.fps = float(getattr(self.frame_manager, "fps", 30.0) or 30.0)
-        self.video_length_seconds = self.total_frames / self.fps if self.fps > 0 else 0.0
+        # Strict time-axis contract (Segmenter)
+        self.times_s = _require_union_times_s(self.frame_manager, self.frame_indices)
+        self.video_length_seconds = float(max(self.times_s[-1] - self.times_s[0], 0.0)) if self.times_s.size else 0.0
         self.min_shot_length_seconds = float(min_shot_length_seconds)
+        self.shot_detect_k = float(shot_detect_k)
         self.rs_path = rs_path
 
         # CLIP модель удалена - используем только core_clip
 
         # Определяем шоты и сцены
         self.shot_boundaries = self._detect_shots_with_merging()
-        # Пока сцены отождествляем с шотами (alias), см. описание в FEATURES_DESCRIPTION
-        self.scene_boundaries = self.shot_boundaries
 
     def _get_resize_frame(self, idx):
         return cv2.resize(
@@ -149,11 +179,13 @@ class VideoPacingPipelineVisualOptimized:
         h, w = img1.shape[:2]
         min_side = min(h, w)
 
-        if min_side < 7:
-            # fallback: считаем, что кадры сильно отличаются
-            return 0.0
+        # No-fallback: if Segmenter produced frames too small for SSIM, treat as invalid input.
+        if min_side < 3:
+            raise RuntimeError("video_pacing | frames too small for SSIM (min_side < 3). Check Segmenter sampling/resolution.")
 
         win_size = min(7, min_side if min_side % 2 == 1 else min_side - 1)
+        if win_size < 3:
+            raise RuntimeError("video_pacing | frames too small for SSIM window (win_size < 3).")
 
         return ssim(
             img1,
@@ -164,21 +196,27 @@ class VideoPacingPipelineVisualOptimized:
 
     def _detect_shots_with_merging(self) -> List[int]:
         """
-        Детекция шотов по комбинации SSIM + цвет/градиенты/яркость с последующим
-        объединением слишком коротких шотов.
+        Shot boundary detection on sampled frames.
+
+        Design goals (audit):
+        - no hard-coded global thresholds tied to FPS / sampling density
+        - robust thresholds derived from per-video statistics (MAD)
+        - merging too-short shots uses time axis (union_timestamps_sec)
         """
         if not self.frame_indices:
             return [0]
 
         # IMPORTANT: store boundaries as POSITIONS in `self.frame_indices` list (0..N-1),
         # not as union frame indices. This keeps all downstream computations consistent.
-        shot_positions = [0]
-        prev_pos = 0
-        prev_idx = self.frame_indices[prev_pos]
+        # 1-pass feature extraction for transitions
+        ssim_scores: List[float] = []
+        chi_scores: List[float] = []
+        edge_scores: List[float] = []
+        vdiff_scores: List[float] = []
+
+        prev_idx = self.frame_indices[0]
         prev_frame = self._get_resize_frame(prev_idx)
         prev_gray = cv2.cvtColor(prev_frame, cv2.COLOR_RGB2GRAY)
-
-        # предвычислим гистограмму и границы
         prev_hsv = cv2.cvtColor(prev_frame, cv2.COLOR_RGB2HSV)
         prev_v = float(np.mean(prev_hsv[:, :, 2]))
         prev_hist = cv2.calcHist([prev_gray], [0], None, [32], [0, 256])
@@ -192,34 +230,19 @@ class VideoPacingPipelineVisualOptimized:
             curr_hsv = cv2.cvtColor(curr_frame, cv2.COLOR_RGB2HSV)
             curr_v = float(np.mean(curr_hsv[:, :, 2]))
 
-            # 1) SSIM
-            ssim_score = self._safe_ssim(prev_frame, curr_frame)
-
-            # 2) Цветовая гистограмма (Chi-squared)
+            ssim_score = float(self._safe_ssim(prev_frame, curr_frame))
             curr_hist = cv2.calcHist([curr_gray], [0], None, [32], [0, 256])
             curr_hist = cv2.normalize(curr_hist, None).flatten()
-            chi_sq = 0.5 * np.sum(
-                ((prev_hist - curr_hist) ** 2) / (prev_hist + curr_hist + 1e-6)
-            )
+            chi_sq = float(0.5 * np.sum(((prev_hist - curr_hist) ** 2) / (prev_hist + curr_hist + 1e-6)))
 
-            # 3) Изменение границ (edge change ratio)
             curr_edges = cv2.Canny(curr_gray, 50, 150)
-            edge_diff = np.mean(cv2.absdiff(prev_edges, curr_edges) > 0)
+            edge_diff = float(np.mean(cv2.absdiff(prev_edges, curr_edges) > 0))
+            v_diff = float(abs(curr_v - prev_v))
 
-            # 4) Изменение яркости
-            v_diff = abs(curr_v - prev_v)
-
-            # бинарные детекторы
-            ssim_cut = ssim_score < 0.93
-            hist_cut = chi_sq > 0.3
-            edge_cut = edge_diff > 0.25 or v_diff > 15.0
-
-            strong_hist = chi_sq > 0.6
-            strong_edge = edge_diff > 0.5 or v_diff > 30.0
-
-            detectors = [ssim_cut, hist_cut, edge_cut]
-            if sum(detectors) >= 2 or strong_hist or strong_edge:
-                shot_positions.append(pos)
+            ssim_scores.append(ssim_score)
+            chi_scores.append(chi_sq)
+            edge_scores.append(edge_diff)
+            vdiff_scores.append(v_diff)
 
             prev_frame = curr_frame
             prev_gray = curr_gray
@@ -228,18 +251,39 @@ class VideoPacingPipelineVisualOptimized:
             prev_hist = curr_hist
             prev_edges = curr_edges
 
+        ssim_arr = np.asarray(ssim_scores, dtype=np.float32)
+        chi_arr = np.asarray(chi_scores, dtype=np.float32)
+        edge_arr = np.asarray(edge_scores, dtype=np.float32)
+        vdiff_arr = np.asarray(vdiff_scores, dtype=np.float32)
+
+        if ssim_arr.size == 0:
+            return [0]
+
+        # Robust per-video thresholds (MAD-based)
+        k = float(self.shot_detect_k)
+        ssim_med, chi_med, edge_med, vdiff_med = map(float, [np.median(ssim_arr), np.median(chi_arr), np.median(edge_arr), np.median(vdiff_arr)])
+        ssim_thr = float(ssim_med - k * (_mad(ssim_arr) + 1e-9))
+        chi_thr = float(chi_med + k * (_mad(chi_arr) + 1e-9))
+        edge_thr = float(edge_med + k * (_mad(edge_arr) + 1e-9))
+        vdiff_thr = float(vdiff_med + k * (_mad(vdiff_arr) + 1e-9))
+
+        # Decision rule: a cut is a strong semantic/visual discontinuity vs local baseline
+        cut_mask = (ssim_arr < ssim_thr) & ((chi_arr > chi_thr) | (edge_arr > edge_thr) | (vdiff_arr > vdiff_thr))
+        cut_positions = (np.nonzero(cut_mask)[0] + 1).astype(np.int32)  # +1: transition i corresponds to boundary at pos i+1
+
+        shot_positions = [0] + [int(x) for x in cut_positions.tolist()]
+
         # Объединяем слишком короткие шоты
         if len(shot_positions) <= 1:
             return [0]
 
-        min_len_frames = max(int(self.min_shot_length_seconds * self.fps), 1)
         # shot boundaries in POSITIONS
         boundaries = sorted(set(int(x) for x in shot_positions))
         merged = [boundaries[0]]
         last_start = boundaries[0]
         for b in boundaries[1:]:
-            dur = b - last_start
-            if dur < min_len_frames:
+            dur_s = float(self.times_s[b] - self.times_s[last_start])
+            if dur_s < self.min_shot_length_seconds:
                 # не открываем новый шот, просто сливаем
                 continue
             merged.append(b)
@@ -253,13 +297,16 @@ class VideoPacingPipelineVisualOptimized:
     # Shot Features
     # -------------------------
     def extract_shot_features(self) -> Dict:
-        # длительности в кадрах
-        shot_frame_boundaries = [0] + self.shot_boundaries + [self.total_frames]
-        durations_frames = np.diff(shot_frame_boundaries).astype(np.float32)
-        if durations_frames.size == 0:
+        boundaries_pos = sorted(set(int(x) for x in self.shot_boundaries))
+        if not boundaries_pos:
+            boundaries_pos = [0]
+        # ensure start boundary exists
+        if boundaries_pos[0] != 0:
+            boundaries_pos = [0] + boundaries_pos
+        bt = self.times_s[np.asarray(boundaries_pos, dtype=np.int32)]
+        durations_sec = np.diff(np.concatenate([bt, np.asarray([self.times_s[-1]], dtype=np.float32)])).astype(np.float32)
+        if durations_sec.size == 0:
             return {}
-
-        durations_sec = durations_frames / self.fps
 
         # базовые статистики
         mean_dur = float(np.mean(durations_sec))
@@ -283,8 +330,8 @@ class VideoPacingPipelineVisualOptimized:
             np.mean(durations_sec < short_threshold) if durations_sec.size > 0 else 0.0
         )
 
-        # quick_cut_burst_count: >=3 cut за 1 секунду (по временным индексам шотов)
-        cut_times = np.array(self.shot_boundaries, dtype=np.float32) / self.fps
+        # quick_cut_burst_count: >=3 cut за 1 секунду (time-axis, union_timestamps_sec)
+        cut_times = bt[1:].astype(np.float32)  # exclude t0
         quick_cut_burst_count = 0
         if cut_times.size >= 3:
             i = 0
@@ -305,11 +352,12 @@ class VideoPacingPipelineVisualOptimized:
         # tempo_entropy: энтропия распределения shot durations (по 5 бинам)
         tempo_entropy_val = float(entropy(hist_counts_5 + 1e-9))
 
-        # cuts per 10 seconds (максимум и медиана скользящего окна)
+        # cuts per 10 seconds (max/median over sliding 10s windows)
         window = 10.0
         if cut_times.size > 0 and self.video_length_seconds > 0:
-            t_edges = np.arange(0.0, self.video_length_seconds + window, window)
-            cuts_per_window, _ = np.histogram(cut_times, bins=t_edges)
+            cut_rel = (cut_times - float(self.times_s[0])).astype(np.float32)
+            t_edges = np.arange(0.0, self.video_length_seconds + window, window, dtype=np.float32)
+            cuts_per_window, _ = np.histogram(cut_rel, bins=t_edges)
             cuts_per_10s_series = cuts_per_window / window
             cuts_per_10s_max = float(cuts_per_10s_series.max())
             cuts_per_10s_median = float(np.median(cuts_per_10s_series))
@@ -322,8 +370,9 @@ class VideoPacingPipelineVisualOptimized:
 
         # cut_density_map по 8 бинам времени
         if cut_times.size > 0 and self.video_length_seconds > 0:
-            bins8 = np.linspace(0.0, self.video_length_seconds, 9)
-            cuts8, _ = np.histogram(cut_times, bins=bins8)
+            cut_rel = (cut_times - float(self.times_s[0])).astype(np.float32)
+            bins8 = np.linspace(0.0, self.video_length_seconds, 9, dtype=np.float32)
+            cuts8, _ = np.histogram(cut_rel, bins=bins8)
             cut_density_map = (cuts8 / max(self.video_length_seconds / 8.0, 1e-6)).tolist()
         else:
             cut_density_map = [0.0] * 8
@@ -346,14 +395,19 @@ class VideoPacingPipelineVisualOptimized:
             "shot_length_histogram_5bins": hist_fracs,
             "tempo_entropy": tempo_entropy_val,
             "cut_density_map_8bins": cut_density_map,
+            "shots_count": int(durations_sec.size),
         }
 
     def extract_pace_curve(self) -> Dict:
-        shot_frame_boundaries = [0] + self.shot_boundaries + [self.total_frames]
-        durations_frames = np.diff(shot_frame_boundaries).astype(np.float32)
-        if durations_frames.size == 0:
+        boundaries_pos = sorted(set(int(x) for x in self.shot_boundaries))
+        if not boundaries_pos:
+            boundaries_pos = [0]
+        if boundaries_pos[0] != 0:
+            boundaries_pos = [0] + boundaries_pos
+        bt = self.times_s[np.asarray(boundaries_pos, dtype=np.int32)]
+        durations_sec = np.diff(np.concatenate([bt, np.asarray([self.times_s[-1]], dtype=np.float32)])).astype(np.float32)
+        if durations_sec.size == 0:
             return {}
-        durations_sec = durations_frames / self.fps
 
         x = np.arange(len(durations_sec), dtype=np.float32)
         if len(durations_sec) >= 2:
@@ -362,9 +416,8 @@ class VideoPacingPipelineVisualOptimized:
             slope = float(np.polyfit(x, y, 1)[0])
         else:
             slope = 0.0
-        mean_dur = float(np.mean(durations_sec))
         pace_curve_slope = slope
-        pace_curve_slope_normalized = float(slope * mean_dur) if mean_dur > 0 else 0.0
+        pace_curve_slope_normalized = float(slope * float(np.mean(durations_sec))) if float(np.mean(durations_sec)) > 0 else 0.0
 
         # пики (локальные максимумы длительностей = замедления)
         if len(durations_sec) >= 3:
@@ -397,7 +450,6 @@ class VideoPacingPipelineVisualOptimized:
             power_at_period = 0.0
 
         return {
-            "pace_curve_mean": mean_dur,
             "pace_curve_slope": pace_curve_slope,
             "pace_curve_slope_normalized": pace_curve_slope_normalized,
             "pace_curve_peaks": pace_curve_peaks,
@@ -405,22 +457,6 @@ class VideoPacingPipelineVisualOptimized:
             "pace_curve_peak_positions": peak_positions,
             "pace_curve_dominant_period_sec": dominant_period_sec,
             "pace_curve_power_at_period": power_at_period,
-        }
-
-    def extract_scene_pacing(self) -> Dict:
-        durations = np.diff([0] + self.scene_boundaries + [self.total_frames]).astype(
-            np.float32
-        )
-        if durations.size == 0:
-            return {}
-        durations_sec = durations / self.fps
-        return {
-            # alias: в текущей версии сцены соответствуют шотам
-            "scene_changes_per_minute": float(
-                len(self.scene_boundaries) / max(self.video_length_seconds / 60.0, 1e-6)
-            ),
-            "average_scene_duration": float(np.mean(durations_sec)),
-            "scene_duration_variance": float(np.var(durations_sec)),
         }
 
     # -------------------------
@@ -434,7 +470,7 @@ class VideoPacingPipelineVisualOptimized:
         if core is None:
             raise RuntimeError("video_pacing | core_optical_flow not found (required)")
         core_idx = core["frame_indices"]
-        core_curve = core["motion_px_per_sec_mean"]
+        core_curve = core["motion_norm_per_sec_mean"]
         if core_curve is None or core_curve.size == 0:
             raise RuntimeError("video_pacing | core_optical_flow curve is empty")
 
@@ -458,8 +494,6 @@ class VideoPacingPipelineVisualOptimized:
         else:
             flow_mags_smooth = core_curve
 
-        angle_series = None  # optical_flow пока не предоставляет angle_series
-
         # пер-кадровые метрики
         mean_motion = float(np.mean(flow_mags_smooth))
         median_motion = float(np.median(flow_mags_smooth))
@@ -469,34 +503,21 @@ class VideoPacingPipelineVisualOptimized:
         high_thr = float(np.percentile(flow_mags_smooth, 75))
         share_high_frames = float(np.mean(flow_mags_smooth > high_thr))
 
-        # изменения направления: доля кадров с резким поворотом > X градусов
-        if angle_series is not None:
-            angle_series = np.asarray(angle_series, dtype=np.float32)
-            if angle_series.size >= 2:
-                # нормализуем углы к [-pi, pi]
-                diff_ang = np.diff(angle_series)
-                diff_ang = (diff_ang + np.pi) % (2 * np.pi) - np.pi
-                angle_deg = np.abs(diff_ang * 180.0 / np.pi)
-                direction_change_events = np.sum(angle_deg > 45.0)
-                time_seconds = max(len(self.frame_indices) / self.fps, 1e-6)
-                dir_changes_per_sec = float(direction_change_events / time_seconds)
-            else:
-                dir_changes_per_sec = 0.0
-        else:
-            # core_optical_flow пока не даёт углы, поэтому ставим 0.0
-            dir_changes_per_sec = 0.0
-
         # пер-шотовые motion-агрегаты и корреляция с длиной шота
-        shot_frame_boundaries = [0] + self.shot_boundaries + [self.total_frames]
-        durations_frames = np.diff(shot_frame_boundaries).astype(np.float32)
-        durations_sec = durations_frames / self.fps
+        boundaries_pos = sorted(set(int(x) for x in self.shot_boundaries))
+        if not boundaries_pos:
+            boundaries_pos = [0]
+        if boundaries_pos[0] != 0:
+            boundaries_pos = [0] + boundaries_pos
+        bt = self.times_s[np.asarray(boundaries_pos, dtype=np.int32)]
+        durations_sec = np.diff(np.concatenate([bt, np.asarray([self.times_s[-1]], dtype=np.float32)])).astype(np.float32)
 
         shot_motion_means = []
-        for i in range(len(shot_frame_boundaries) - 1):
-            start = shot_frame_boundaries[i]
-            end = shot_frame_boundaries[i + 1]
-            # flow_mags соответствует переходам между кадрами, сдвинуто на 1 относительно frame_indices
-            local = flow_mags_smooth[max(start - 1, 0) : max(end - 1, 0)]
+        for i in range(len(boundaries_pos)):
+            start = boundaries_pos[i]
+            end = boundaries_pos[i + 1] if i + 1 < len(boundaries_pos) else int(self.total_frames)
+            # core_optical_flow curve is per-frame; the first element is typically 0 (no previous frame).
+            local = flow_mags_smooth[min(start + 1, flow_mags_smooth.size) : min(end, flow_mags_smooth.size)]
             if local.size > 0:
                 shot_motion_means.append(float(np.mean(local)))
             else:
@@ -524,7 +545,6 @@ class VideoPacingPipelineVisualOptimized:
             "share_of_high_motion_frames": share_high_frames,
             "share_of_high_motion_shots": share_high_motion_shots,
             "motion_shot_corr": motion_shot_corr,
-            "optical_flow_direction_changes_per_second": dir_changes_per_sec,
         }
 
     def _get_clip_frame(self, idx):
@@ -560,14 +580,18 @@ class VideoPacingPipelineVisualOptimized:
         emb_norm = embeddings / norms
         cos_sim = np.sum(emb_norm[1:] * emb_norm[:-1], axis=1)
         cos_dist = 1.0 - cos_sim  # 0..2
+        # Normalize by dt to be robust to variable sampling density.
+        dt = np.diff(self.times_s).astype(np.float32)
+        dt = np.maximum(dt, 1e-3)
+        cos_rate = (cos_dist.astype(np.float32) / dt).astype(np.float32)
 
         # сглаживание
-        if cos_dist.size >= 7:
+        if cos_rate.size >= 7:
             kernel_size = 5
             kernel = np.ones(kernel_size, dtype=np.float32) / kernel_size
-            diff_smooth = np.convolve(cos_dist, kernel, mode="same")
+            diff_smooth = np.convolve(cos_rate, kernel, mode="same")
         else:
-            diff_smooth = cos_dist
+            diff_smooth = cos_rate
 
         mean_diff = float(np.mean(diff_smooth))
         std_diff = float(np.std(diff_smooth))
@@ -578,24 +602,17 @@ class VideoPacingPipelineVisualOptimized:
         thr_jump = mean_diff + 2.0 * std_diff
         scene_jumps = int(np.sum(diff_smooth > thr_jump))
 
-        # semantic_change_burst_count: количество кластеров >=3 high-change кадров в окне 5 секунд
+        # semantic_change_burst_count: >=3 high-change transitions within any 5 seconds window
         high_mask = diff_smooth > thr_jump
-        if self.fps > 0:
-            window_frames = int(5.0 * self.fps)
-        else:
-            window_frames = 5
-        if window_frames < 3:
-            window_frames = 3
-
         burst_count = 0
-        if high_mask.size > 0:
+        if np.any(high_mask):
+            trans_times = ((self.times_s[1:] + self.times_s[:-1]) * 0.5).astype(np.float32)
+            high_times = trans_times[high_mask]
+            window_s = 5.0
             i = 0
-            while i < high_mask.size:
-                if not high_mask[i]:
-                    i += 1
-                    continue
-                j = i
-                while j < high_mask.size and j - i <= window_frames and high_mask[j]:
+            while i < high_times.size:
+                j = i + 1
+                while j < high_times.size and float(high_times[j] - high_times[i]) <= window_s:
                     j += 1
                 if j - i >= 3:
                     burst_count += 1
@@ -614,7 +631,9 @@ class VideoPacingPipelineVisualOptimized:
     # -------------------------
     def extract_color_pacing(self) -> Dict:
         hist_diffs = []
-        prev_frame = self._get_resize_frame(0)
+        if not self.frame_indices:
+            return {}
+        prev_frame = self._get_resize_frame(self.frame_indices[0])
         for idx in self.frame_indices[1:]:
             frame = self._get_resize_frame(idx)
             lab1 = rgb2lab(prev_frame)
@@ -623,23 +642,32 @@ class VideoPacingPipelineVisualOptimized:
             hist_diffs.append(np.mean(deltaE))
             prev_frame = frame
         hist_diffs = np.array(hist_diffs, dtype=np.float32)
+        dt = np.diff(self.times_s).astype(np.float32)
+        dt = np.maximum(dt, 1e-3)
+        hist_rate = (hist_diffs / dt).astype(np.float32)
 
         # локальный baseline (скользящее среднее) для дельты цвета
-        if hist_diffs.size >= 7:
+        if hist_rate.size >= 7:
             kernel = np.ones(7, dtype=np.float32) / 7.0
-            baseline = np.convolve(hist_diffs, kernel, mode="same")
+            baseline = np.convolve(hist_rate, kernel, mode="same")
         else:
-            baseline = np.full_like(hist_diffs, float(np.mean(hist_diffs)) if hist_diffs.size else 0.0)
-        hist_diffs_detrended = hist_diffs - baseline
+            baseline = np.full_like(hist_rate, float(np.mean(hist_rate)) if hist_rate.size else 0.0)
+        hist_diffs_detrended = hist_rate - baseline
 
-        saturation = [
+        saturation = np.asarray(
+            [
             np.mean(cv2.cvtColor(self._get_resize_frame(idx), cv2.COLOR_RGB2HSV)[:, :, 1])
             for idx in self.frame_indices
-        ]
-        brightness = [
+            ],
+            dtype=np.float32,
+        )
+        brightness = np.asarray(
+            [
             np.mean(cv2.cvtColor(self._get_resize_frame(idx), cv2.COLOR_RGB2HSV)[:, :, 2])
             for idx in self.frame_indices
-        ]
+            ],
+            dtype=np.float32,
+        )
 
         # color_change_bursts по detrended DeltaE
         if hist_diffs_detrended.size > 0:
@@ -651,59 +679,60 @@ class VideoPacingPipelineVisualOptimized:
         else:
             color_change_bursts = 0
 
+        sat_rate = np.diff(saturation) / dt if saturation.size >= 2 else np.asarray([], dtype=np.float32)
+        bri_rate = np.diff(brightness) / dt if brightness.size >= 2 else np.asarray([], dtype=np.float32)
+
         return {
-            "color_histogram_diff_mean": float(np.mean(hist_diffs)),
-            "color_histogram_diff_std": float(np.std(hist_diffs)),
-            "saturation_change_rate": float(np.std(saturation)),
-            "brightness_change_rate": float(np.std(brightness)),
+            "color_change_rate_mean": float(np.mean(hist_rate)) if hist_rate.size else 0.0,
+            "color_change_rate_std": float(np.std(hist_rate)) if hist_rate.size else 0.0,
+            "saturation_change_rate": float(np.std(sat_rate)) if sat_rate.size else 0.0,
+            "brightness_change_rate": float(np.std(bri_rate)) if bri_rate.size else 0.0,
             "color_change_bursts": color_change_bursts,
         }
 
     def extract_lighting_pacing(self) -> Dict:
-        lum = [
+        lum = np.asarray(
+            [
             np.mean(cv2.cvtColor(self._get_resize_frame(idx), cv2.COLOR_RGB2GRAY))
             for idx in self.frame_indices
-        ]
-        lum = np.asarray(lum, dtype=np.float32)
+            ],
+            dtype=np.float32,
+        )
         if lum.size < 2:
             return {
                 "luminance_spikes_per_minute": 0.0,
-                "high_frequency_flash_ratio": 0.0,
             }
 
-        lum_diff = np.diff(lum)
-        std_lum = float(np.std(lum_diff))
-        # простой порог шума камеры
-        noise_threshold = max(5.0, std_lum)
-        spikes = np.abs(lum_diff) > noise_threshold
+        dt = np.diff(self.times_s).astype(np.float32)
+        dt = np.maximum(dt, 1e-3)
+        lum_rate = np.diff(lum) / dt
+
+        # Robust spike threshold (MAD-based). Avoid FFT because sampling is non-uniform.
+        med = float(np.median(lum_rate))
+        thr = float(abs(med) + 6.0 * (_mad(lum_rate) + 1e-9))
+        spikes = np.abs(lum_rate - med) > thr
         spikes_count = int(np.sum(spikes))
 
         time_minutes = max(self.video_length_seconds / 60.0, 1e-6)
         lum_spikes_per_minute = float(spikes_count / time_minutes)
 
-        # high frequency flash ratio через FFT
-        lum_fft = np.fft.fft(lum_diff - np.mean(lum_diff))
-        mag = np.abs(lum_fft)
-        nyq = len(mag) // 2
-        cutoff = int(0.25 * nyq)
-        hf_power = np.sum(mag[cutoff:nyq])
-        total_power = np.sum(mag[:nyq]) + 1e-9
-        hf_ratio = float(hf_power / total_power)
-
         return {
             "luminance_spikes_per_minute": lum_spikes_per_minute,
-            "high_frequency_flash_ratio": hf_ratio,
         }
 
     # -------------------------
     # Structural Pacing
     # -------------------------
     def extract_structural_pacing(self) -> Dict:
-        shot_frame_boundaries = [0] + self.shot_boundaries + [self.total_frames]
-        durations_frames = np.diff(shot_frame_boundaries).astype(np.float32)
-        if durations_frames.size == 0:
+        boundaries_pos = sorted(set(int(x) for x in self.shot_boundaries))
+        if not boundaries_pos:
+            boundaries_pos = [0]
+        if boundaries_pos[0] != 0:
+            boundaries_pos = [0] + boundaries_pos
+        bt = self.times_s[np.asarray(boundaries_pos, dtype=np.int32)]
+        durations_sec = np.diff(np.concatenate([bt, np.asarray([self.times_s[-1]], dtype=np.float32)])).astype(np.float32)
+        if durations_sec.size == 0:
             return {}
-        durations_sec = durations_frames / self.fps
         n = len(durations_sec)
         quarter = max(n // 4, 1)
         intro = float(np.median(durations_sec[:quarter]))
@@ -731,8 +760,7 @@ class VideoPacingPipelineVisualOptimized:
         # Основные визуальные метрики
         features.update(self.extract_shot_features())
         features.update(self.extract_pace_curve())
-        features.update(self.extract_scene_pacing())
-        # Optional dependencies (optical_flow, core_clip)
+        # Hard deps: core_optical_flow + core_clip (contract)
         features.update(self.extract_motion_features())
         features.update(self.extract_content_change_rate())
         features.update(self.extract_color_pacing())
@@ -772,46 +800,19 @@ class VideoPacingModule(BaseModule):
             raise ValueError("video_pacing | frame_indices is empty")
 
         downscale = float(config.get("downscale_factor", self._downscale_factor))
+        min_shot_len_s = float(config.get("min_shot_length_seconds", 0.15))
+        shot_detect_k = float(config.get("shot_detect_k", 6.0))
 
         pipeline = VideoPacingPipelineVisualOptimized(
             frame_manager=frame_manager,
             frame_indices=frame_indices,
             downscale_factor=downscale,
+            min_shot_length_seconds=min_shot_len_s,
+            shot_detect_k=shot_detect_k,
             rs_path=self.rs_path,
         )
 
         raw_features = pipeline.extract_all_features()
-
-        # Presence flags for optional dependency families
-        has_motion = bool(raw_features.get("mean_motion_speed_per_shot") is not None) and ("motion_speed_median" in raw_features)
-        has_content_change = "frame_embedding_diff_mean" in raw_features
-
-        # Provide stable keys (NaN when missing optional blocks)
-        def _nan_features(keys: List[str]) -> Dict[str, Any]:
-            return {k: float("nan") for k in keys}
-
-        motion_keys = [
-            "mean_motion_speed_per_shot",
-            "motion_speed_median",
-            "motion_speed_variance",
-            "motion_speed_90perc",
-            "share_of_high_motion_frames",
-            "share_of_high_motion_shots",
-            "motion_shot_corr",
-            "optical_flow_direction_changes_per_second",
-        ]
-        if not has_motion:
-            raw_features.update(_nan_features(motion_keys))
-
-        content_keys = [
-            "frame_embedding_diff_mean",
-            "frame_embedding_diff_std",
-            "high_change_frames_ratio",
-            "scene_embedding_jumps",
-            "semantic_change_burst_count",
-        ]
-        if not has_content_change:
-            raw_features.update(_nan_features(content_keys))
 
         frame_indices_np = np.asarray([int(i) for i in frame_indices], dtype=np.int32)
         # boundaries are stored as POSITIONS inside pipeline; export as UNION frame indices
@@ -827,6 +828,4 @@ class VideoPacingModule(BaseModule):
             "frame_indices": frame_indices_np,
             "shot_boundary_frame_indices": shot_boundaries_frame_indices,
             "features": raw_features,
-            "motion_present": np.asarray(bool(has_motion)),
-            "content_change_present": np.asarray(bool(has_content_change)),
         }

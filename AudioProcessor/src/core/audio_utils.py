@@ -59,6 +59,67 @@ class AudioUtils:
                 self.logger.warning("Переключение на CPU загрузку")
                 return self._load_audio_cpu(file_path, target_sr)
             raise
+
+    def load_audio_segment(
+        self,
+        file_path: str,
+        *,
+        start_sample: int,
+        end_sample: int,
+        target_sr: Optional[int] = None,
+        mix_to_mono: bool = True,
+    ) -> Tuple[torch.Tensor, int]:
+        """
+        Load a slice of audio by sample indices (fail-fast).
+
+        This is used for Segmenter-aligned audio windows (audio/segments.json),
+        to avoid writing temporary WAV files and to keep performance stable.
+        """
+        if not os.path.exists(file_path):
+            raise FileNotFoundError(f"Аудио файл не найден: {file_path}")
+        if os.path.getsize(file_path) == 0:
+            raise ValueError(f"Аудио файл пуст: {file_path}")
+
+        start = int(start_sample)
+        end = int(end_sample)
+        if start < 0 or end < 0 or end < start:
+            raise ValueError(f"Некорректные границы сегмента: start_sample={start} end_sample={end}")
+
+        # Prefer soundfile for reliable frame slicing (PCM wav).
+        target_sr = target_sr or self.sample_rate
+        try:
+            with sf.SoundFile(file_path, mode="r") as f:
+                sr = int(f.samplerate)
+                total = int(len(f))
+                start_c = min(start, total)
+                end_c = min(end, total)
+                if end_c <= start_c:
+                    raise ValueError(f"Пустой сегмент после clip: start={start_c} end={end_c} total={total}")
+                f.seek(start_c)
+                frames = int(end_c - start_c)
+                data = f.read(frames=frames, dtype="float32", always_2d=True)  # shape [frames, ch]
+
+            if data.size == 0:
+                raise ValueError("Пустые данные сегмента")
+            # Mix to mono if requested
+            if data.ndim == 2:
+                if mix_to_mono:
+                    data = np.mean(data, axis=1)
+                else:
+                    data = data[:, 0]
+            data = np.asarray(data, dtype=np.float32)
+
+            # Resample if needed
+            if sr != target_sr:
+                data = librosa.resample(data, orig_sr=sr, target_sr=int(target_sr))
+                sr = int(target_sr)
+
+            waveform = torch.from_numpy(data).float().unsqueeze(0)
+            if self.device == "cuda" and torch.cuda.is_available():
+                waveform = waveform.to(self.device, non_blocking=True)
+            return waveform, sr
+        except Exception as e:
+            raise RuntimeError(f"Не удалось загрузить сегмент аудио: {e}") from e
     
     def _load_audio_gpu(self, file_path: str, target_sr: Optional[int] = None) -> Tuple[torch.Tensor, int]:
         """Загрузка аудио на GPU."""
@@ -111,9 +172,6 @@ class AudioUtils:
                 data = librosa.resample(data, orig_sr=sr, target_sr=target_sr)
                 sr = target_sr
 
-            if np.max(np.abs(data)) < 1e-12:
-                raise ValueError("Сигнал слишком тихий (почти нулевой) после загрузки")
-
             waveform = torch.from_numpy(data).float().unsqueeze(0)
             return waveform, sr
         except Exception as e_sf:
@@ -135,9 +193,6 @@ class AudioUtils:
                 waveform_t = resampler(waveform_t)
                 sr = target_sr
 
-            if torch.max(torch.abs(waveform_t)) < 1e-12:
-                raise ValueError("Сигнал слишком тихий (почти нулевой) после torchaudio")
-
             return waveform_t.float(), sr
         except Exception as e_ta:
             self.logger.warning(f"torchaudio не удалось: {e_ta}")
@@ -151,9 +206,6 @@ class AudioUtils:
             )
             if data is None or (isinstance(data, np.ndarray) and data.size == 0):
                 raise ValueError("Пустые данные при чтении librosa")
-
-            if np.max(np.abs(data)) < 1e-12:
-                raise ValueError("Сигнал слишком тихий (почти нулевой) после librosa")
 
             waveform = torch.from_numpy(data).float().unsqueeze(0)
             return waveform, sr

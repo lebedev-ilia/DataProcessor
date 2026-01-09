@@ -1,0 +1,30 @@
+version: "bench_spec_v1"
+
+# Grouped local baseline (GPU/Triton): YOLO only.
+# NOTE: yolo11x_960 may OOM on 6GB GPUs; keep it optional.
+
+defaults:
+  warmup: 5
+  repeats: 30
+  timeout_sec: 10.0
+
+models:
+  - name: yolo11x_320
+    model_spec_name: yolo11x_320_triton
+    kind: single_input
+    input: { dtype: FP32, shape: [1, 3, 320, 320], layout: nchw, value: random_uniform, float_range: [0.0, 1.0] }
+    output: { name: output0 }
+
+  - name: yolo11x_640
+    model_spec_name: yolo11x_640_triton
+    kind: single_input
+    input: { dtype: FP32, shape: [1, 3, 640, 640], layout: nchw, value: random_uniform, float_range: [0.0, 1.0] }
+    output: { name: output0 }
+
+  - name: yolo11x_960
+    model_spec_name: yolo11x_960_triton
+    kind: single_input
+    input: { dtype: FP32, shape: [1, 3, 960, 960], layout: nchw, value: random_uniform, float_range: [0.0, 1.0] }
+    output: { name: output0 }
+
+

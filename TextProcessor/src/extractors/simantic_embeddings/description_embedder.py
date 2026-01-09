@@ -18,8 +18,8 @@ from typing import List, Optional, Tuple, Any, Dict
 
 import numpy as np
 import torch
-from sentence_transformers import SentenceTransformer
 from src.core.model_registry import get_model
+from src.core.path_utils import default_artifacts_dir, default_cache_dir
 
 from src.core.base_extractor import BaseExtractor  # noqa
 from src.core.text_utils import normalize_whitespace  # noqa
@@ -32,27 +32,25 @@ class DescriptionEmbedder(BaseExtractor):
 
     def __init__(
         self,
-        model_name: str = "intfloat/multilingual-e5-large",
-        cache_dir: str = "/home/ilya/Рабочий стол/DataProcessor/TextProcessor/.cache/embed_cache",
-        device: Optional[str] = None,
+        model_name: str = "sentence-transformers/all-MiniLM-L6-v2",
+        cache_dir: Optional[str] = None,
+        device: Optional[str] = "cpu",
         fp16: bool = True,
         batch_size: int = 32,
-        artifacts_dir: str = "/home/ilya/Рабочий стол/DataProcessor/TextProcessor/.artifacts",
+        artifacts_dir: Optional[str] = None,
         max_chunk_tokens: int = 512,
     ):
         self.model_name = model_name
-        self.cache_dir = Path(cache_dir)
+        base_cache = default_cache_dir() / "embed_cache"
+        self.cache_dir = Path(cache_dir).expanduser().resolve() if cache_dir else base_cache
         self.cache_dir.mkdir(parents=True, exist_ok=True)
-        self.artifacts_dir = Path(artifacts_dir)
+        self.artifacts_dir = Path(artifacts_dir).expanduser().resolve() if artifacts_dir else default_artifacts_dir()
         self.artifacts_dir.mkdir(parents=True, exist_ok=True)
 
         self.batch_size = batch_size
         self.max_chunk_tokens = max_chunk_tokens
 
-        if device is None:
-            self.device = "cuda" if torch.cuda.is_available() else "cpu"
-        else:
-            self.device = device
+        self.device = str(device or "cpu")
 
         self.fp16 = fp16 and ("cuda" in self.device)
 

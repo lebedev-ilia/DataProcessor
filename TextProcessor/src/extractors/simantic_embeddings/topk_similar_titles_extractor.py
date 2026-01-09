@@ -8,6 +8,7 @@ import numpy as np
 
 from src.core.base_extractor import BaseExtractor
 from src.core.metrics import system_snapshot, process_memory_bytes
+from src.core.path_utils import default_artifacts_dir
 
 try:
     import faiss  # type: ignore
@@ -92,7 +93,7 @@ class TopKSimilarCorpusTitlesExtractor(BaseExtractor):
                 # resolve latest artifact
                 from glob import glob
                 import os
-                artifacts_dir = Path("/home/ilya/Рабочий стол/DataProcessor/TextProcessor/.artifacts")
+                artifacts_dir = default_artifacts_dir()
                 files = glob(str(artifacts_dir / "title_embedding_*.npy"))
                 if not files:
                     raise FileNotFoundError

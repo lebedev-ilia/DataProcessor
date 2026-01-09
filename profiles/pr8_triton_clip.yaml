@@ -1,0 +1,33 @@
+version: "pr8_profile_v1"
+
+# PR‑8 MVP: resolved model mapping for Triton.
+# NOTE: this is MVP source-of-truth (profile YAML). In prod the mapping lives in DB.
+
+processors:
+  audio:
+    enabled: false
+    required: false
+  text:
+    enabled: false
+    required: false
+
+visual:
+  cfg_path: "./VisualProcessor/config_pr2_min.yaml"
+  requirements:
+    core_clip: true
+
+resolved_model_mapping:
+  core_clip:
+    runtime: triton
+    # Preferred: resolve Triton models via dp_models specs (single source-of-truth).
+    # dp_models/spec_catalog/vision/{clip_image_triton.yaml,clip_text_triton.yaml}
+    triton_image_model_spec: "clip_image_triton"
+    triton_text_model_spec: "clip_text_triton"
+
+  cut_detection:
+    # Enable CLIP inside cut_detection but forbid local weights:
+    # it consumes core_clip text embeddings + runs Triton CLIP image encoder for candidate windows.
+    use_clip: true
+    clip_image_model_spec: "clip_image_triton"
+
+

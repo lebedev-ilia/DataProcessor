@@ -1,0 +1,20 @@
+model_name: clip_text_triton
+model_version: "1"
+role: clip_text
+runtime: triton
+engine: triton
+precision: fp16
+device_policy: cuda
+weights_digest: provided_by_deploy
+local_artifacts: []
+runtime_params:
+  triton_http_url: "${TRITON_HTTP_URL}"
+  triton_timeout_sec: 60.0
+  triton_model_name: "clip_text"
+  triton_model_version: "1"
+  triton_input_name: "INPUT__0"
+  triton_input_datatype: "INT64"
+  triton_output_name: "OUTPUT__0"
+  triton_output_datatype: "FP32"
+
+

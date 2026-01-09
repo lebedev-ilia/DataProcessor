@@ -1,0 +1,44 @@
+version: "pr8_triton_baseline_gpu_yolo_local_v1"
+
+processors:
+  audio:
+    enabled: false
+    required: false
+  text:
+    enabled: false
+    required: false
+
+visual:
+  cfg_path: "./VisualProcessor/config_triton_baseline_gpu_yolo_local.yaml"
+  requirements:
+    core_clip: true
+    core_depth_midas: true
+    core_optical_flow: true
+    core_object_detections: true
+
+resolved_model_mapping:
+  core_clip:
+    runtime: triton
+    triton_image_model_spec: "clip_image_224_triton"
+    triton_text_model_spec: "clip_text_triton"
+    triton_preprocess_preset: "openai_clip_224"
+
+  core_depth_midas:
+    runtime: triton
+    triton_model_spec: "midas_256_triton"
+    triton_preprocess_preset: "midas_256"
+    batch_size: 1
+
+  core_optical_flow:
+    runtime: triton
+    triton_model_spec: "raft_256_triton"
+    triton_preprocess_preset: "raft_256"
+
+  core_object_detections:
+    runtime: triton
+    triton_model_spec: "yolo11x_640_triton"
+    triton_preprocess_preset: "yolo11x_640"
+    batch_size: 1
+    model: "${DP_MODELS_ROOT}/visual/yolo/yolo11x.pt"
+
+

@@ -43,7 +43,7 @@
 - **Поля**:
   - `results_by_extractor.TranscriptChunkEmbedder.transcript_chunks_by_source.whisper.embeddings_path` — путь к `.npy` (матрица `float32` формы (N, D)).
   - Аналогично для `youtube_auto`.
-  - `...meta_path` — JSON с метаданными (`chunks`, `n_chunks`, `embedding_dim`, `model`, `device`).
+  - `...meta_path` — JSON с метаданными (**без raw текста**): `n_chunks`, `embedding_dim`, `model`, `device`, `chunk_word_counts`.
 - **Алгоритм**: разбиение на предложения с overlap → батчевый `encode(normalize_embeddings=False)` → L2-нормализация каждого чанка → сохранение.
 - **Время**: `timings_by_extractor.TranscriptChunkEmbedder.total` ~0.1–0.8 s (зависит от длины текста и батча).
 
@@ -92,13 +92,12 @@
 - **Время**: ~0.0–0.02 s.
 
 ### EmbeddingPairTopKExtractor
-- **Что делает**: top‑K пары «title ↔ transcript chunks», плюс косинус `title ↔ description`, опционально rerank CrossEncoder.
+- **Что делает**: top‑K пары «title ↔ transcript chunks», плюс косинус `title ↔ description`.
 - **Поля**:
   - `results_by_extractor.EmbeddingPairTopKExtractor.embedding_pair_topk_scores.title_transcript_topk_cosine` — список K чисел.
-  - `...title_transcript_topk_cross` — список K вероятностей (если CrossEncoder включен).
   - `...title_description_cosine` — число.
-- **Алгоритм**: FAISS/NP косинусная матрица → top‑K индексы → при наличии текстов чанков — CrossEncoder c численно устойчивым softmax.
-- **Время**: ~0.01–0.2 s (без CrossEncoder); ~0.05–0.5 s (с CrossEncoder), зависит от K.
+- **Алгоритм**: FAISS/NP косинусная матрица → top‑K индексы.
+- **Время**: ~0.01–0.2 s (зависит от K и размера матрицы).
 
 ### TitleEmbeddingClusterEntropyExtractor
 - **Что делает**: измеряет «размытость» заголовка по распределению близостей к ближайшим кластерам.
@@ -127,7 +126,7 @@
 ### QAEmbeddingPairsExtractor
 - **Что делает**: извлекает вопросительные фразы из `title/description/transcript/comments` и считает их эмбеддинги.
 - **Поля**:
-  - `qa_embeddings.path` (N×D), `meta_path` (источники, тексты, счётчики), `num_questions`, `embedding_dim`.
+  - `qa_embeddings.path` (N×D), `meta_path` (источники, **question_hashes**, счётчики), `num_questions`, `embedding_dim`.
 - **Алгоритм**: регэксп для вопросов → батчевый encode → L2‑нормализация поштучно → сохранение.
 - **Время**: ~0.01–0.3 s.
 

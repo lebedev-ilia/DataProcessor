@@ -1,0 +1,37 @@
+version: "pr8_triton_baseline_gpu_clip_448_local_v1"
+
+processors:
+  audio:
+    enabled: false
+    required: false
+  text:
+    enabled: false
+    required: false
+
+visual:
+  # Baseline GPU config with CLIP@448 branch for local Triton testing.
+  cfg_path: "./VisualProcessor/config_triton_baseline_gpu_local_clip_448.yaml"
+  requirements:
+    core_clip: true
+    core_depth_midas: true
+    core_optical_flow: true
+
+resolved_model_mapping:
+  core_clip:
+    runtime: triton
+    triton_image_model_spec: "clip_image_448_triton"
+    triton_text_model_spec: "clip_text_triton"
+    triton_preprocess_preset: "openai_clip_448"
+
+  core_depth_midas:
+    runtime: triton
+    triton_model_spec: "midas_256_triton"
+    triton_preprocess_preset: "midas_256"
+    batch_size: 1
+
+  core_optical_flow:
+    runtime: triton
+    triton_model_spec: "raft_256_triton"
+    triton_preprocess_preset: "raft_256"
+
+
